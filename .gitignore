@@ -1,0 +1,13 @@
+# SwiftPM build artifacts
+.build/
+
+# SwiftPM local settings/cache
+.swiftpm/
+
+# Xcode/Swift user-specific files
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# macOS metadata
+.DS_Store

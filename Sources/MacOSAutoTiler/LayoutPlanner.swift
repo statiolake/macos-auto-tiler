@@ -26,7 +26,11 @@ final class LayoutPlanner {
         for displayID in grouped.keys.sorted() {
             guard
                 let displayWindows = grouped[displayID],
-                let plan = buildPlan(for: displayID, windows: displayWindows)
+                let plan = buildPlan(
+                    for: displayID,
+                    windows: displayWindows,
+                    slotCount: displayWindows.count
+                )
             else {
                 continue
             }
@@ -35,17 +39,25 @@ final class LayoutPlanner {
         return plans
     }
 
-    func buildDragPlan(at point: CGPoint, windows: [WindowRef]) -> DisplayLayoutPlan? {
+    func buildDragPreviewPlan(
+        at point: CGPoint,
+        windows: [WindowRef],
+        draggedWindowID: CGWindowID
+    ) -> DisplayLayoutPlan? {
         guard let displayID = DisplayService.displayID(containing: point) else {
             return nil
         }
 
-        let displayWindows = windows.filter { window in
-            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            return DisplayService.displayID(containing: midpoint) == displayID
-        }
+        let nonDragged = windows.filter { $0.windowID != draggedWindowID }
+        let grouped = groupByDisplay(nonDragged)
+        let displayWindows = grouped[displayID] ?? []
 
-        return buildPlan(for: displayID, windows: displayWindows)
+        // Keep one empty slot for the dragged window on the hovered display.
+        return buildPlan(
+            for: displayID,
+            windows: displayWindows,
+            slotCount: displayWindows.count + 1
+        )
     }
 
     func slotIndex(at point: CGPoint, in plan: DisplayLayoutPlan) -> Int? {
@@ -53,42 +65,64 @@ final class LayoutPlanner {
     }
 
     func resolveDrop(
-        plan: DisplayLayoutPlan,
+        previewPlan: DisplayLayoutPlan,
         dragState: DragState,
         destinationIndex: Int,
-        latestDraggedFrame: CGRect?
+        allWindows: [WindowRef]
     ) -> DropResolution? {
-        guard let sourceIndex = plan.windowToSlotIndex[dragState.draggedWindowID] else {
+        guard destinationIndex >= 0, destinationIndex < previewPlan.slots.count else {
             return nil
         }
 
-        var nextSlotToWindowID = plan.slotToWindowID
-        var shouldApply = true
+        guard let draggedWindow = allWindows.first(where: { $0.windowID == dragState.draggedWindowID }) else {
+            return nil
+        }
 
-        if sourceIndex == destinationIndex {
-            if let latestDraggedFrame {
-                shouldApply = !GeometryUtils.isApproximatelyEqual(
-                    latestDraggedFrame,
-                    plan.slots[sourceIndex].rect,
-                    tolerance: frameTolerance
-                )
-            }
-        } else {
-            let destinationWindowID = nextSlotToWindowID[destinationIndex]
-            nextSlotToWindowID[destinationIndex] = dragState.draggedWindowID
+        var windowsByID: [CGWindowID: WindowRef] = [:]
+        windowsByID.reserveCapacity(allWindows.count)
+        for window in allWindows {
+            windowsByID[window.windowID] = window
+        }
 
-            if let destinationWindowID, destinationWindowID != dragState.draggedWindowID {
-                nextSlotToWindowID[sourceIndex] = destinationWindowID
-            } else {
-                nextSlotToWindowID.removeValue(forKey: sourceIndex)
+        let nonDragged = allWindows.filter { $0.windowID != dragState.draggedWindowID }
+        var combinedTargets: [CGWindowID: CGRect] = [:]
+
+        let otherDisplayPlans = buildReflowPlans(from: nonDragged)
+            .filter { $0.displayID != previewPlan.displayID }
+        for plan in otherDisplayPlans {
+            combinedTargets.merge(plan.targetFrames, uniquingKeysWith: { _, new in new })
+        }
+
+        var nextSlotToWindowID = previewPlan.slotToWindowID
+        let sourceSlotIndex = previewPlan.slots.indices.first { nextSlotToWindowID[$0] == nil }
+
+        let displacedWindowID = nextSlotToWindowID[destinationIndex]
+        nextSlotToWindowID[destinationIndex] = dragState.draggedWindowID
+
+        if let displacedWindowID, displacedWindowID != dragState.draggedWindowID {
+            if let sourceSlotIndex, sourceSlotIndex != destinationIndex {
+                nextSlotToWindowID[sourceSlotIndex] = displacedWindowID
+            } else if let fallbackEmpty = previewPlan.slots.indices.first(where: { nextSlotToWindowID[$0] == nil }) {
+                nextSlotToWindowID[fallbackEmpty] = displacedWindowID
             }
         }
 
+        let previewTargets = targetFrames(for: previewPlan.slots, slotToWindowID: nextSlotToWindowID)
+        combinedTargets.merge(previewTargets, uniquingKeysWith: { _, new in new })
+
+        let shouldApply = !GeometryUtils.isApproximatelyEqual(
+            draggedWindow.frame,
+            previewPlan.slots[destinationIndex].rect,
+            tolerance: frameTolerance
+        )
+
         return DropResolution(
-            sourceSlotIndex: sourceIndex,
+            displayID: previewPlan.displayID,
+            sourceSlotIndex: sourceSlotIndex,
             destinationSlotIndex: destinationIndex,
             shouldApply: shouldApply,
-            targetFrames: targetFrames(for: plan.slots, slotToWindowID: nextSlotToWindowID)
+            targetFrames: combinedTargets,
+            windowsByID: windowsByID
         )
     }
 
@@ -102,13 +136,17 @@ final class LayoutPlanner {
         return dragState.originalFrame.offsetBy(dx: dx, dy: dy)
     }
 
-    private func buildPlan(for displayID: CGDirectDisplayID, windows: [WindowRef]) -> DisplayLayoutPlan? {
-        guard !windows.isEmpty else {
+    private func buildPlan(
+        for displayID: CGDirectDisplayID,
+        windows: [WindowRef],
+        slotCount: Int
+    ) -> DisplayLayoutPlan? {
+        guard slotCount > 0 else {
             return nil
         }
 
         let bounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: displayInset, dy: displayInset)
-        let slots = makeSlots(for: windows.count, in: bounds)
+        let slots = makeSlots(for: slotCount, in: bounds)
         let assignment = assignWindowsToNearestSlots(windows: windows, slots: slots)
 
         var windowsByID: [CGWindowID: WindowRef] = [:]

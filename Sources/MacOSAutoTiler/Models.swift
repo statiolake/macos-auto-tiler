@@ -46,8 +46,10 @@ struct DisplayLayoutPlan {
 }
 
 struct DropResolution {
-    let sourceSlotIndex: Int
+    let displayID: CGDirectDisplayID
+    let sourceSlotIndex: Int?
     let destinationSlotIndex: Int
     let shouldApply: Bool
     let targetFrames: [CGWindowID: CGRect]
+    let windowsByID: [CGWindowID: WindowRef]
 }

@@ -27,6 +27,13 @@ final class DragInteractionTracker {
         return pending.windowID
     }
 
+    var draggedWindowID: CGWindowID? {
+        guard case let .dragging(dragState) = state else {
+            return nil
+        }
+        return dragState.draggedWindowID
+    }
+
     func beginPendingDrag(window: WindowRef) {
         state = .pending(
             PendingDrag(

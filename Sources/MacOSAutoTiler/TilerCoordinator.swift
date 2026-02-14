@@ -135,18 +135,26 @@ final class TilerCoordinator {
     }
 
     private func handleMouseUp(at point: CGPoint) {
-        guard let activePlan else {
+        guard let currentPreviewPlan = activePlan else {
             dragTracker.clearPendingDrag()
             return
         }
 
-        let fallbackDestination = layoutPlanner.slotIndex(at: point, in: activePlan)
-        guard let dragState = dragTracker.finishDrag(point: point, fallbackHoverSlotIndex: fallbackDestination) else {
+        guard let dragState = dragTracker.finishDrag(point: point, fallbackHoverSlotIndex: nil) else {
             resetInteractionState()
             return
         }
 
-        guard let destinationIndex = fallbackDestination ?? dragState.hoverSlotIndex else {
+        let windows = discovery.fetchVisibleWindows()
+        let previewPlan =
+            layoutPlanner.buildDragPreviewPlan(
+                at: point,
+                windows: windows,
+                draggedWindowID: dragState.draggedWindowID
+            ) ?? currentPreviewPlan
+
+        let destinationIndex = layoutPlanner.slotIndex(at: point, in: previewPlan) ?? dragState.hoverSlotIndex
+        guard let destinationIndex else {
             Diagnostics.log(
                 "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
                 level: .debug
@@ -155,16 +163,15 @@ final class TilerCoordinator {
             return
         }
 
-        let latestFrame = discovery.fetchWindow(windowID: dragState.draggedWindowID)?.frame
         guard
             let drop = layoutPlanner.resolveDrop(
-                plan: activePlan,
+                previewPlan: previewPlan,
                 dragState: dragState,
                 destinationIndex: destinationIndex,
-                latestDraggedFrame: latestFrame
+                allWindows: windows
             )
         else {
-            Diagnostics.log("Dragged window is not assigned to any slot, skipping drop", level: .warn)
+            Diagnostics.log("Failed to resolve drop for windowID=\(dragState.draggedWindowID)", level: .warn)
             clearOverlayState()
             return
         }
@@ -173,21 +180,22 @@ final class TilerCoordinator {
 
         if !drop.shouldApply {
             Diagnostics.log(
-                "Drop skipped windowID=\(dragState.draggedWindowID) source==destination (\(drop.sourceSlotIndex))",
+                "Drop skipped windowID=\(dragState.draggedWindowID) destination=\(drop.destinationSlotIndex)",
                 level: .debug
             )
             return
         }
 
+        let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
         Diagnostics.log(
-            "Applying layout from drop windowID=\(dragState.draggedWindowID) source=\(drop.sourceSlotIndex) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
+            "Applying layout from drop windowID=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
             level: .info
         )
 
         geometryApplier.applyAsync(
-            reason: "drop/window=\(dragState.draggedWindowID) source=\(drop.sourceSlotIndex) destination=\(drop.destinationSlotIndex)",
+            reason: "drop/window=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
             targetFrames: drop.targetFrames,
-            windowsByID: activePlan.windowsByID
+            windowsByID: drop.windowsByID
         ) { [weak self] failures in
             self?.logApplyResult(failures)
         }
@@ -210,14 +218,14 @@ final class TilerCoordinator {
 
     private func activateDragSession(draggedWindow: WindowRef, point: CGPoint) {
         let windows = discovery.fetchVisibleWindows()
-        guard let plan = layoutPlanner.buildDragPlan(at: point, windows: windows) else {
+        guard
+            let plan = layoutPlanner.buildDragPreviewPlan(
+                at: point,
+                windows: windows,
+                draggedWindowID: draggedWindow.windowID
+            )
+        else {
             Diagnostics.log("No windows found for drag session at point=\(point)", level: .warn)
-            resetInteractionState()
-            return
-        }
-
-        guard plan.windowToSlotIndex[draggedWindow.windowID] != nil else {
-            Diagnostics.log("Dragged windowID=\(draggedWindow.windowID) was not assigned to a slot", level: .warn)
             resetInteractionState()
             return
         }
@@ -241,14 +249,35 @@ final class TilerCoordinator {
     }
 
     private func updateActiveDrag(at point: CGPoint) {
-        guard let activePlan else {
+        guard let draggedWindowID = dragTracker.draggedWindowID else {
             return
         }
 
-        let hoverIndex = layoutPlanner.slotIndex(at: point, in: activePlan)
+        let windows = discovery.fetchVisibleWindows()
+        guard
+            let previewPlan = layoutPlanner.buildDragPreviewPlan(
+                at: point,
+                windows: windows,
+                draggedWindowID: draggedWindowID
+            )
+        else {
+            clearOverlayState()
+            return
+        }
+
+        let hoverIndex = layoutPlanner.slotIndex(at: point, in: previewPlan)
         guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
             clearOverlayState()
             return
+        }
+
+        let previousDisplayID = activePlan?.displayID
+        activePlan = previewPlan
+        if previousDisplayID != nil, previousDisplayID != previewPlan.displayID {
+            Diagnostics.log(
+                "Drag display changed windowID=\(dragState.draggedWindowID) display=\(previewPlan.displayID)",
+                level: .info
+            )
         }
 
         if dragState.hoverSlotIndex != lastLoggedHoverIndex {
@@ -260,7 +289,7 @@ final class TilerCoordinator {
             lastLoggedHoverIndex = dragState.hoverSlotIndex
         }
 
-        renderOverlay(dragState: dragState, plan: activePlan)
+        renderOverlay(dragState: dragState, plan: previewPlan)
     }
 
     private func renderOverlay(dragState: DragState, plan: DisplayLayoutPlan) {

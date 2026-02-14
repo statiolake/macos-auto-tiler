@@ -6,6 +6,7 @@ final class AXWindowActuator {
     private var cache: [CGWindowID: AXUIElement] = [:]
     private let applyOriginThreshold: CGFloat = 1.0
     private let applySizeThreshold: CGFloat = 1.0
+    private let frameTolerance: CGFloat = 6
     private let axEnhancedUserInterfaceAttribute: CFString = "AXEnhancedUserInterface" as CFString
 
     func apply(targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
@@ -31,7 +32,7 @@ final class AXWindowActuator {
                 continue
             }
 
-            if let actual = copyFrame(of: axWindow), !isFrameRoughlyEqual(actual, target) {
+            if let actual = copyFrame(of: axWindow), !GeometryUtils.isApproximatelyEqual(actual, target, tolerance: frameTolerance) {
                 Diagnostics.log(
                     "AX frame mismatch \(windowLabel(windowID, windows: windows)) target=\(target) actual=\(actual)",
                     level: .debug
@@ -54,11 +55,6 @@ final class AXWindowActuator {
         if let cached = cache[window.windowID] {
             return cached
         }
-        if let explicit = window.axWindow {
-            cache[window.windowID] = explicit
-            return explicit
-        }
-
         let appElement = AXUIElementCreateApplication(window.pid)
         var windowsValue: CFTypeRef?
         let windowsResult = AXUIElementCopyAttributeValue(
@@ -102,19 +98,7 @@ final class AXWindowActuator {
     }
 
     private func copyCGPoint(attribute: CFString, from element: AXUIElement) -> CGPoint? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard
-            result == .success,
-            let rawValue = value,
-            CFGetTypeID(rawValue) == AXValueGetTypeID()
-        else {
-            return nil
-        }
-        let axValue = unsafeBitCast(rawValue, to: AXValue.self)
-        guard
-            AXValueGetType(axValue) == .cgPoint
-        else {
+        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgPoint) else {
             return nil
         }
         var point = CGPoint.zero
@@ -125,6 +109,17 @@ final class AXWindowActuator {
     }
 
     private func copyCGSize(attribute: CFString, from element: AXUIElement) -> CGSize? {
+        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgSize) else {
+            return nil
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size) else {
+            return nil
+        }
+        return size
+    }
+
+    private func copyAXValue(attribute: CFString, from element: AXUIElement, type: AXValueType) -> AXValue? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, attribute, &value)
         guard
@@ -135,16 +130,10 @@ final class AXWindowActuator {
             return nil
         }
         let axValue = unsafeBitCast(rawValue, to: AXValue.self)
-        guard
-            AXValueGetType(axValue) == .cgSize
-        else {
+        guard AXValueGetType(axValue) == type else {
             return nil
         }
-        var size = CGSize.zero
-        guard AXValueGetValue(axValue, .cgSize, &size) else {
-            return nil
-        }
-        return size
+        return axValue
     }
 
     private func setPosition(_ point: CGPoint, on axWindow: AXUIElement) -> AXError {
@@ -243,7 +232,8 @@ final class AXWindowActuator {
         guard CFGetTypeID(raw) == CFBooleanGetTypeID() else {
             return nil
         }
-        return CFBooleanGetValue((raw as! CFBoolean))
+        let boolValue = unsafeBitCast(raw, to: CFBoolean.self)
+        return CFBooleanGetValue(boolValue)
     }
 
     private func setBooleanAttribute(_ attribute: CFString, on element: AXUIElement, value: Bool) -> Bool {
@@ -251,17 +241,8 @@ final class AXWindowActuator {
         return AXUIElementSetAttributeValue(element, attribute, cfValue) == .success
     }
 
-    private func isFrameRoughlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        let tolerance: CGFloat = 6
-        return
-            abs(lhs.origin.x - rhs.origin.x) <= tolerance &&
-            abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
-            abs(lhs.size.width - rhs.size.width) <= tolerance &&
-            abs(lhs.size.height - rhs.size.height) <= tolerance
-    }
-
     private func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        let originDistance = hypot(lhs.midX - rhs.midX, lhs.midY - rhs.midY)
+        let originDistance = GeometryUtils.centerDistance(lhs, rhs)
         let sizeDistance = abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
         return originDistance + sizeDistance
     }

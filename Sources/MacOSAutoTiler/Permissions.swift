@@ -15,9 +15,9 @@ enum Permissions {
     }
 
     static func ensureInputMonitoringPermission() -> Bool {
-        // 実際にタップを作ってみて権限をテスト
+        // Probe by creating a minimal event tap.
         let testMask = (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
-        guard let tap = CGEvent.tapCreate(
+        guard CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
@@ -26,11 +26,10 @@ enum Permissions {
                 return Unmanaged.passUnretained(event)
             },
             userInfo: nil
-        ) else {
+        ) != nil else {
             Diagnostics.log("Input Monitoring permission check failed", level: .warn)
             return false
         }
-        // CFMachPort を解放するだけでOK
         Diagnostics.log("Input Monitoring permission granted", level: .debug)
         return true
     }

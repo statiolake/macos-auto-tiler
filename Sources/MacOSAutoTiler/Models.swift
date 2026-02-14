@@ -1,10 +1,8 @@
-import ApplicationServices
 import CoreGraphics
 
 struct WindowRef {
     let windowID: CGWindowID
     let pid: pid_t
-    var axWindow: AXUIElement?
     let frame: CGRect
     let title: String
     let appName: String
@@ -12,15 +10,9 @@ struct WindowRef {
 
 struct Slot {
     let rect: CGRect
-    var windowID: CGWindowID?
-}
-
-struct LayoutState {
-    var slots: [Slot]
 }
 
 struct DragState {
-    var active: Bool
     let draggedWindowID: CGWindowID
     let startPoint: CGPoint
     var currentPoint: CGPoint
@@ -30,16 +22,32 @@ struct DragState {
 
 struct PendingDrag {
     let windowID: CGWindowID
-    let pid: pid_t
-    let startPoint: CGPoint
     let originalFrame: CGRect
-    let appName: String
 }
 
-struct ActiveLayoutContext {
+struct DisplayLayoutPlan {
     let displayID: CGDirectDisplayID
-    var slots: [Slot]
-    var slotToWindowID: [Int: CGWindowID]
-    var windowToSlotIndex: [CGWindowID: Int]
-    var windowsByID: [CGWindowID: WindowRef]
+    let slots: [Slot]
+    let slotToWindowID: [Int: CGWindowID]
+    let windowToSlotIndex: [CGWindowID: Int]
+    let windowsByID: [CGWindowID: WindowRef]
+
+    var targetFrames: [CGWindowID: CGRect] {
+        var result: [CGWindowID: CGRect] = [:]
+        result.reserveCapacity(slotToWindowID.count)
+        for (slotIndex, windowID) in slotToWindowID {
+            guard slotIndex >= 0, slotIndex < slots.count else {
+                continue
+            }
+            result[windowID] = slots[slotIndex].rect
+        }
+        return result
+    }
+}
+
+struct DropResolution {
+    let sourceSlotIndex: Int
+    let destinationSlotIndex: Int
+    let shouldApply: Bool
+    let targetFrames: [CGWindowID: CGRect]
 }

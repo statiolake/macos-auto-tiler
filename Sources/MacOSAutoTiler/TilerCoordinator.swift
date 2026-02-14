@@ -3,16 +3,14 @@ import CoreGraphics
 
 final class TilerCoordinator {
     private let discovery = WindowDiscovery()
-    private let layoutEngine = LayoutEngine()
+    private let layoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
     private let eventTap = EventTapController()
-    private let actuator = AXWindowActuator()
-    private let actuationQueue = DispatchQueue(label: "com.dicen.macosautotiler.actuation")
+    private let geometryApplier = WindowGeometryApplier()
+    private let dragTracker = DragInteractionTracker()
 
     private var activeSpaceObserver: NSObjectProtocol?
-    private var pendingDrag: PendingDrag?
-    private var dragState: DragState?
-    private var activeLayout: ActiveLayoutContext?
+    private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
 
     func start() {
@@ -61,50 +59,35 @@ final class TilerCoordinator {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
         }
-        resetDragSession()
+        resetInteractionState()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
 
     func reflowAllVisibleWindows(reason: String = "manual") {
         let windows = discovery.fetchVisibleWindows()
-        guard !windows.isEmpty else {
+        let plans = layoutPlanner.buildReflowPlans(from: windows)
+        guard !plans.isEmpty else {
             Diagnostics.log("Reflow (\(reason)) skipped: no candidate windows", level: .debug)
             return
-        }
-
-        var groupedByDisplay: [CGDirectDisplayID: [WindowRef]] = [:]
-        for window in windows {
-            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            guard let displayID = DisplayService.displayID(containing: midpoint) else {
-                continue
-            }
-            groupedByDisplay[displayID, default: []].append(window)
         }
 
         var totalTargets = 0
         var totalFailures: [CGWindowID] = []
 
-        let sortedDisplays = groupedByDisplay.keys.sorted()
-        for displayID in sortedDisplays {
-            guard let displayWindows = groupedByDisplay[displayID], !displayWindows.isEmpty else {
-                continue
-            }
-            var windowsByID: [CGWindowID: WindowRef] = [:]
-            for window in displayWindows {
-                windowsByID[window.windowID] = window
-            }
-
-            let bounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
-            let slots = layoutEngine.makeSlots(for: displayWindows.count, in: bounds)
-            let assignment = layoutEngine.assignWindowsToNearestSlots(windows: displayWindows, slots: slots)
-            let targets = layoutEngine.targets(for: slots, slotToWindowID: assignment.slotToWindowID)
+        for plan in plans {
+            let targets = plan.targetFrames
             totalTargets += targets.count
 
             Diagnostics.log(
-                "Reflow (\(reason)) display=\(displayID) bounds=\(bounds) windows=\(displayWindows.count) targets=\(targets.count)",
+                "Reflow (\(reason)) display=\(plan.displayID) windows=\(plan.windowsByID.count) targets=\(targets.count)",
                 level: .info
             )
-            let failures = applyTargetsSync(targets, windows: windowsByID)
+
+            let failures = geometryApplier.applySync(
+                reason: "reflow(\(reason))/display=\(plan.displayID)",
+                targetFrames: targets,
+                windowsByID: plan.windowsByID
+            )
             totalFailures.append(contentsOf: failures)
         }
 
@@ -118,238 +101,176 @@ final class TilerCoordinator {
     private func handle(_ eventType: MouseEventType, point: CGPoint) {
         switch eventType {
         case .down:
-            capturePendingDrag(at: point)
+            handleMouseDown(at: point)
         case .dragged:
-            if dragState != nil {
-                updateDrag(at: point)
-            } else {
-                maybeActivateDrag(at: point)
-            }
+            handleMouseDragged(at: point)
         case .up:
-            if dragState != nil {
-                endDrag(at: point)
-            } else {
-                pendingDrag = nil
-            }
+            handleMouseUp(at: point)
         }
     }
 
-    private func capturePendingDrag(at point: CGPoint) {
+    private func handleMouseDown(at point: CGPoint) {
+        resetInteractionState()
+
         let windows = discovery.fetchVisibleWindows()
         guard let dragged = windows.first(where: { $0.frame.contains(point) }) else {
-            pendingDrag = nil
             Diagnostics.log("Mouse down at \(point) but no window hit", level: .debug)
             return
         }
 
-        pendingDrag = PendingDrag(
-            windowID: dragged.windowID,
-            pid: dragged.pid,
-            startPoint: point,
-            originalFrame: dragged.frame,
-            appName: dragged.appName
-        )
+        dragTracker.beginPendingDrag(window: dragged)
         Diagnostics.log(
             "Pending drag captured windowID=\(dragged.windowID) app=\(dragged.appName)",
             level: .debug
         )
     }
 
+    private func handleMouseDragged(at point: CGPoint) {
+        if dragTracker.isDragging {
+            updateActiveDrag(at: point)
+            return
+        }
+
+        maybeActivateDrag(at: point)
+    }
+
+    private func handleMouseUp(at point: CGPoint) {
+        guard let activePlan else {
+            dragTracker.clearPendingDrag()
+            return
+        }
+
+        let fallbackDestination = layoutPlanner.slotIndex(at: point, in: activePlan)
+        guard let dragState = dragTracker.finishDrag(point: point, fallbackHoverSlotIndex: fallbackDestination) else {
+            resetInteractionState()
+            return
+        }
+
+        guard let destinationIndex = fallbackDestination ?? dragState.hoverSlotIndex else {
+            Diagnostics.log(
+                "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
+                level: .debug
+            )
+            clearOverlayState()
+            return
+        }
+
+        let latestFrame = discovery.fetchWindow(windowID: dragState.draggedWindowID)?.frame
+        guard
+            let drop = layoutPlanner.resolveDrop(
+                plan: activePlan,
+                dragState: dragState,
+                destinationIndex: destinationIndex,
+                latestDraggedFrame: latestFrame
+            )
+        else {
+            Diagnostics.log("Dragged window is not assigned to any slot, skipping drop", level: .warn)
+            clearOverlayState()
+            return
+        }
+
+        clearOverlayState()
+
+        if !drop.shouldApply {
+            Diagnostics.log(
+                "Drop skipped windowID=\(dragState.draggedWindowID) source==destination (\(drop.sourceSlotIndex))",
+                level: .debug
+            )
+            return
+        }
+
+        Diagnostics.log(
+            "Applying layout from drop windowID=\(dragState.draggedWindowID) source=\(drop.sourceSlotIndex) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
+            level: .info
+        )
+
+        geometryApplier.applyAsync(
+            reason: "drop/window=\(dragState.draggedWindowID) source=\(drop.sourceSlotIndex) destination=\(drop.destinationSlotIndex)",
+            targetFrames: drop.targetFrames,
+            windowsByID: activePlan.windowsByID
+        ) { [weak self] failures in
+            self?.logApplyResult(failures)
+        }
+    }
+
     private func maybeActivateDrag(at point: CGPoint) {
-        guard let pendingDrag else {
+        guard let pendingWindowID = dragTracker.pendingWindowID else {
             return
         }
-        guard let latestWindow = discovery.fetchWindow(windowID: pendingDrag.windowID) else {
+        guard let latestWindow = discovery.fetchWindow(windowID: pendingWindowID) else {
+            dragTracker.clearPendingDrag()
             return
         }
-        guard hasWindowMoved(original: pendingDrag.originalFrame, current: latestWindow.frame) else {
+        guard dragTracker.maybeActivateDrag(currentPoint: point, latestWindow: latestWindow) != nil else {
             return
         }
 
         activateDragSession(draggedWindow: latestWindow, point: point)
     }
 
-    private func activateDragSession(draggedWindow dragged: WindowRef, point: CGPoint) {
-        guard let displayID = DisplayService.displayID(containing: point) else {
-            Diagnostics.log("Failed to resolve display for drag start at \(point)", level: .warn)
-            return
-        }
-
+    private func activateDragSession(draggedWindow: WindowRef, point: CGPoint) {
         let windows = discovery.fetchVisibleWindows()
-        let displayBounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
-        let displayWindows = windows.filter { window in
-            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            return DisplayService.displayID(containing: midpoint) == displayID
-        }
-        guard !displayWindows.isEmpty else {
-            Diagnostics.log("No windows found on display \(displayID) for drag session", level: .warn)
+        guard let plan = layoutPlanner.buildDragPlan(at: point, windows: windows) else {
+            Diagnostics.log("No windows found for drag session at point=\(point)", level: .warn)
+            resetInteractionState()
             return
         }
 
-        let slots = layoutEngine.makeSlots(for: displayWindows.count, in: displayBounds)
-        let assignment = layoutEngine.assignWindowsToNearestSlots(windows: displayWindows, slots: slots)
-
-        var windowsByID: [CGWindowID: WindowRef] = [:]
-        for window in displayWindows {
-            windowsByID[window.windowID] = window
+        guard plan.windowToSlotIndex[draggedWindow.windowID] != nil else {
+            Diagnostics.log("Dragged windowID=\(draggedWindow.windowID) was not assigned to a slot", level: .warn)
+            resetInteractionState()
+            return
         }
 
-        let hoverIndex = layoutEngine.slotIndex(at: point, in: slots)
-        dragState = DragState(
-            active: true,
-            draggedWindowID: dragged.windowID,
-            startPoint: point,
-            currentPoint: point,
-            originalFrame: dragged.frame,
-            hoverSlotIndex: hoverIndex
-        )
-        activeLayout = ActiveLayoutContext(
-            displayID: displayID,
-            slots: slots,
-            slotToWindowID: assignment.slotToWindowID,
-            windowToSlotIndex: assignment.windowToSlotIndex,
-            windowsByID: windowsByID
-        )
-        pendingDrag = nil
+        let hoverIndex = layoutPlanner.slotIndex(at: point, in: plan)
+        guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
+            Diagnostics.log("Failed to update drag state during activation", level: .warn)
+            resetInteractionState()
+            return
+        }
+
+        activePlan = plan
         lastLoggedHoverIndex = hoverIndex
-        Diagnostics.log("Using visible bounds for display \(displayID): \(displayBounds)", level: .debug)
+
+        let hoverText = hoverIndex.map(String.init) ?? "nil"
         Diagnostics.log(
-            "Drag begin windowID=\(dragged.windowID) app=\(dragged.appName) title=\"\(dragged.title)\" display=\(displayID) slots=\(slots.count) hover=\(hoverIndex?.description ?? "nil")",
+            "Drag begin windowID=\(draggedWindow.windowID) app=\(draggedWindow.appName) title=\"\(draggedWindow.title)\" display=\(plan.displayID) slots=\(plan.slots.count) hover=\(hoverText)",
             level: .info
         )
-        renderOverlay()
+        renderOverlay(dragState: dragState, plan: plan)
     }
 
-    private func updateDrag(at point: CGPoint) {
-        guard var dragState, let activeLayout else {
+    private func updateActiveDrag(at point: CGPoint) {
+        guard let activePlan else {
             return
         }
-        dragState.currentPoint = point
-        dragState.hoverSlotIndex = layoutEngine.slotIndex(at: point, in: activeLayout.slots)
-        self.dragState = dragState
-        self.activeLayout = activeLayout
+
+        let hoverIndex = layoutPlanner.slotIndex(at: point, in: activePlan)
+        guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
+            clearOverlayState()
+            return
+        }
+
         if dragState.hoverSlotIndex != lastLoggedHoverIndex {
+            let hoverText = dragState.hoverSlotIndex.map(String.init) ?? "nil"
             Diagnostics.log(
-                "Drag hover changed windowID=\(dragState.draggedWindowID) hover=\(dragState.hoverSlotIndex?.description ?? "nil") point=\(point)",
+                "Drag hover changed windowID=\(dragState.draggedWindowID) hover=\(hoverText) point=\(point)",
                 level: .debug
             )
             lastLoggedHoverIndex = dragState.hoverSlotIndex
         }
-        renderOverlay()
+
+        renderOverlay(dragState: dragState, plan: activePlan)
     }
 
-    private func endDrag(at point: CGPoint) {
-        guard var dragState, let activeLayout else {
-            resetDragSession()
-            return
-        }
-
-        dragState.currentPoint = point
-        let destinationIndex = layoutEngine.slotIndex(at: point, in: activeLayout.slots) ?? dragState.hoverSlotIndex
-        guard let destinationIndex else {
-            Diagnostics.log(
-                "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
-                level: .debug
-            )
-            resetDragSession()
-            return
-        }
-
-        guard let sourceIndex = activeLayout.windowToSlotIndex[dragState.draggedWindowID] else {
-            Diagnostics.log("Dragged window is not assigned to any slot, skipping drop", level: .warn)
-            resetDragSession()
-            return
-        }
-
-        var nextSlotToWindowID = activeLayout.slotToWindowID
-        var shouldApply = true
-
-        if sourceIndex == destinationIndex {
-            if
-                let latest = discovery.fetchWindow(windowID: dragState.draggedWindowID),
-                !isFrameRoughlyEqual(latest.frame, activeLayout.slots[sourceIndex].rect)
-            {
-                Diagnostics.log(
-                    "Applying normalization for same-slot drop windowID=\(dragState.draggedWindowID) with full-layout apply",
-                    level: .debug
-                )
-            } else {
-                Diagnostics.log(
-                    "Drop skipped windowID=\(dragState.draggedWindowID) source==destination (\(sourceIndex))",
-                    level: .debug
-                )
-                shouldApply = false
-            }
-        } else {
-            let destinationWindowID = nextSlotToWindowID[destinationIndex]
-            nextSlotToWindowID[destinationIndex] = dragState.draggedWindowID
-            if let destinationWindowID, destinationWindowID != dragState.draggedWindowID {
-                nextSlotToWindowID[sourceIndex] = destinationWindowID
-            } else {
-                nextSlotToWindowID.removeValue(forKey: sourceIndex)
-            }
-        }
-
-        if !shouldApply {
-            resetDragSession()
-            return
-        }
-
-        let targets = layoutEngine.targets(for: activeLayout.slots, slotToWindowID: nextSlotToWindowID)
-        let windowsByID = activeLayout.windowsByID
-        let draggedWindowID = dragState.draggedWindowID
-
-        // Hide preview immediately, then apply AX updates off the main thread.
-        resetDragSession()
-
-        Diagnostics.log(
-            "Applying reflow windowID=\(draggedWindowID) destination=\(destinationIndex) movedWindows=\(targets.count)",
-            level: .info
-        )
-        applyTargetsAsync(targets, windows: windowsByID)
-    }
-
-    private func renderOverlay() {
-        guard let dragState, let activeLayout else {
-            overlay.hide()
-            return
-        }
-
-        let ghostRect: CGRect
-        if let hover = dragState.hoverSlotIndex, hover < activeLayout.slots.count {
-            ghostRect = activeLayout.slots[hover].rect
-        } else {
-            let dx = dragState.currentPoint.x - dragState.startPoint.x
-            let dy = dragState.currentPoint.y - dragState.startPoint.y
-            ghostRect = dragState.originalFrame.offsetBy(dx: dx, dy: dy)
-        }
-
+    private func renderOverlay(dragState: DragState, plan: DisplayLayoutPlan) {
+        let ghostRect = layoutPlanner.ghostRect(for: dragState, in: plan)
         overlay.show(
-            displayID: activeLayout.displayID,
-            slotRects: activeLayout.slots.map(\.rect),
+            displayID: plan.displayID,
+            slotRects: plan.slots.map(\.rect),
             hoverIndex: dragState.hoverSlotIndex,
             ghostRect: ghostRect
         )
-    }
-
-    private func applyTargetsSync(_ targets: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
-        actuationQueue.sync {
-            actuator.apply(targetFrames: targets, windows: windows)
-        }
-    }
-
-    private func applyTargetsAsync(_ targets: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) {
-        actuationQueue.async { [weak self] in
-            guard let self else { return }
-            let failures = self.actuator.apply(targetFrames: targets, windows: windows)
-            DispatchQueue.main.async {
-                if !failures.isEmpty {
-                    Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
-                } else {
-                    Diagnostics.log("AX apply completed successfully", level: .info)
-                }
-            }
-        }
     }
 
     private func setupActiveSpaceObserver() {
@@ -371,30 +292,23 @@ final class TilerCoordinator {
         }
     }
 
-    private func resetDragSession() {
+    private func clearOverlayState() {
         overlay.hide()
-        pendingDrag = nil
-        dragState = nil
-        activeLayout = nil
+        activePlan = nil
         lastLoggedHoverIndex = nil
     }
 
-    private func hasWindowMoved(original: CGRect, current: CGRect) -> Bool {
-        let moveThreshold: CGFloat = 4
-        return
-            abs(original.origin.x - current.origin.x) >= moveThreshold ||
-            abs(original.origin.y - current.origin.y) >= moveThreshold ||
-            abs(original.size.width - current.size.width) >= moveThreshold ||
-            abs(original.size.height - current.size.height) >= moveThreshold
+    private func resetInteractionState() {
+        dragTracker.clearAll()
+        clearOverlayState()
     }
 
-    private func isFrameRoughlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        let tolerance: CGFloat = 6
-        return
-            abs(lhs.origin.x - rhs.origin.x) <= tolerance &&
-            abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
-            abs(lhs.size.width - rhs.size.width) <= tolerance &&
-            abs(lhs.size.height - rhs.size.height) <= tolerance
+    private func logApplyResult(_ failures: [CGWindowID]) {
+        if failures.isEmpty {
+            Diagnostics.log("AX apply completed successfully", level: .info)
+            return
+        }
+        Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
     }
 
     private func presentPermissionAlert(title: String, message: String) {

@@ -35,7 +35,7 @@ final class OverlayWindowController {
         overlayView = nil
         activeDisplayID = displayID
 
-        guard let screen = Self.screen(for: displayID) else { return }
+        guard let screen = DisplayService.screen(for: displayID) else { return }
 
         let window = NSWindow(
             contentRect: screen.frame,
@@ -58,15 +58,6 @@ final class OverlayWindowController {
         overlayWindow = window
         overlayView = contentView
         window.orderFrontRegardless()
-    }
-
-    private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
-        NSScreen.screens.first { screen in
-            guard let raw = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
-                return false
-            }
-            return raw.uint32Value == displayID
-        }
     }
 }
 

@@ -29,7 +29,7 @@ enum DisplayService {
         return CGRect(x: visible.minX, y: quartzY, width: visible.width, height: visible.height)
     }
 
-    private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
+    static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
         NSScreen.screens.first { screen in
             guard let raw = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
                 return false

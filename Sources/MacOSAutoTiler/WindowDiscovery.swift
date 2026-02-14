@@ -37,7 +37,6 @@ final class WindowDiscovery {
                 WindowRef(
                     windowID: CGWindowID(windowNumber),
                     pid: pid,
-                    axWindow: nil,
                     frame: frame,
                     title: title,
                     appName: appName

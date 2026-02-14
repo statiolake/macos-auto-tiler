@@ -261,15 +261,16 @@ final class TilerCoordinator {
             return
         }
 
-        var targets: [CGWindowID: CGRect] = [:]
+        var nextSlotToWindowID = activeLayout.slotToWindowID
+        var shouldApply = true
+
         if sourceIndex == destinationIndex {
             if
                 let latest = discovery.fetchWindow(windowID: dragState.draggedWindowID),
                 !isFrameRoughlyEqual(latest.frame, activeLayout.slots[sourceIndex].rect)
             {
-                targets[dragState.draggedWindowID] = activeLayout.slots[sourceIndex].rect
                 Diagnostics.log(
-                    "Applying normalization for same-slot drop windowID=\(dragState.draggedWindowID)",
+                    "Applying normalization for same-slot drop windowID=\(dragState.draggedWindowID) with full-layout apply",
                     level: .debug
                 )
             } else {
@@ -277,22 +278,24 @@ final class TilerCoordinator {
                     "Drop skipped windowID=\(dragState.draggedWindowID) source==destination (\(sourceIndex))",
                     level: .debug
                 )
+                shouldApply = false
             }
         } else {
-            targets[dragState.draggedWindowID] = activeLayout.slots[destinationIndex].rect
-            if
-                let destinationWindowID = activeLayout.slotToWindowID[destinationIndex],
-                destinationWindowID != dragState.draggedWindowID
-            {
-                targets[destinationWindowID] = activeLayout.slots[sourceIndex].rect
+            let destinationWindowID = nextSlotToWindowID[destinationIndex]
+            nextSlotToWindowID[destinationIndex] = dragState.draggedWindowID
+            if let destinationWindowID, destinationWindowID != dragState.draggedWindowID {
+                nextSlotToWindowID[sourceIndex] = destinationWindowID
+            } else {
+                nextSlotToWindowID.removeValue(forKey: sourceIndex)
             }
         }
 
-        if targets.isEmpty {
+        if !shouldApply {
             resetDragSession()
             return
         }
 
+        let targets = layoutEngine.targets(for: activeLayout.slots, slotToWindowID: nextSlotToWindowID)
         let windowsByID = activeLayout.windowsByID
         let draggedWindowID = dragState.draggedWindowID
 

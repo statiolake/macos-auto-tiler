@@ -31,14 +31,6 @@ final class TilerCoordinator {
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
-        let accessibilityGranted = Permissions.ensureAccessibilityPermission(prompt: true)
-        let inputMonitoringGranted = Permissions.ensureInputMonitoringPermission()
-
-        if !inputMonitoringGranted {
-            Diagnostics.log("Input Monitoring permission not granted, prompting user", level: .warn)
-            Permissions.presentInputMonitoringAlert()
-        }
-
         let started = eventTap.start { [weak self] eventType, point in
             DispatchQueue.main.async {
                 self?.handle(eventType, point: point)
@@ -46,22 +38,14 @@ final class TilerCoordinator {
         }
 
         if !started {
-            Diagnostics.log("Event tap failed to start", level: .error)
-            presentPermissionAlert(
-                title: "Event Tap Failed",
-                message: "Failed to start global mouse event tap. Please enable both Input Monitoring and Accessibility permissions in System Settings."
-            )
+            Diagnostics.log("Event tap failed to start (permissions are expected to be pre-granted)", level: .error)
+            return
         } else {
             Diagnostics.log("Coordinator started successfully", level: .info)
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
-            let canControlWindows = accessibilityGranted || Permissions.ensureAccessibilityPermission(prompt: false)
-            if !canControlWindows {
-                Diagnostics.log("Startup reflow skipped (Accessibility permission not granted)", level: .warn)
-                return
-            }
             self.reflowAllVisibleWindows(reason: "startup")
         }
 
@@ -449,9 +433,6 @@ final class TilerCoordinator {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            guard Permissions.ensureAccessibilityPermission(prompt: false) else {
-                return
-            }
             Diagnostics.log("Active space changed, triggering reflow", level: .info)
             self.reflowAllVisibleWindows(reason: "space-change")
         }
@@ -460,7 +441,6 @@ final class TilerCoordinator {
     private func startLifecycleMonitor() {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
-            guard Permissions.ensureAccessibilityPermission(prompt: false) else { return }
 
             if dragTracker.isDragging {
                 needsDeferredLifecycleReflow = true
@@ -498,15 +478,5 @@ final class TilerCoordinator {
             return
         }
         Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
-    }
-
-    private func presentPermissionAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
     }
 }

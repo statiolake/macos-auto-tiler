@@ -43,19 +43,12 @@ enum Permissions {
         }
     }
 
-    static func presentInputMonitoringAlert() {
-        let alert = NSAlert()
-        alert.messageText = "Input Monitoring Permission Needed"
-        alert.informativeText = "To detect mouse drag events, the app needs Input Monitoring permission.\n\nGo to System Settings → Privacy & Security → Input Monitoring and enable it for this app."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Cancel")
-
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-
-        if response == .alertFirstButtonReturn {
-            openSystemSettingsForInputMonitoring()
+    static func openSystemSettingsForAccessibility() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        } else {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security")!)
         }
     }
+
 }

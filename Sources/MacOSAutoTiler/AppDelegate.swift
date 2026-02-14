@@ -2,11 +2,17 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator = TilerCoordinator()
+    private let startupPermissionFlow = StartupPermissionFlow()
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Diagnostics.log("Application launched", level: .info)
         setupStatusItem()
+        guard startupPermissionFlow.run() else {
+            Diagnostics.log("Startup permission flow did not complete; terminating app", level: .warn)
+            NSApp.terminate(nil)
+            return
+        }
         coordinator.start()
     }
 
@@ -21,11 +27,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "macOS Auto Tiler"
 
         let menu = NSMenu()
-        menu.addItem(
-            withTitle: "Prompt Accessibility Permission",
-            action: #selector(promptAccessibility),
-            keyEquivalent: ""
-        )
         menu.addItem(
             withTitle: "Reflow Now",
             action: #selector(reflowNow),
@@ -43,12 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.statusItem = statusItem
         Diagnostics.log("Menu bar item initialized", level: .debug)
-    }
-
-    @objc
-    private func promptAccessibility() {
-        Diagnostics.log("Manual accessibility prompt requested", level: .info)
-        _ = Permissions.ensureAccessibilityPermission(prompt: true)
     }
 
     @objc

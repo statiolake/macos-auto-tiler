@@ -2,39 +2,44 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-final class WindowSemanticsClassifier {
-    private var cache: [CGWindowID: Bool] = [:]
+struct WindowSemantics {
+    let descriptor: WindowTypeDescriptor
+    let isSpecialFloating: Bool
+}
 
-    func isSpecialFloating(window: WindowRef) -> Bool {
+final class WindowSemanticsClassifier {
+    private var cache: [CGWindowID: WindowSemantics] = [:]
+
+    func semantics(for window: WindowRef) -> WindowSemantics {
         if let cached = cache[window.windowID] {
             return cached
         }
 
-        let result = classify(window: window)
-        cache[window.windowID] = result
-        return result
+        let semantics = classify(window: window)
+        cache[window.windowID] = semantics
+        return semantics
     }
 
     func prune(to liveWindowIDs: Set<CGWindowID>) {
         cache = cache.filter { liveWindowIDs.contains($0.key) }
     }
 
-    private func classify(window: WindowRef) -> Bool {
+    private func classify(window: WindowRef) -> WindowSemantics {
         guard let axWindow = resolveAXWindow(window: window) else {
-            return false
+            return WindowSemantics(
+                descriptor: WindowTypeDescriptor(role: "AXWindow", subrole: "Unknown"),
+                isSpecialFloating: false
+            )
         }
 
-        let role = copyStringAttribute(kAXRoleAttribute as CFString, from: axWindow)
-        let subrole = copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow)
+        let role = copyStringAttribute(kAXRoleAttribute as CFString, from: axWindow) ?? "AXWindow"
+        let subrole = copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow) ?? "None"
 
-        if let role, floatingRoles.contains(role) {
-            return true
-        }
-        if let subrole, floatingSubroles.contains(subrole) {
-            return true
-        }
-
-        return false
+        let isSpecialFloating = floatingRoles.contains(role) || floatingSubroles.contains(subrole)
+        return WindowSemantics(
+            descriptor: WindowTypeDescriptor(role: role, subrole: subrole),
+            isSpecialFloating: isSpecialFloating
+        )
     }
 
     private func resolveAXWindow(window: WindowRef) -> AXUIElement? {

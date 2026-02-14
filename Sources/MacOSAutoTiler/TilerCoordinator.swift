@@ -10,6 +10,15 @@ final class TilerCoordinator {
     private let dragTracker = DragInteractionTracker()
     private let lifecycleMonitor = WindowLifecycleMonitor()
     private let semanticsClassifier = WindowSemanticsClassifier()
+    private let ruleStore = WindowRuleStore()
+    private let typeRegistry = WindowTypeRegistry()
+
+    private lazy var rulesPanelController = WindowRulesPanelController(
+        registry: typeRegistry,
+        ruleStore: ruleStore
+    ) { [weak self] in
+        self?.reflowAllVisibleWindows(reason: "rules-updated")
+    }
 
     private var activeSpaceObserver: NSObjectProtocol?
     private var activePlan: DisplayLayoutPlan?
@@ -69,6 +78,10 @@ final class TilerCoordinator {
         }
         resetInteractionState()
         Diagnostics.log("Coordinator stopped", level: .info)
+    }
+
+    func showRulesPanel() {
+        rulesPanelController.present()
     }
 
     func reflowAllVisibleWindows(reason: String = "manual") {
@@ -371,6 +384,10 @@ final class TilerCoordinator {
     private func fetchVisibleWindows() -> [WindowRef] {
         let windows = discovery.fetchVisibleWindows()
         pruneFloatingState(using: windows)
+        for window in windows {
+            let semantics = semanticsClassifier.semantics(for: window)
+            typeRegistry.record(appName: window.appName, descriptor: semantics.descriptor)
+        }
         return windows
     }
 
@@ -394,7 +411,16 @@ final class TilerCoordinator {
     }
 
     private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
-        if semanticsClassifier.isSpecialFloating(window: window) {
+        if ruleStore.isAppForcedFloating(window.appName) {
+            return true
+        }
+
+        let semantics = semanticsClassifier.semantics(for: window)
+        if ruleStore.isTypeForcedFloating(semantics.descriptor) {
+            return true
+        }
+
+        if semantics.isSpecialFloating {
             return true
         }
 

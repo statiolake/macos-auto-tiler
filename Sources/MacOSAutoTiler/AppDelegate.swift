@@ -31,6 +31,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(reflowNow),
             keyEquivalent: "r"
         )
+        menu.addItem(
+            withTitle: "Floating Rules...",
+            action: #selector(openFloatingRules),
+            keyEquivalent: ","
+        )
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quitApp), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
@@ -50,6 +55,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reflowNow() {
         Diagnostics.log("Manual reflow requested from menu", level: .info)
         coordinator.reflowAllVisibleWindows(reason: "menu")
+    }
+
+    @objc
+    private func openFloatingRules() {
+        Diagnostics.log("Floating rules panel requested", level: .info)
+        coordinator.showRulesPanel()
     }
 
     @objc

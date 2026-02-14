@@ -14,7 +14,15 @@ final class TilerCoordinator {
 
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
+
         let accessibilityGranted = Permissions.ensureAccessibilityPermission(prompt: true)
+        let inputMonitoringGranted = Permissions.ensureInputMonitoringPermission()
+
+        if !inputMonitoringGranted {
+            Diagnostics.log("Input Monitoring permission not granted, prompting user", level: .warn)
+            Permissions.presentInputMonitoringAlert()
+        }
+
         let started = eventTap.start { [weak self] eventType, point in
             DispatchQueue.main.async {
                 self?.handle(eventType, point: point)
@@ -24,8 +32,8 @@ final class TilerCoordinator {
         if !started {
             Diagnostics.log("Event tap failed to start", level: .error)
             presentPermissionAlert(
-                title: "Input Monitoring Permission Needed",
-                message: "Failed to start global mouse event tap. Enable Input Monitoring and Accessibility permissions."
+                title: "Event Tap Failed",
+                message: "Failed to start global mouse event tap. Please enable both Input Monitoring and Accessibility permissions in System Settings."
             )
         } else {
             Diagnostics.log("Coordinator started successfully", level: .info)

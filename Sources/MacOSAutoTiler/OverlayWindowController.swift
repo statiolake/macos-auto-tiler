@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 
 final class OverlayWindowController {
-    private var overlayWindow: NSPanel?
+    private var overlayWindow: NSWindow?
     private var overlayView: OverlayView?
     private var activeDisplayID: CGDirectDisplayID?
 
@@ -35,32 +35,29 @@ final class OverlayWindowController {
         overlayView = nil
         activeDisplayID = displayID
 
-        guard
-            let screen = Self.screen(for: displayID)
-        else {
-            return
-        }
+        guard let screen = Self.screen(for: displayID) else { return }
 
-        let panel = NSPanel(
+        let window = NSWindow(
             contentRect: screen.frame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        panel.level = .screenSaver
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.isReleasedWhenClosed = false
+        window.level = .screenSaver
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
 
-        let contentView = OverlayView(frame: panel.contentView?.bounds ?? .zero, displayID: displayID)
+        let contentView = OverlayView(frame: screen.frame, displayID: displayID)
         contentView.autoresizingMask = [.width, .height]
-        panel.contentView = contentView
+        window.contentView = contentView
 
-        overlayWindow = panel
+        overlayWindow = window
         overlayView = contentView
+        window.orderFrontRegardless()
     }
 
     private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {

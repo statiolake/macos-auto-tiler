@@ -2,6 +2,9 @@ import CoreGraphics
 import Foundation
 
 final class WindowDiscovery {
+    private let logStateLock = NSLock()
+    private var lastDiscoverySignature: UInt64?
+
     func fetchVisibleWindows() -> [WindowRef] {
         guard
             let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
@@ -44,11 +47,37 @@ final class WindowDiscovery {
             )
         }
 
-        Diagnostics.log("Discovered \(windows.count) visible candidate windows", level: .debug)
+        logDiscoveryIfChanged(windows)
         return windows
     }
 
     func fetchWindow(windowID: CGWindowID) -> WindowRef? {
         fetchVisibleWindows().first { $0.windowID == windowID }
+    }
+
+    private func logDiscoveryIfChanged(_ windows: [WindowRef]) {
+        let signature = discoverySignature(for: windows)
+
+        logStateLock.lock()
+        let shouldLog = signature != lastDiscoverySignature
+        if shouldLog {
+            lastDiscoverySignature = signature
+        }
+        logStateLock.unlock()
+
+        guard shouldLog else {
+            return
+        }
+
+        Diagnostics.log("Discovered \(windows.count) visible candidate windows", level: .debug)
+    }
+
+    private func discoverySignature(for windows: [WindowRef]) -> UInt64 {
+        var hash = UInt64(windows.count)
+        for id in windows.map(\.windowID).sorted() {
+            hash ^= UInt64(id)
+            hash = hash &* 1_099_511_628_211
+        }
+        return hash
     }
 }

@@ -20,6 +20,19 @@ struct DiscoveredWindowType: Identifiable {
     }
 }
 
+struct WindowRuleSnapshot {
+    let floatingApps: Set<String>
+    let floatingTypeKeys: Set<String>
+
+    func isAppForcedFloating(_ appName: String) -> Bool {
+        floatingApps.contains(appName)
+    }
+
+    func isTypeForcedFloating(_ descriptor: WindowTypeDescriptor) -> Bool {
+        floatingTypeKeys.contains(descriptor.typeKey)
+    }
+}
+
 final class WindowRuleStore {
     private enum Keys {
         static let floatingApps = "rules.floatingApps"
@@ -60,6 +73,13 @@ final class WindowRuleStore {
             floatingTypeKeys.remove(descriptor.typeKey)
         }
         defaults.set(Array(floatingTypeKeys).sorted(), forKey: Keys.floatingTypeKeys)
+    }
+
+    func snapshot() -> WindowRuleSnapshot {
+        WindowRuleSnapshot(
+            floatingApps: floatingApps,
+            floatingTypeKeys: floatingTypeKeys
+        )
     }
 }
 

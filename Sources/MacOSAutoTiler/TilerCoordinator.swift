@@ -12,6 +12,7 @@ final class TilerCoordinator {
     private let semanticsClassifier = WindowSemanticsClassifier()
     private let ruleStore = WindowRuleStore()
     private let typeRegistry = WindowTypeRegistry()
+    private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
 
     private lazy var rulesPanelController = WindowRulesPanelController(
         registry: typeRegistry,
@@ -27,6 +28,12 @@ final class TilerCoordinator {
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
+
+    private struct FloatingStateSnapshot {
+        let userFloatingWindowIDs: Set<CGWindowID>
+        let userTiledWindowIDs: Set<CGWindowID>
+        let ruleSnapshot: WindowRuleSnapshot
+    }
 
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
@@ -69,42 +76,7 @@ final class TilerCoordinator {
     }
 
     func reflowAllVisibleWindows(reason: String = "manual") {
-        let windows = fetchVisibleWindows()
-        let tiled = tiledWindows(from: windows)
-        let plans = layoutPlanner.buildReflowPlans(from: tiled)
-        guard !plans.isEmpty else {
-            Diagnostics.log(
-                "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count), floating=\(windows.count - tiled.count))",
-                level: .debug
-            )
-            return
-        }
-
-        var totalTargets = 0
-        var totalFailures: [CGWindowID] = []
-
-        for plan in plans {
-            let targets = plan.targetFrames
-            totalTargets += targets.count
-
-            Diagnostics.log(
-                "Reflow (\(reason)) display=\(plan.displayID) windows=\(plan.windowsByID.count) targets=\(targets.count)",
-                level: .info
-            )
-
-            let failures = geometryApplier.applySync(
-                reason: "reflow(\(reason))/display=\(plan.displayID)",
-                targetFrames: targets,
-                windowsByID: plan.windowsByID
-            )
-            totalFailures.append(contentsOf: failures)
-        }
-
-        if totalFailures.isEmpty {
-            Diagnostics.log("Reflow (\(reason)) finished successfully for \(totalTargets) windows", level: .info)
-        } else {
-            Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
-        }
+        enqueueFullReflow(reason: reason)
     }
 
     private func handle(_ eventType: MouseEventType, point: CGPoint) {
@@ -160,62 +132,12 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = fetchVisibleWindows()
-        let tiled = tiledWindows(from: windows, including: [dragState.draggedWindowID])
-
-        let previewPlan =
-            layoutPlanner.buildDragPreviewPlan(
-                at: point,
-                windows: tiled,
-                draggedWindowID: dragState.draggedWindowID
-            ) ?? currentPreviewPlan
-
-        let destinationIndex = layoutPlanner.slotIndex(at: point, in: previewPlan) ?? dragState.hoverSlotIndex
-        guard let destinationIndex else {
-            Diagnostics.log(
-                "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
-                level: .debug
-            )
-            clearOverlayState()
-            return
-        }
-
-        guard
-            let drop = layoutPlanner.resolveDrop(
-                previewPlan: previewPlan,
-                dragState: dragState,
-                destinationIndex: destinationIndex,
-                allWindows: tiled
-            )
-        else {
-            Diagnostics.log("Failed to resolve drop for windowID=\(dragState.draggedWindowID)", level: .warn)
-            clearOverlayState()
-            return
-        }
-
         clearOverlayState()
-
-        if !drop.shouldApply {
-            Diagnostics.log(
-                "Drop skipped windowID=\(dragState.draggedWindowID) destination=\(drop.destinationSlotIndex)",
-                level: .debug
-            )
-            return
-        }
-
-        let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
-        Diagnostics.log(
-            "Applying layout from drop windowID=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
-            level: .info
+        enqueueDropReflow(
+            point: point,
+            dragState: dragState,
+            currentPreviewPlan: currentPreviewPlan
         )
-
-        geometryApplier.applyAsync(
-            reason: "drop/window=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
-            targetFrames: drop.targetFrames,
-            windowsByID: drop.windowsByID
-        ) { [weak self] failures in
-            self?.logApplyResult(failures)
-        }
     }
 
     private func handleSecondaryMouseDown(at point: CGPoint) {
@@ -365,6 +287,142 @@ final class TilerCoordinator {
         )
     }
 
+    private func enqueueFullReflow(reason: String) {
+        let floatingState = captureFloatingStateSnapshot()
+        reflowQueue.async { [weak self] in
+            self?.performFullReflow(reason: reason, floatingState: floatingState)
+        }
+    }
+
+    private func performFullReflow(reason: String, floatingState: FloatingStateSnapshot) {
+        Diagnostics.log("Reflow job started (\(reason))", level: .debug)
+        let windows = discovery.fetchVisibleWindows()
+        let liveWindowIDs = Set(windows.map(\.windowID))
+        DispatchQueue.main.async { [weak self] in
+            self?.pruneFloatingState(to: liveWindowIDs)
+        }
+        let semantics = WindowSemanticsClassifier()
+        let tiled = tiledWindows(
+            from: windows,
+            floatingState: floatingState,
+            semanticsClassifier: semantics
+        )
+        let plans = layoutPlanner.buildReflowPlans(from: tiled)
+        guard !plans.isEmpty else {
+            Diagnostics.log(
+                "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count), floating=\(windows.count - tiled.count))",
+                level: .debug
+            )
+            return
+        }
+
+        var totalTargets = 0
+        var totalFailures: [CGWindowID] = []
+        for plan in plans {
+            let targets = plan.targetFrames
+            totalTargets += targets.count
+
+            Diagnostics.log(
+                "Reflow (\(reason)) display=\(plan.displayID) windows=\(plan.windowsByID.count) targets=\(targets.count)",
+                level: .info
+            )
+
+            let failures = geometryApplier.applySync(
+                reason: "reflow(\(reason))/display=\(plan.displayID)",
+                targetFrames: targets,
+                windowsByID: plan.windowsByID
+            )
+            totalFailures.append(contentsOf: failures)
+        }
+
+        if totalFailures.isEmpty {
+            Diagnostics.log("Reflow (\(reason)) finished successfully for \(totalTargets) windows", level: .info)
+        } else {
+            Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
+        }
+    }
+
+    private func enqueueDropReflow(point: CGPoint, dragState: DragState, currentPreviewPlan: DisplayLayoutPlan) {
+        let floatingState = captureFloatingStateSnapshot()
+        reflowQueue.async { [weak self] in
+            self?.performDropReflow(
+                point: point,
+                dragState: dragState,
+                currentPreviewPlan: currentPreviewPlan,
+                floatingState: floatingState
+            )
+        }
+    }
+
+    private func performDropReflow(
+        point: CGPoint,
+        dragState: DragState,
+        currentPreviewPlan: DisplayLayoutPlan,
+        floatingState: FloatingStateSnapshot
+    ) {
+        let windows = discovery.fetchVisibleWindows()
+        let liveWindowIDs = Set(windows.map(\.windowID))
+        DispatchQueue.main.async { [weak self] in
+            self?.pruneFloatingState(to: liveWindowIDs)
+        }
+        let semantics = WindowSemanticsClassifier()
+        let tiled = tiledWindows(
+            from: windows,
+            floatingState: floatingState,
+            including: [dragState.draggedWindowID],
+            semanticsClassifier: semantics
+        )
+
+        let previewPlan =
+            layoutPlanner.buildDragPreviewPlan(
+                at: point,
+                windows: tiled,
+                draggedWindowID: dragState.draggedWindowID
+            ) ?? currentPreviewPlan
+
+        let destinationIndex = layoutPlanner.slotIndex(at: point, in: previewPlan) ?? dragState.hoverSlotIndex
+        guard let destinationIndex else {
+            Diagnostics.log(
+                "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
+                level: .debug
+            )
+            return
+        }
+
+        guard
+            let drop = layoutPlanner.resolveDrop(
+                previewPlan: previewPlan,
+                dragState: dragState,
+                destinationIndex: destinationIndex,
+                allWindows: tiled
+            )
+        else {
+            Diagnostics.log("Failed to resolve drop for windowID=\(dragState.draggedWindowID)", level: .warn)
+            return
+        }
+
+        if !drop.shouldApply {
+            Diagnostics.log(
+                "Drop skipped windowID=\(dragState.draggedWindowID) destination=\(drop.destinationSlotIndex)",
+                level: .debug
+            )
+            return
+        }
+
+        let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
+        Diagnostics.log(
+            "Applying layout from drop windowID=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
+            level: .info
+        )
+
+        let failures = geometryApplier.applySync(
+            reason: "drop/window=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
+            targetFrames: drop.targetFrames,
+            windowsByID: drop.windowsByID
+        )
+        logApplyResult(failures)
+    }
+
     private func fetchVisibleWindows() -> [WindowRef] {
         let windows = discovery.fetchVisibleWindows()
         pruneFloatingState(using: windows)
@@ -373,6 +431,14 @@ final class TilerCoordinator {
             typeRegistry.record(appName: window.appName, descriptor: semantics.descriptor)
         }
         return windows
+    }
+
+    private func captureFloatingStateSnapshot() -> FloatingStateSnapshot {
+        FloatingStateSnapshot(
+            userFloatingWindowIDs: userFloatingWindowIDs,
+            userTiledWindowIDs: userTiledWindowIDs,
+            ruleSnapshot: ruleStore.snapshot()
+        )
     }
 
     private func tiledWindows(from windows: [WindowRef], including included: Set<CGWindowID> = []) -> [WindowRef] {
@@ -384,6 +450,24 @@ final class TilerCoordinator {
         }
     }
 
+    private func tiledWindows(
+        from windows: [WindowRef],
+        floatingState: FloatingStateSnapshot,
+        including included: Set<CGWindowID> = [],
+        semanticsClassifier: WindowSemanticsClassifier
+    ) -> [WindowRef] {
+        windows.filter { window in
+            if included.contains(window.windowID) {
+                return true
+            }
+            return !isFloatingWindow(
+                window,
+                floatingState: floatingState,
+                semanticsClassifier: semanticsClassifier
+            )
+        }
+    }
+
     private func isFloatingWindow(_ window: WindowRef) -> Bool {
         if userFloatingWindowIDs.contains(window.windowID) {
             return true
@@ -392,6 +476,24 @@ final class TilerCoordinator {
             return false
         }
         return isAutomaticallyFloating(window)
+    }
+
+    private func isFloatingWindow(
+        _ window: WindowRef,
+        floatingState: FloatingStateSnapshot,
+        semanticsClassifier: WindowSemanticsClassifier
+    ) -> Bool {
+        if floatingState.userFloatingWindowIDs.contains(window.windowID) {
+            return true
+        }
+        if floatingState.userTiledWindowIDs.contains(window.windowID) {
+            return false
+        }
+        return isAutomaticallyFloating(
+            window,
+            ruleSnapshot: floatingState.ruleSnapshot,
+            semanticsClassifier: semanticsClassifier
+        )
     }
 
     private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
@@ -415,8 +517,37 @@ final class TilerCoordinator {
         return tiny || dialogLike
     }
 
+    private func isAutomaticallyFloating(
+        _ window: WindowRef,
+        ruleSnapshot: WindowRuleSnapshot,
+        semanticsClassifier: WindowSemanticsClassifier
+    ) -> Bool {
+        if ruleSnapshot.isAppForcedFloating(window.appName) {
+            return true
+        }
+
+        let semantics = semanticsClassifier.semantics(for: window)
+        if ruleSnapshot.isTypeForcedFloating(semantics.descriptor) {
+            return true
+        }
+
+        if semantics.isSpecialFloating {
+            return true
+        }
+
+        // Fallback heuristics for apps with weak AX metadata.
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tiny = window.frame.width <= 260 || window.frame.height <= 140
+        let dialogLike = title.isEmpty && window.frame.width <= 520 && window.frame.height <= 360
+        return tiny || dialogLike
+    }
+
     private func pruneFloatingState(using windows: [WindowRef]) {
         let liveIDs = Set(windows.map(\.windowID))
+        pruneFloatingState(to: liveIDs)
+    }
+
+    private func pruneFloatingState(to liveIDs: Set<CGWindowID>) {
         userFloatingWindowIDs.formIntersection(liveIDs)
         userTiledWindowIDs.formIntersection(liveIDs)
         semanticsClassifier.prune(to: liveIDs)

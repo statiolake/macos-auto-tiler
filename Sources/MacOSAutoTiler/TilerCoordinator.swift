@@ -9,6 +9,7 @@ final class TilerCoordinator {
     private let actuator = AXWindowActuator()
     private let actuationQueue = DispatchQueue(label: "com.dicen.macosautotiler.actuation")
 
+    private var pendingDrag: PendingDrag?
     private var dragState: DragState?
     private var activeLayout: ActiveLayoutContext?
     private var lastLoggedHoverIndex: Int?
@@ -53,7 +54,7 @@ final class TilerCoordinator {
 
     func stop() {
         eventTap.stop()
-        overlay.hide()
+        resetDragSession()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
 
@@ -110,26 +111,64 @@ final class TilerCoordinator {
     private func handle(_ eventType: MouseEventType, point: CGPoint) {
         switch eventType {
         case .down:
-            beginDrag(at: point)
+            capturePendingDrag(at: point)
         case .dragged:
-            updateDrag(at: point)
+            if dragState != nil {
+                updateDrag(at: point)
+            } else {
+                maybeActivateDrag(at: point)
+            }
         case .up:
-            endDrag(at: point)
+            if dragState != nil {
+                endDrag(at: point)
+            } else {
+                pendingDrag = nil
+            }
         }
     }
 
-    private func beginDrag(at point: CGPoint) {
+    private func capturePendingDrag(at point: CGPoint) {
         let windows = discovery.fetchVisibleWindows()
         guard let dragged = windows.first(where: { $0.frame.contains(point) }) else {
+            pendingDrag = nil
             Diagnostics.log("Mouse down at \(point) but no window hit", level: .debug)
             return
         }
 
+        pendingDrag = PendingDrag(
+            windowID: dragged.windowID,
+            pid: dragged.pid,
+            startPoint: point,
+            originalFrame: dragged.frame,
+            appName: dragged.appName
+        )
+        Diagnostics.log(
+            "Pending drag captured windowID=\(dragged.windowID) app=\(dragged.appName)",
+            level: .debug
+        )
+    }
+
+    private func maybeActivateDrag(at point: CGPoint) {
+        guard let pendingDrag else {
+            return
+        }
+        guard let latestWindow = discovery.fetchWindow(windowID: pendingDrag.windowID) else {
+            return
+        }
+        guard hasWindowMoved(original: pendingDrag.originalFrame, current: latestWindow.frame) else {
+            return
+        }
+
+        activateDragSession(draggedWindow: latestWindow, point: point)
+    }
+
+    private func activateDragSession(draggedWindow dragged: WindowRef, point: CGPoint) {
         guard let displayID = DisplayService.displayID(containing: point) else {
             Diagnostics.log("Failed to resolve display for drag start at \(point)", level: .warn)
             return
         }
 
+        let windows = discovery.fetchVisibleWindows()
         let displayBounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
         let displayWindows = windows.filter { window in
             let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
@@ -168,6 +207,7 @@ final class TilerCoordinator {
             order: order,
             windowsByID: windowsByID
         )
+        pendingDrag = nil
         lastLoggedHoverIndex = hoverIndex
         Diagnostics.log("Using visible bounds for display \(displayID): \(displayBounds)", level: .debug)
         Diagnostics.log(
@@ -291,9 +331,19 @@ final class TilerCoordinator {
 
     private func resetDragSession() {
         overlay.hide()
+        pendingDrag = nil
         dragState = nil
         activeLayout = nil
         lastLoggedHoverIndex = nil
+    }
+
+    private func hasWindowMoved(original: CGRect, current: CGRect) -> Bool {
+        let moveThreshold: CGFloat = 4
+        return
+            abs(original.origin.x - current.origin.x) >= moveThreshold ||
+            abs(original.origin.y - current.origin.y) >= moveThreshold ||
+            abs(original.size.width - current.size.width) >= moveThreshold ||
+            abs(original.size.height - current.size.height) >= moveThreshold
     }
 
     private func shouldSkipSameSlotReflow(for layout: ActiveLayoutContext) -> Bool {

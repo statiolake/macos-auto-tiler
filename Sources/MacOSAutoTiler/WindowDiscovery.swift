@@ -48,4 +48,8 @@ final class WindowDiscovery {
         Diagnostics.log("Discovered \(windows.count) visible candidate windows", level: .debug)
         return windows
     }
+
+    func fetchWindow(windowID: CGWindowID) -> WindowRef? {
+        fetchVisibleWindows().first { $0.windowID == windowID }
+    }
 }

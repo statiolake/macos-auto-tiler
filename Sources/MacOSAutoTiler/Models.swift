@@ -28,6 +28,14 @@ struct DragState {
     var hoverSlotIndex: Int?
 }
 
+struct PendingDrag {
+    let windowID: CGWindowID
+    let pid: pid_t
+    let startPoint: CGPoint
+    let originalFrame: CGRect
+    let appName: String
+}
+
 struct ActiveLayoutContext {
     let displayID: CGDirectDisplayID
     var slots: [Slot]

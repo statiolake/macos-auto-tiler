@@ -13,6 +13,9 @@ final class TilerCoordinator {
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
 
+    private var userFloatingWindowIDs = Set<CGWindowID>()
+    private var userTiledWindowIDs = Set<CGWindowID>()
+
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
@@ -64,10 +67,14 @@ final class TilerCoordinator {
     }
 
     func reflowAllVisibleWindows(reason: String = "manual") {
-        let windows = discovery.fetchVisibleWindows()
-        let plans = layoutPlanner.buildReflowPlans(from: windows)
+        let windows = fetchVisibleWindows()
+        let tiled = tiledWindows(from: windows)
+        let plans = layoutPlanner.buildReflowPlans(from: tiled)
         guard !plans.isEmpty else {
-            Diagnostics.log("Reflow (\(reason)) skipped: no candidate windows", level: .debug)
+            Diagnostics.log(
+                "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count), floating=\(windows.count - tiled.count))",
+                level: .debug
+            )
             return
         }
 
@@ -106,13 +113,15 @@ final class TilerCoordinator {
             handleMouseDragged(at: point)
         case .up:
             handleMouseUp(at: point)
+        case .secondaryDown:
+            handleSecondaryMouseDown(at: point)
         }
     }
 
     private func handleMouseDown(at point: CGPoint) {
         resetInteractionState()
 
-        let windows = discovery.fetchVisibleWindows()
+        let windows = fetchVisibleWindows()
         guard let dragged = windows.first(where: { $0.frame.contains(point) }) else {
             Diagnostics.log("Mouse down at \(point) but no window hit", level: .debug)
             return
@@ -136,7 +145,7 @@ final class TilerCoordinator {
 
     private func handleMouseUp(at point: CGPoint) {
         guard let currentPreviewPlan = activePlan else {
-            dragTracker.clearPendingDrag()
+            resetInteractionState()
             return
         }
 
@@ -145,11 +154,13 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = discovery.fetchVisibleWindows()
+        let windows = fetchVisibleWindows()
+        let tiled = tiledWindows(from: windows, including: [dragState.draggedWindowID])
+
         let previewPlan =
             layoutPlanner.buildDragPreviewPlan(
                 at: point,
-                windows: windows,
+                windows: tiled,
                 draggedWindowID: dragState.draggedWindowID
             ) ?? currentPreviewPlan
 
@@ -168,7 +179,7 @@ final class TilerCoordinator {
                 previewPlan: previewPlan,
                 dragState: dragState,
                 destinationIndex: destinationIndex,
-                allWindows: windows
+                allWindows: tiled
             )
         else {
             Diagnostics.log("Failed to resolve drop for windowID=\(dragState.draggedWindowID)", level: .warn)
@@ -201,39 +212,74 @@ final class TilerCoordinator {
         }
     }
 
+    private func handleSecondaryMouseDown(at point: CGPoint) {
+        guard let draggedWindowID = dragTracker.draggedWindowID else {
+            return
+        }
+
+        let windows = fetchVisibleWindows()
+        guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
+            return
+        }
+
+        if isFloatingWindow(draggedWindow) {
+            userFloatingWindowIDs.remove(draggedWindowID)
+            userTiledWindowIDs.insert(draggedWindowID)
+            Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> tiled", level: .info)
+            activateDragSession(draggedWindow: draggedWindow, point: point, windows: windows)
+        } else {
+            userTiledWindowIDs.remove(draggedWindowID)
+            userFloatingWindowIDs.insert(draggedWindowID)
+            Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> floating", level: .info)
+            clearOverlayState()
+            reflowAllVisibleWindows(reason: "floating-toggle")
+        }
+    }
+
     private func maybeActivateDrag(at point: CGPoint) {
         guard let pendingWindowID = dragTracker.pendingWindowID else {
             return
         }
-        guard let latestWindow = discovery.fetchWindow(windowID: pendingWindowID) else {
+
+        let windows = fetchVisibleWindows()
+        guard let latestWindow = windows.first(where: { $0.windowID == pendingWindowID }) else {
             dragTracker.clearPendingDrag()
             return
         }
+
         guard dragTracker.maybeActivateDrag(currentPoint: point, latestWindow: latestWindow) != nil else {
             return
         }
 
-        activateDragSession(draggedWindow: latestWindow, point: point)
+        if isFloatingWindow(latestWindow) {
+            Diagnostics.log("Dragging floating windowID=\(latestWindow.windowID) (tiler preview disabled)", level: .debug)
+            clearOverlayState()
+            return
+        }
+
+        activateDragSession(draggedWindow: latestWindow, point: point, windows: windows)
     }
 
-    private func activateDragSession(draggedWindow: WindowRef, point: CGPoint) {
-        let windows = discovery.fetchVisibleWindows()
+    private func activateDragSession(draggedWindow: WindowRef, point: CGPoint, windows: [WindowRef]? = nil) {
+        let allWindows = windows ?? fetchVisibleWindows()
+        let tiled = tiledWindows(from: allWindows, including: [draggedWindow.windowID])
+
         guard
             let plan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
-                windows: windows,
+                windows: tiled,
                 draggedWindowID: draggedWindow.windowID
             )
         else {
             Diagnostics.log("No windows found for drag session at point=\(point)", level: .warn)
-            resetInteractionState()
+            clearOverlayState()
             return
         }
 
         let hoverIndex = layoutPlanner.slotIndex(at: point, in: plan)
         guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
             Diagnostics.log("Failed to update drag state during activation", level: .warn)
-            resetInteractionState()
+            clearOverlayState()
             return
         }
 
@@ -253,11 +299,22 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = discovery.fetchVisibleWindows()
+        let windows = fetchVisibleWindows()
+        guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
+            resetInteractionState()
+            return
+        }
+
+        if isFloatingWindow(draggedWindow) {
+            clearOverlayState()
+            return
+        }
+
+        let tiled = tiledWindows(from: windows, including: [draggedWindowID])
         guard
             let previewPlan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
-                windows: windows,
+                windows: tiled,
                 draggedWindowID: draggedWindowID
             )
         else {
@@ -300,6 +357,44 @@ final class TilerCoordinator {
             hoverIndex: dragState.hoverSlotIndex,
             ghostRect: ghostRect
         )
+    }
+
+    private func fetchVisibleWindows() -> [WindowRef] {
+        let windows = discovery.fetchVisibleWindows()
+        pruneFloatingState(using: windows)
+        return windows
+    }
+
+    private func tiledWindows(from windows: [WindowRef], including included: Set<CGWindowID> = []) -> [WindowRef] {
+        windows.filter { window in
+            if included.contains(window.windowID) {
+                return true
+            }
+            return !isFloatingWindow(window)
+        }
+    }
+
+    private func isFloatingWindow(_ window: WindowRef) -> Bool {
+        if userFloatingWindowIDs.contains(window.windowID) {
+            return true
+        }
+        if userTiledWindowIDs.contains(window.windowID) {
+            return false
+        }
+        return isAutomaticallyFloating(window)
+    }
+
+    private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tiny = window.frame.width <= 260 || window.frame.height <= 140
+        let dialogLike = title.isEmpty && window.frame.width <= 520 && window.frame.height <= 360
+        return tiny || dialogLike
+    }
+
+    private func pruneFloatingState(using windows: [WindowRef]) {
+        let liveIDs = Set(windows.map(\.windowID))
+        userFloatingWindowIDs.formIntersection(liveIDs)
+        userTiledWindowIDs.formIntersection(liveIDs)
     }
 
     private func setupActiveSpaceObserver() {

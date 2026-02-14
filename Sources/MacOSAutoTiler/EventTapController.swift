@@ -5,6 +5,7 @@ enum MouseEventType {
     case down
     case dragged
     case up
+    case secondaryDown
 }
 
 final class EventTapController {
@@ -20,7 +21,8 @@ final class EventTapController {
         let mask =
             (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
             (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
-            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
+            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
+            (CGEventMask(1) << CGEventType.rightMouseDown.rawValue)
 
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         guard
@@ -84,6 +86,8 @@ final class EventTapController {
             handler(.dragged, point)
         case .leftMouseUp:
             handler(.up, point)
+        case .rightMouseDown:
+            handler(.secondaryDown, point)
         default:
             break
         }

@@ -8,10 +8,12 @@ final class TilerCoordinator {
     private let eventTap = EventTapController()
     private let geometryApplier = WindowGeometryApplier()
     private let dragTracker = DragInteractionTracker()
+    private let lifecycleMonitor = WindowLifecycleMonitor()
 
     private var activeSpaceObserver: NSObjectProtocol?
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
+    private var needsDeferredLifecycleReflow = false
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
@@ -54,9 +56,11 @@ final class TilerCoordinator {
         }
 
         setupActiveSpaceObserver()
+        startLifecycleMonitor()
     }
 
     func stop() {
+        lifecycleMonitor.stop()
         eventTap.stop()
         if let activeSpaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
@@ -144,6 +148,10 @@ final class TilerCoordinator {
     }
 
     private func handleMouseUp(at point: CGPoint) {
+        defer {
+            applyDeferredLifecycleReflowIfNeeded()
+        }
+
         guard let currentPreviewPlan = activePlan else {
             resetInteractionState()
             return
@@ -414,6 +422,30 @@ final class TilerCoordinator {
             Diagnostics.log("Active space changed, triggering reflow", level: .info)
             self.reflowAllVisibleWindows(reason: "space-change")
         }
+    }
+
+    private func startLifecycleMonitor() {
+        lifecycleMonitor.start { [weak self] reason in
+            guard let self else { return }
+            guard Permissions.ensureAccessibilityPermission(prompt: false) else { return }
+
+            if dragTracker.isDragging {
+                needsDeferredLifecycleReflow = true
+                Diagnostics.log("Lifecycle reflow deferred during drag reason=\(reason)", level: .debug)
+                return
+            }
+
+            Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
+            reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
+        }
+    }
+
+    private func applyDeferredLifecycleReflowIfNeeded() {
+        guard needsDeferredLifecycleReflow else {
+            return
+        }
+        needsDeferredLifecycleReflow = false
+        reflowAllVisibleWindows(reason: "lifecycle:deferred")
     }
 
     private func clearOverlayState() {

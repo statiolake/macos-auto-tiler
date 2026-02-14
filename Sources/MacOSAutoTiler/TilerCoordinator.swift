@@ -9,6 +9,7 @@ final class TilerCoordinator {
     private let geometryApplier = WindowGeometryApplier()
     private let dragTracker = DragInteractionTracker()
     private let lifecycleMonitor = WindowLifecycleMonitor()
+    private let semanticsClassifier = WindowSemanticsClassifier()
 
     private var activeSpaceObserver: NSObjectProtocol?
     private var activePlan: DisplayLayoutPlan?
@@ -393,6 +394,11 @@ final class TilerCoordinator {
     }
 
     private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
+        if semanticsClassifier.isSpecialFloating(window: window) {
+            return true
+        }
+
+        // Fallback heuristics for apps with weak AX metadata.
         let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let tiny = window.frame.width <= 260 || window.frame.height <= 140
         let dialogLike = title.isEmpty && window.frame.width <= 520 && window.frame.height <= 360
@@ -403,6 +409,7 @@ final class TilerCoordinator {
         let liveIDs = Set(windows.map(\.windowID))
         userFloatingWindowIDs.formIntersection(liveIDs)
         userTiledWindowIDs.formIntersection(liveIDs)
+        semanticsClassifier.prune(to: liveIDs)
     }
 
     private func setupActiveSpaceObserver() {

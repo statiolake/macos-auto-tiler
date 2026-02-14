@@ -69,23 +69,65 @@ final class LayoutEngine {
         slots.firstIndex { $0.rect.contains(point) }
     }
 
-    func reflow(order: [CGWindowID], draggedID: CGWindowID, destinationIndex: Int) -> [CGWindowID] {
-        guard let sourceIndex = order.firstIndex(of: draggedID) else {
-            return order
+    func assignWindowsToNearestSlots(
+        windows: [WindowRef],
+        slots: [Slot]
+    ) -> (slotToWindowID: [Int: CGWindowID], windowToSlotIndex: [CGWindowID: Int]) {
+        guard !windows.isEmpty, !slots.isEmpty else {
+            return ([:], [:])
         }
 
-        var next = order
-        next.remove(at: sourceIndex)
-        let clamped = max(0, min(destinationIndex, next.count))
-        next.insert(draggedID, at: clamped)
-        return next
+        struct Pair {
+            let distance: CGFloat
+            let slotIndex: Int
+            let windowID: CGWindowID
+        }
+
+        var pairs: [Pair] = []
+        pairs.reserveCapacity(windows.count * slots.count)
+        for (slotIndex, slot) in slots.enumerated() {
+            let slotCenter = CGPoint(x: slot.rect.midX, y: slot.rect.midY)
+            for window in windows {
+                let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
+                let distance = hypot(center.x - slotCenter.x, center.y - slotCenter.y)
+                pairs.append(Pair(distance: distance, slotIndex: slotIndex, windowID: window.windowID))
+            }
+        }
+
+        pairs.sort {
+            if $0.distance != $1.distance { return $0.distance < $1.distance }
+            if $0.slotIndex != $1.slotIndex { return $0.slotIndex < $1.slotIndex }
+            return $0.windowID < $1.windowID
+        }
+
+        var usedSlots = Set<Int>()
+        var usedWindows = Set<CGWindowID>()
+        var slotToWindowID: [Int: CGWindowID] = [:]
+        var windowToSlotIndex: [CGWindowID: Int] = [:]
+
+        for pair in pairs {
+            if usedSlots.contains(pair.slotIndex) || usedWindows.contains(pair.windowID) {
+                continue
+            }
+            usedSlots.insert(pair.slotIndex)
+            usedWindows.insert(pair.windowID)
+            slotToWindowID[pair.slotIndex] = pair.windowID
+            windowToSlotIndex[pair.windowID] = pair.slotIndex
+            if usedWindows.count == windows.count || usedSlots.count == slots.count {
+                break
+            }
+        }
+
+        return (slotToWindowID, windowToSlotIndex)
     }
 
-    func targets(for slots: [Slot], order: [CGWindowID]) -> [CGWindowID: CGRect] {
+    func targets(for slots: [Slot], slotToWindowID: [Int: CGWindowID]) -> [CGWindowID: CGRect] {
         var result: [CGWindowID: CGRect] = [:]
-        let count = min(slots.count, order.count)
-        for index in 0..<count {
-            result[order[index]] = slots[index].rect
+        for (slotIndex, windowID) in slotToWindowID {
+            guard slotIndex >= 0, slotIndex < slots.count else {
+                continue
+            }
+            result[windowID] = slots[slotIndex].rect
         }
         return result
     }

@@ -39,6 +39,7 @@ struct PendingDrag {
 struct ActiveLayoutContext {
     let displayID: CGDirectDisplayID
     var slots: [Slot]
-    var order: [CGWindowID]
+    var slotToWindowID: [Int: CGWindowID]
+    var windowToSlotIndex: [CGWindowID: Int]
     var windowsByID: [CGWindowID: WindowRef]
 }

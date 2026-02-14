@@ -9,6 +9,7 @@ final class TilerCoordinator {
     private let actuator = AXWindowActuator()
     private let actuationQueue = DispatchQueue(label: "com.dicen.macosautotiler.actuation")
 
+    private var activeSpaceObserver: NSObjectProtocol?
     private var pendingDrag: PendingDrag?
     private var dragState: DragState?
     private var activeLayout: ActiveLayoutContext?
@@ -50,10 +51,16 @@ final class TilerCoordinator {
             }
             self.reflowAllVisibleWindows(reason: "startup")
         }
+
+        setupActiveSpaceObserver()
     }
 
     func stop() {
         eventTap.stop()
+        if let activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
+            self.activeSpaceObserver = nil
+        }
         resetDragSession()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
@@ -89,8 +96,8 @@ final class TilerCoordinator {
 
             let bounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
             let slots = layoutEngine.makeSlots(for: displayWindows.count, in: bounds)
-            let order = displayWindows.map(\.windowID)
-            let targets = layoutEngine.targets(for: slots, order: order)
+            let assignment = layoutEngine.assignWindowsToNearestSlots(windows: displayWindows, slots: slots)
+            let targets = layoutEngine.targets(for: slots, slotToWindowID: assignment.slotToWindowID)
             totalTargets += targets.count
 
             Diagnostics.log(
@@ -179,13 +186,8 @@ final class TilerCoordinator {
             return
         }
 
-        var slots = layoutEngine.makeSlots(for: displayWindows.count, in: displayBounds)
-        let order = displayWindows.map(\.windowID)
-        for index in slots.indices {
-            if index < order.count {
-                slots[index].windowID = order[index]
-            }
-        }
+        let slots = layoutEngine.makeSlots(for: displayWindows.count, in: displayBounds)
+        let assignment = layoutEngine.assignWindowsToNearestSlots(windows: displayWindows, slots: slots)
 
         var windowsByID: [CGWindowID: WindowRef] = [:]
         for window in displayWindows {
@@ -204,7 +206,8 @@ final class TilerCoordinator {
         activeLayout = ActiveLayoutContext(
             displayID: displayID,
             slots: slots,
-            order: order,
+            slotToWindowID: assignment.slotToWindowID,
+            windowToSlotIndex: assignment.windowToSlotIndex,
             windowsByID: windowsByID
         )
         pendingDrag = nil
@@ -252,27 +255,44 @@ final class TilerCoordinator {
             return
         }
 
-        if let sourceIndex = activeLayout.order.firstIndex(of: dragState.draggedWindowID), sourceIndex == destinationIndex {
-            if shouldSkipSameSlotReflow(for: activeLayout) {
-                Diagnostics.log(
-                    "Reflow skipped windowID=\(dragState.draggedWindowID) source==destination (\(sourceIndex)) and frames already settled",
-                    level: .debug
-                )
-                resetDragSession()
-                return
-            }
-            Diagnostics.log(
-                "Source==destination but frames are not settled, applying normalization reflow",
-                level: .debug
-            )
+        guard let sourceIndex = activeLayout.windowToSlotIndex[dragState.draggedWindowID] else {
+            Diagnostics.log("Dragged window is not assigned to any slot, skipping drop", level: .warn)
+            resetDragSession()
+            return
         }
 
-        let nextOrder = layoutEngine.reflow(
-            order: activeLayout.order,
-            draggedID: dragState.draggedWindowID,
-            destinationIndex: destinationIndex
-        )
-        let targets = layoutEngine.targets(for: activeLayout.slots, order: nextOrder)
+        var targets: [CGWindowID: CGRect] = [:]
+        if sourceIndex == destinationIndex {
+            if
+                let latest = discovery.fetchWindow(windowID: dragState.draggedWindowID),
+                !isFrameRoughlyEqual(latest.frame, activeLayout.slots[sourceIndex].rect)
+            {
+                targets[dragState.draggedWindowID] = activeLayout.slots[sourceIndex].rect
+                Diagnostics.log(
+                    "Applying normalization for same-slot drop windowID=\(dragState.draggedWindowID)",
+                    level: .debug
+                )
+            } else {
+                Diagnostics.log(
+                    "Drop skipped windowID=\(dragState.draggedWindowID) source==destination (\(sourceIndex))",
+                    level: .debug
+                )
+            }
+        } else {
+            targets[dragState.draggedWindowID] = activeLayout.slots[destinationIndex].rect
+            if
+                let destinationWindowID = activeLayout.slotToWindowID[destinationIndex],
+                destinationWindowID != dragState.draggedWindowID
+            {
+                targets[destinationWindowID] = activeLayout.slots[sourceIndex].rect
+            }
+        }
+
+        if targets.isEmpty {
+            resetDragSession()
+            return
+        }
+
         let windowsByID = activeLayout.windowsByID
         let draggedWindowID = dragState.draggedWindowID
 
@@ -329,6 +349,25 @@ final class TilerCoordinator {
         }
     }
 
+    private func setupActiveSpaceObserver() {
+        guard activeSpaceObserver == nil else {
+            return
+        }
+
+        activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            guard Permissions.ensureAccessibilityPermission(prompt: false) else {
+                return
+            }
+            Diagnostics.log("Active space changed, triggering reflow", level: .info)
+            self.reflowAllVisibleWindows(reason: "space-change")
+        }
+    }
+
     private func resetDragSession() {
         overlay.hide()
         pendingDrag = nil
@@ -344,25 +383,6 @@ final class TilerCoordinator {
             abs(original.origin.y - current.origin.y) >= moveThreshold ||
             abs(original.size.width - current.size.width) >= moveThreshold ||
             abs(original.size.height - current.size.height) >= moveThreshold
-    }
-
-    private func shouldSkipSameSlotReflow(for layout: ActiveLayoutContext) -> Bool {
-        let targets = layoutEngine.targets(for: layout.slots, order: layout.order)
-        let currentWindows = discovery.fetchVisibleWindows()
-        var currentByID: [CGWindowID: CGRect] = [:]
-        for window in currentWindows {
-            currentByID[window.windowID] = window.frame
-        }
-
-        for (windowID, target) in targets {
-            guard let current = currentByID[windowID] else {
-                return false
-            }
-            if !isFrameRoughlyEqual(current, target) {
-                return false
-            }
-        }
-        return true
     }
 
     private func isFrameRoughlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {

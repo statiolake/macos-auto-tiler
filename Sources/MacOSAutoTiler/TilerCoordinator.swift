@@ -7,6 +7,7 @@ final class TilerCoordinator {
     private let overlay = OverlayWindowController()
     private let eventTap = EventTapController()
     private let actuator = AXWindowActuator()
+    private let actuationQueue = DispatchQueue(label: "com.dicen.macosautotiler.actuation")
 
     private var dragState: DragState?
     private var activeLayout: ActiveLayoutContext?
@@ -85,17 +86,17 @@ final class TilerCoordinator {
                 windowsByID[window.windowID] = window
             }
 
-            let bounds = DisplayService.bounds(for: displayID).insetBy(dx: 12, dy: 12)
+            let bounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
             let slots = layoutEngine.makeSlots(for: displayWindows.count, in: bounds)
             let order = displayWindows.map(\.windowID)
             let targets = layoutEngine.targets(for: slots, order: order)
             totalTargets += targets.count
 
             Diagnostics.log(
-                "Reflow (\(reason)) display=\(displayID) windows=\(displayWindows.count) targets=\(targets.count)",
+                "Reflow (\(reason)) display=\(displayID) bounds=\(bounds) windows=\(displayWindows.count) targets=\(targets.count)",
                 level: .info
             )
-            let failures = actuator.apply(targetFrames: targets, windows: windowsByID)
+            let failures = applyTargetsSync(targets, windows: windowsByID)
             totalFailures.append(contentsOf: failures)
         }
 
@@ -129,7 +130,7 @@ final class TilerCoordinator {
             return
         }
 
-        let displayBounds = DisplayService.bounds(for: displayID).insetBy(dx: 12, dy: 12)
+        let displayBounds = DisplayService.visibleBounds(for: displayID).insetBy(dx: 12, dy: 12)
         let displayWindows = windows.filter { window in
             let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
             return DisplayService.displayID(containing: midpoint) == displayID
@@ -168,6 +169,7 @@ final class TilerCoordinator {
             windowsByID: windowsByID
         )
         lastLoggedHoverIndex = hoverIndex
+        Diagnostics.log("Using visible bounds for display \(displayID): \(displayBounds)", level: .debug)
         Diagnostics.log(
             "Drag begin windowID=\(dragged.windowID) app=\(dragged.appName) title=\"\(dragged.title)\" display=\(displayID) slots=\(slots.count) hover=\(hoverIndex?.description ?? "nil")",
             level: .info
@@ -195,27 +197,34 @@ final class TilerCoordinator {
 
     private func endDrag(at point: CGPoint) {
         guard var dragState, let activeLayout else {
-            overlay.hide()
-            self.dragState = nil
-            self.activeLayout = nil
+            resetDragSession()
             return
         }
 
         dragState.currentPoint = point
         let destinationIndex = layoutEngine.slotIndex(at: point, in: activeLayout.slots) ?? dragState.hoverSlotIndex
-        defer {
-            overlay.hide()
-            self.dragState = nil
-            self.activeLayout = nil
-            self.lastLoggedHoverIndex = nil
-        }
-
         guard let destinationIndex else {
             Diagnostics.log(
                 "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
                 level: .debug
             )
+            resetDragSession()
             return
+        }
+
+        if let sourceIndex = activeLayout.order.firstIndex(of: dragState.draggedWindowID), sourceIndex == destinationIndex {
+            if shouldSkipSameSlotReflow(for: activeLayout) {
+                Diagnostics.log(
+                    "Reflow skipped windowID=\(dragState.draggedWindowID) source==destination (\(sourceIndex)) and frames already settled",
+                    level: .debug
+                )
+                resetDragSession()
+                return
+            }
+            Diagnostics.log(
+                "Source==destination but frames are not settled, applying normalization reflow",
+                level: .debug
+            )
         }
 
         let nextOrder = layoutEngine.reflow(
@@ -224,16 +233,17 @@ final class TilerCoordinator {
             destinationIndex: destinationIndex
         )
         let targets = layoutEngine.targets(for: activeLayout.slots, order: nextOrder)
+        let windowsByID = activeLayout.windowsByID
+        let draggedWindowID = dragState.draggedWindowID
+
+        // Hide preview immediately, then apply AX updates off the main thread.
+        resetDragSession()
+
         Diagnostics.log(
-            "Applying reflow windowID=\(dragState.draggedWindowID) destination=\(destinationIndex) movedWindows=\(targets.count)",
+            "Applying reflow windowID=\(draggedWindowID) destination=\(destinationIndex) movedWindows=\(targets.count)",
             level: .info
         )
-        let failures = actuator.apply(targetFrames: targets, windows: activeLayout.windowsByID)
-        if !failures.isEmpty {
-            Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
-        } else {
-            Diagnostics.log("AX apply completed successfully", level: .info)
-        }
+        applyTargetsAsync(targets, windows: windowsByID)
     }
 
     private func renderOverlay() {
@@ -257,6 +267,61 @@ final class TilerCoordinator {
             hoverIndex: dragState.hoverSlotIndex,
             ghostRect: ghostRect
         )
+    }
+
+    private func applyTargetsSync(_ targets: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
+        actuationQueue.sync {
+            actuator.apply(targetFrames: targets, windows: windows)
+        }
+    }
+
+    private func applyTargetsAsync(_ targets: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) {
+        actuationQueue.async { [weak self] in
+            guard let self else { return }
+            let failures = self.actuator.apply(targetFrames: targets, windows: windows)
+            DispatchQueue.main.async {
+                if !failures.isEmpty {
+                    Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
+                } else {
+                    Diagnostics.log("AX apply completed successfully", level: .info)
+                }
+            }
+        }
+    }
+
+    private func resetDragSession() {
+        overlay.hide()
+        dragState = nil
+        activeLayout = nil
+        lastLoggedHoverIndex = nil
+    }
+
+    private func shouldSkipSameSlotReflow(for layout: ActiveLayoutContext) -> Bool {
+        let targets = layoutEngine.targets(for: layout.slots, order: layout.order)
+        let currentWindows = discovery.fetchVisibleWindows()
+        var currentByID: [CGWindowID: CGRect] = [:]
+        for window in currentWindows {
+            currentByID[window.windowID] = window.frame
+        }
+
+        for (windowID, target) in targets {
+            guard let current = currentByID[windowID] else {
+                return false
+            }
+            if !isFrameRoughlyEqual(current, target) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func isFrameRoughlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        let tolerance: CGFloat = 6
+        return
+            abs(lhs.origin.x - rhs.origin.x) <= tolerance &&
+            abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
+            abs(lhs.size.width - rhs.size.width) <= tolerance &&
+            abs(lhs.size.height - rhs.size.height) <= tolerance
     }
 
     private func presentPermissionAlert(title: String, message: String) {

@@ -4,19 +4,18 @@ import Foundation
 
 final class AXWindowActuator {
     private var cache: [CGWindowID: AXUIElement] = [:]
-    private let maxAttempts = 3
-    private let settleDelay: TimeInterval = 0.04
-    private let originTolerance: CGFloat = 2.0
-    private let sizeTolerance: CGFloat = 3.0
+    private let applyOriginThreshold: CGFloat = 1.0
+    private let applySizeThreshold: CGFloat = 1.0
+    private let axEnhancedUserInterfaceAttribute: CFString = "AXEnhancedUserInterface" as CFString
 
     func apply(targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
         let sortedIDs = targetFrames.keys.sorted()
         Diagnostics.log("AX apply start for \(sortedIDs.count) windows", level: .debug)
         var failures: [CGWindowID] = []
-        var resolved: [CGWindowID: AXUIElement] = [:]
 
         for windowID in sortedIDs {
             guard
+                let target = targetFrames[windowID],
                 let window = windows[windowID],
                 let axWindow = resolveAXWindow(for: window)
             else {
@@ -24,62 +23,31 @@ final class AXWindowActuator {
                 failures.append(windowID)
                 continue
             }
-            resolved[windowID] = axWindow
-        }
 
-        var pending = Set(resolved.keys)
-        if !pending.isEmpty {
-            for attempt in 1...maxAttempts {
-                if pending.isEmpty {
-                    break
-                }
-                Diagnostics.log("AX apply attempt=\(attempt) pending=\(pending.count)", level: .debug)
-
-                for windowID in pending {
-                    guard
-                        let target = targetFrames[windowID],
-                        let axWindow = resolved[windowID]
-                    else {
-                        continue
-                    }
-                    _ = setFrame(target, on: axWindow, windowID: windowID)
-                }
-
-                Thread.sleep(forTimeInterval: settleDelay)
-
-                var stillPending: Set<CGWindowID> = []
-                for windowID in pending {
-                    guard
-                        let target = targetFrames[windowID],
-                        let axWindow = resolved[windowID]
-                    else {
-                        stillPending.insert(windowID)
-                        continue
-                    }
-                    guard let actual = copyFrame(of: axWindow) else {
-                        stillPending.insert(windowID)
-                        continue
-                    }
-                    if !isFrameClose(actual, target) {
-                        stillPending.insert(windowID)
-                        Diagnostics.log(
-                            "AX frame mismatch windowID=\(windowID) target=\(target) actual=\(actual)",
-                            level: .debug
-                        )
-                    }
-                }
-                pending = stillPending
+            let success = setFrame(target, on: axWindow, windowID: windowID, pid: window.pid)
+            if !success {
+                cache.removeValue(forKey: windowID)
+                failures.append(windowID)
+                continue
             }
-        }
 
-        for windowID in pending {
-            cache.removeValue(forKey: windowID)
-            failures.append(windowID)
-            Diagnostics.log("AX frame did not converge windowID=\(windowID)", level: .warn)
+            if let actual = copyFrame(of: axWindow), !isFrameRoughlyEqual(actual, target) {
+                Diagnostics.log(
+                    "AX frame mismatch \(windowLabel(windowID, windows: windows)) target=\(target) actual=\(actual)",
+                    level: .debug
+                )
+            }
         }
 
         Diagnostics.log("AX apply completed with failures=\(failures.count)", level: .debug)
         return failures.sorted()
+    }
+
+    private func windowLabel(_ windowID: CGWindowID, windows: [CGWindowID: WindowRef]) -> String {
+        guard let window = windows[windowID] else {
+            return "windowID=\(windowID)"
+        }
+        return "windowID=\(windowID) app=\(window.appName) title=\"\(window.title)\""
     }
 
     private func resolveAXWindow(for window: WindowRef) -> AXUIElement? {
@@ -195,31 +163,101 @@ final class AXWindowActuator {
         return AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, value)
     }
 
-    private func setFrame(_ frame: CGRect, on axWindow: AXUIElement, windowID: CGWindowID) -> Bool {
-        let sizeResultA = setSize(frame.size, on: axWindow)
-        let positionResultA = setPosition(frame.origin, on: axWindow)
-        if sizeResultA == .success, positionResultA == .success {
-            return true
+    private func setFrame(_ frame: CGRect, on axWindow: AXUIElement, windowID: CGWindowID, pid: pid_t?) -> Bool {
+        let work: () -> Bool = { [self] in
+            let current = self.copyFrame(of: axWindow)
+            let canSetPosition = self.isAttributeSettable(kAXPositionAttribute as CFString, on: axWindow)
+            let canSetSize = self.isAttributeSettable(kAXSizeAttribute as CFString, on: axWindow)
+
+            let shouldSetPosition: Bool = {
+                guard canSetPosition else { return false }
+                guard let current else { return true }
+                return
+                    abs(current.origin.x - frame.origin.x) >= self.applyOriginThreshold ||
+                    abs(current.origin.y - frame.origin.y) >= self.applyOriginThreshold
+            }()
+
+            let shouldSetSize: Bool = {
+                guard canSetSize else { return false }
+                guard let current else { return true }
+                return
+                    abs(current.size.width - frame.size.width) >= self.applySizeThreshold ||
+                    abs(current.size.height - frame.size.height) >= self.applySizeThreshold
+            }()
+
+            if !shouldSetPosition, !shouldSetSize {
+                return true
+            }
+
+            let sizeResultA: AXError = shouldSetSize ? self.setSize(frame.size, on: axWindow) : .success
+            let positionResult: AXError = shouldSetPosition ? self.setPosition(frame.origin, on: axWindow) : .success
+            let sizeResultB: AXError = shouldSetSize ? self.setSize(frame.size, on: axWindow) : .success
+
+            let ok = sizeResultA == .success && positionResult == .success && sizeResultB == .success
+            if !ok {
+                Diagnostics.log(
+                    "AX set failed windowID=\(windowID) canSetSize=\(canSetSize) canSetPosition=\(canSetPosition) sizeA=\(sizeResultA.rawValue) pos=\(positionResult.rawValue) sizeB=\(sizeResultB.rawValue) target=\(frame)",
+                    level: .warn
+                )
+            }
+            return ok
         }
 
-        let positionResultB = setPosition(frame.origin, on: axWindow)
-        let sizeResultB = setSize(frame.size, on: axWindow)
-        if positionResultB == .success, sizeResultB == .success {
-            return true
+        guard let pid else {
+            return work()
         }
-
-        Diagnostics.log(
-            "AX set failed windowID=\(windowID) sizeA=\(sizeResultA.rawValue) posA=\(positionResultA.rawValue) posB=\(positionResultB.rawValue) sizeB=\(sizeResultB.rawValue) target=\(frame)",
-            level: .warn
-        )
-        return false
+        return withEnhancedUIIfNeededDisabled(pid: pid, operation: work)
     }
 
-    private func isFrameClose(_ actual: CGRect, _ target: CGRect) -> Bool {
-        abs(actual.origin.x - target.origin.x) <= originTolerance &&
-            abs(actual.origin.y - target.origin.y) <= originTolerance &&
-            abs(actual.size.width - target.size.width) <= sizeTolerance &&
-            abs(actual.size.height - target.size.height) <= sizeTolerance
+    private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        let result = AXUIElementIsAttributeSettable(element, attribute, &settable)
+        return result == .success && settable.boolValue
+    }
+
+    private func withEnhancedUIIfNeededDisabled(pid: pid_t, operation: () -> Bool) -> Bool {
+        let appElement = AXUIElementCreateApplication(pid)
+        guard
+            let flag = copyBooleanAttribute(axEnhancedUserInterfaceAttribute, from: appElement)
+        else {
+            return operation()
+        }
+
+        if !flag {
+            return operation()
+        }
+
+        _ = setBooleanAttribute(axEnhancedUserInterfaceAttribute, on: appElement, value: false)
+        defer {
+            _ = setBooleanAttribute(axEnhancedUserInterfaceAttribute, on: appElement, value: true)
+        }
+        return operation()
+    }
+
+    private func copyBooleanAttribute(_ attribute: CFString, from element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success, let raw = value else {
+            return nil
+        }
+        guard CFGetTypeID(raw) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return CFBooleanGetValue((raw as! CFBoolean))
+    }
+
+    private func setBooleanAttribute(_ attribute: CFString, on element: AXUIElement, value: Bool) -> Bool {
+        let cfValue: CFBoolean = value ? kCFBooleanTrue : kCFBooleanFalse
+        return AXUIElementSetAttributeValue(element, attribute, cfValue) == .success
+    }
+
+    private func isFrameRoughlyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        let tolerance: CGFloat = 6
+        return
+            abs(lhs.origin.x - rhs.origin.x) <= tolerance &&
+            abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
+            abs(lhs.size.width - rhs.size.width) <= tolerance &&
+            abs(lhs.size.height - rhs.size.height) <= tolerance
     }
 
     private func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {

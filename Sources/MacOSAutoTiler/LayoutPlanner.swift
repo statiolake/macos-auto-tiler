@@ -5,15 +5,18 @@ final class LayoutPlanner {
     private let displayInset: CGFloat
     private let slotInset: CGFloat
     private let frameTolerance: CGFloat
+    private let masterRatio: CGFloat
 
     init(
         displayInset: CGFloat = 12,
         slotInset: CGFloat = 8,
-        frameTolerance: CGFloat = 6
+        frameTolerance: CGFloat = 6,
+        masterRatio: CGFloat = 0.5
     ) {
         self.displayInset = displayInset
         self.slotInset = slotInset
         self.frameTolerance = frameTolerance
+        self.masterRatio = min(max(masterRatio, 0.2), 0.8)
     }
 
     func buildReflowPlans(from windows: [WindowRef]) -> [DisplayLayoutPlan] {
@@ -191,57 +194,41 @@ final class LayoutPlanner {
             return []
         }
 
-        switch windowCount {
-        case 3:
-            let splitX = bounds.midX
-            let leftWidth = splitX - bounds.minX - slotInset * 2
-            let rightWidth = bounds.maxX - splitX - slotInset * 2
-
-            let leftSlot = CGRect(
-                x: bounds.minX + slotInset,
-                y: bounds.minY + slotInset,
-                width: leftWidth,
-                height: bounds.height - slotInset * 2
-            )
-            let rightSlot1 = CGRect(
-                x: splitX + slotInset,
-                y: bounds.minY + slotInset,
-                width: rightWidth,
-                height: (bounds.height - slotInset * 2) / 2
-            )
-            let rightSlot2 = CGRect(
-                x: splitX + slotInset,
-                y: bounds.minY + slotInset + rightSlot1.height + slotInset,
-                width: rightWidth,
-                height: (bounds.height - slotInset * 2) / 2
-            )
-            return [
-                Slot(rect: leftSlot),
-                Slot(rect: rightSlot1),
-                Slot(rect: rightSlot2),
-            ]
-
-        default:
-            let columns = max(1, Int(ceil(sqrt(Double(windowCount)))))
-            let rows = Int(ceil(Double(windowCount) / Double(columns)))
-            let cellWidth = bounds.width / CGFloat(columns)
-            let cellHeight = bounds.height / CGFloat(rows)
-
-            var slots: [Slot] = []
-            slots.reserveCapacity(windowCount)
-            for index in 0..<windowCount {
-                let row = index / columns
-                let column = index % columns
-                let rect = CGRect(
-                    x: bounds.minX + CGFloat(column) * cellWidth,
-                    y: bounds.minY + CGFloat(row) * cellHeight,
-                    width: cellWidth,
-                    height: cellHeight
-                ).insetBy(dx: slotInset, dy: slotInset)
-                slots.append(Slot(rect: rect))
-            }
-            return slots
+        if windowCount == 1 {
+            return [Slot(rect: bounds.insetBy(dx: slotInset, dy: slotInset))]
         }
+
+        let masterWidth = bounds.width * masterRatio
+        let stackWidth = bounds.width - masterWidth
+        let masterPane = CGRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: masterWidth,
+            height: bounds.height
+        )
+        let stackPane = CGRect(
+            x: masterPane.maxX,
+            y: bounds.minY,
+            width: stackWidth,
+            height: bounds.height
+        )
+
+        var slots: [Slot] = []
+        slots.reserveCapacity(windowCount)
+        slots.append(Slot(rect: masterPane.insetBy(dx: slotInset, dy: slotInset)))
+
+        let stackCount = windowCount - 1
+        let rowHeight = stackPane.height / CGFloat(stackCount)
+        for row in 0..<stackCount {
+            let rowRect = CGRect(
+                x: stackPane.minX,
+                y: stackPane.minY + CGFloat(row) * rowHeight,
+                width: stackPane.width,
+                height: rowHeight
+            )
+            slots.append(Slot(rect: rowRect.insetBy(dx: slotInset, dy: slotInset)))
+        }
+        return slots
     }
 
     private func assignWindowsToNearestSlots(

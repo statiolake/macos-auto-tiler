@@ -61,7 +61,23 @@ final class LayoutPlanner {
     }
 
     func slotIndex(at point: CGPoint, in plan: DisplayLayoutPlan) -> Int? {
-        plan.slots.firstIndex { $0.rect.contains(point) }
+        if let directHit = plan.slots.firstIndex(where: { $0.rect.contains(point) }) {
+            return directHit
+        }
+        guard !plan.slots.isEmpty else {
+            return nil
+        }
+
+        var bestIndex: Int?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for (index, slot) in plan.slots.enumerated() {
+            let distance = pointDistance(to: slot.rect, from: point)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestIndex = index
+            }
+        }
+        return bestIndex
     }
 
     func resolveDrop(
@@ -124,16 +140,6 @@ final class LayoutPlanner {
             targetFrames: combinedTargets,
             windowsByID: windowsByID
         )
-    }
-
-    func ghostRect(for dragState: DragState, in plan: DisplayLayoutPlan) -> CGRect {
-        if let hover = dragState.hoverSlotIndex, hover >= 0, hover < plan.slots.count {
-            return plan.slots[hover].rect
-        }
-
-        let dx = dragState.currentPoint.x - dragState.startPoint.x
-        let dy = dragState.currentPoint.y - dragState.startPoint.y
-        return dragState.originalFrame.offsetBy(dx: dx, dy: dy)
     }
 
     private func buildPlan(
@@ -301,5 +307,11 @@ final class LayoutPlanner {
             result[windowID] = slots[slotIndex].rect
         }
         return result
+    }
+
+    private func pointDistance(to rect: CGRect, from point: CGPoint) -> CGFloat {
+        let dx = max(rect.minX - point.x, 0, point.x - rect.maxX)
+        let dy = max(rect.minY - point.y, 0, point.y - rect.maxY)
+        return (dx * dx + dy * dy).squareRoot()
     }
 }

@@ -9,14 +9,12 @@ final class OverlayWindowController {
     func show(
         displayID: CGDirectDisplayID,
         slotRects: [CGRect],
-        hoverIndex: Int?,
-        ghostRect: CGRect?
+        hoverIndex: Int?
     ) {
         ensureWindow(displayID: displayID)
         guard let overlayView else { return }
         overlayView.slotRects = slotRects
         overlayView.hoverIndex = hoverIndex
-        overlayView.ghostRect = ghostRect
         overlayView.needsDisplay = true
         overlayWindow?.orderFrontRegardless()
     }
@@ -65,7 +63,6 @@ private final class OverlayView: NSView {
     let displayBounds: CGRect
     var slotRects: [CGRect] = []
     var hoverIndex: Int?
-    var ghostRect: CGRect?
 
     override var isFlipped: Bool {
         true
@@ -90,10 +87,6 @@ private final class OverlayView: NSView {
         for (index, slot) in slotRects.enumerated() {
             drawSlot(slot, highlighted: hoverIndex == index)
         }
-
-        if let ghostRect {
-            drawGhost(ghostRect)
-        }
     }
 
     private func drawSlot(_ globalRect: CGRect, highlighted: Bool) {
@@ -105,16 +98,6 @@ private final class OverlayView: NSView {
         path.fill()
         stroke.setStroke()
         path.lineWidth = highlighted ? 3 : 1.5
-        path.stroke()
-    }
-
-    private func drawGhost(_ globalRect: CGRect) {
-        let rect = toLocal(globalRect)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 12, yRadius: 12)
-        let dash: [CGFloat] = [8, 6]
-        path.setLineDash(dash, count: 2, phase: 0)
-        NSColor.controlAccentColor.withAlphaComponent(0.9).setStroke()
-        path.lineWidth = 3
         path.stroke()
     }
 

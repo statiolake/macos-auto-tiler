@@ -290,12 +290,10 @@ final class TilerCoordinator {
     }
 
     private func renderOverlay(dragState: DragState, plan: DisplayLayoutPlan) {
-        let ghostRect = layoutPlanner.ghostRect(for: dragState, in: plan)
         overlay.show(
             displayID: plan.displayID,
             slotRects: plan.slots.map(\.rect),
-            hoverIndex: dragState.hoverSlotIndex,
-            ghostRect: ghostRect
+            hoverIndex: dragState.hoverSlotIndex
         )
     }
 
@@ -392,7 +390,9 @@ final class TilerCoordinator {
                 draggedWindowID: dragState.draggedWindowID
             ) ?? currentPreviewPlan
 
-        let destinationIndex = layoutPlanner.slotIndex(at: point, in: previewPlan) ?? dragState.hoverSlotIndex
+        let destinationIndex =
+            layoutPlanner.slotIndex(at: point, in: previewPlan)
+            ?? dragState.hoverSlotIndex
         guard let destinationIndex else {
             Diagnostics.log(
                 "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",

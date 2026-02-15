@@ -13,6 +13,7 @@ final class TilerCoordinator {
     private let ruleStore = WindowRuleStore()
     private let typeRegistry = WindowTypeRegistry()
     private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
+    private let spaceProbeQueue = DispatchQueue(label: "com.dicen.macosautotiler.spaceprobe", qos: .utility)
 
     private lazy var rulesPanelController = WindowRulesPanelController(
         registry: typeRegistry,
@@ -25,9 +26,19 @@ final class TilerCoordinator {
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
     private var needsDeferredLifecycleReflow = false
+    private var isSpaceTransitioning = false
+    private var spaceTransitionGeneration: UInt64 = 0
+    private var spaceTransitionStartedAt: Date?
+    private var lastSpaceSnapshotSignature: UInt64?
+    private var stableSpaceSnapshotCount = 0
+    private var spaceProbeWorkItem: DispatchWorkItem?
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
+
+    private let stableSnapshotsRequired = 3
+    private let spaceProbeInterval: TimeInterval = 0.12
+    private let maxSpaceTransitionWait: TimeInterval = 1.5
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -67,6 +78,7 @@ final class TilerCoordinator {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
         }
+        resetSpaceTransitionState()
         resetInteractionState()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
@@ -564,14 +576,141 @@ final class TilerCoordinator {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            Diagnostics.log("Active space changed, triggering reflow", level: .info)
-            self.reflowAllVisibleWindows(reason: "space-change")
+            self.beginSpaceTransition()
         }
+    }
+
+    private func beginSpaceTransition() {
+        spaceTransitionGeneration &+= 1
+        let generation = spaceTransitionGeneration
+        isSpaceTransitioning = true
+        spaceTransitionStartedAt = Date()
+        lastSpaceSnapshotSignature = nil
+        stableSpaceSnapshotCount = 0
+        spaceProbeWorkItem?.cancel()
+        spaceProbeWorkItem = nil
+
+        Diagnostics.log(
+            "Active space changed, entering transition mode generation=\(generation)",
+            level: .info
+        )
+
+        probeSpaceSnapshot(generation: generation)
+    }
+
+    private func probeSpaceSnapshot(generation: UInt64) {
+        spaceProbeQueue.async { [weak self] in
+            guard let self else { return }
+            let windows = self.discovery.fetchVisibleWindows()
+            let signature = self.spaceSnapshotSignature(for: windows)
+            let windowCount = windows.count
+            DispatchQueue.main.async { [weak self] in
+                self?.handleSpaceSnapshotProbe(
+                    generation: generation,
+                    signature: signature,
+                    windowCount: windowCount
+                )
+            }
+        }
+    }
+
+    private func handleSpaceSnapshotProbe(generation: UInt64, signature: UInt64, windowCount: Int) {
+        guard isSpaceTransitioning, generation == spaceTransitionGeneration else {
+            return
+        }
+
+        if signature == lastSpaceSnapshotSignature {
+            stableSpaceSnapshotCount += 1
+        } else {
+            lastSpaceSnapshotSignature = signature
+            stableSpaceSnapshotCount = 1
+        }
+
+        let elapsed = Date().timeIntervalSince(spaceTransitionStartedAt ?? Date())
+        let reachedStability = stableSpaceSnapshotCount >= stableSnapshotsRequired
+        let reachedTimeout = elapsed >= maxSpaceTransitionWait
+
+        Diagnostics.log(
+            "Space transition probe generation=\(generation) stable=\(stableSpaceSnapshotCount)/\(stableSnapshotsRequired) windows=\(windowCount)",
+            level: .debug
+        )
+
+        if reachedStability || reachedTimeout {
+            let settleReason = reachedStability ? "stable" : "timeout"
+            isSpaceTransitioning = false
+            spaceTransitionStartedAt = nil
+            lastSpaceSnapshotSignature = nil
+            stableSpaceSnapshotCount = 0
+            spaceProbeWorkItem?.cancel()
+            spaceProbeWorkItem = nil
+
+            Diagnostics.log(
+                "Space transition settled reason=\(settleReason) generation=\(generation)",
+                level: .info
+            )
+
+            needsDeferredLifecycleReflow = false
+            reflowAllVisibleWindows(reason: "space-settled:\(settleReason)")
+            return
+        }
+
+        scheduleNextSpaceProbe(generation: generation)
+    }
+
+    private func scheduleNextSpaceProbe(generation: UInt64) {
+        spaceProbeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.probeSpaceSnapshot(generation: generation)
+        }
+        spaceProbeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + spaceProbeInterval, execute: workItem)
+    }
+
+    private func resetSpaceTransitionState() {
+        isSpaceTransitioning = false
+        spaceTransitionStartedAt = nil
+        lastSpaceSnapshotSignature = nil
+        stableSpaceSnapshotCount = 0
+        spaceTransitionGeneration &+= 1
+        spaceProbeWorkItem?.cancel()
+        spaceProbeWorkItem = nil
+    }
+
+    private func spaceSnapshotSignature(for windows: [WindowRef]) -> UInt64 {
+        var pairs: [(CGWindowID, CGDirectDisplayID)] = []
+        pairs.reserveCapacity(windows.count)
+        for window in windows {
+            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
+            let displayID = DisplayService.displayID(containing: midpoint) ?? 0
+            pairs.append((window.windowID, displayID))
+        }
+        pairs.sort {
+            if $0.0 != $1.0 { return $0.0 < $1.0 }
+            return $0.1 < $1.1
+        }
+
+        var hash = UInt64(pairs.count)
+        for (windowID, displayID) in pairs {
+            hash ^= UInt64(windowID)
+            hash = hash &* 1_099_511_628_211
+            hash ^= UInt64(displayID)
+            hash = hash &* 1_099_511_628_211
+        }
+        return hash
     }
 
     private func startLifecycleMonitor() {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
+
+            if isSpaceTransitioning {
+                needsDeferredLifecycleReflow = true
+                Diagnostics.log(
+                    "Lifecycle reflow deferred during space transition reason=\(reason)",
+                    level: .debug
+                )
+                return
+            }
 
             if dragTracker.isDragging {
                 needsDeferredLifecycleReflow = true
@@ -586,6 +725,9 @@ final class TilerCoordinator {
 
     private func applyDeferredLifecycleReflowIfNeeded() {
         guard needsDeferredLifecycleReflow else {
+            return
+        }
+        guard !isSpaceTransitioning else {
             return
         }
         needsDeferredLifecycleReflow = false

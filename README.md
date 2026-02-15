@@ -28,6 +28,30 @@ swift run macos-auto-tiler
 The app appears as a menu bar item (`Tiler`).
 You can trigger manual reflow from menu item `Reflow Now`.
 
+## Build `.app` bundle
+
+```bash
+./scripts/create_app_bundle.sh
+```
+
+Output:
+
+- `dist/macos-auto-tiler.app`
+
+## GitHub Actions
+
+`.github/workflows/build-app.yml` builds and uploads:
+
+- `dist/macos-auto-tiler.app`
+- `dist/macos-auto-tiler.app.zip`
+
+Triggers:
+
+- `push` to `main` (updates prerelease `nightly`)
+- `push` tag `v*` (creates/updates normal release)
+- `pull_request`
+- manual (`workflow_dispatch`)
+
 ## Debug logs
 
 Logs are printed to stdout with a `[Tiler]` prefix.

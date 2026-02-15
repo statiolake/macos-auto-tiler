@@ -1,5 +1,6 @@
 # SwiftPM build artifacts
 .build/
+dist/
 
 # SwiftPM local settings/cache
 .swiftpm/

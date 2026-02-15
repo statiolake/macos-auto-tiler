@@ -40,7 +40,6 @@ final class TilerCoordinator {
     private let spaceProbeInterval: TimeInterval = 0.12
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 28
-    private let windowNearHitDistance: CGFloat = 48
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -894,35 +893,8 @@ final class TilerCoordinator {
         if !directHits.isEmpty {
             return directHits
         }
-
-        let expandedHits = windows.filter {
+        return windows.filter {
             $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
         }
-        if !expandedHits.isEmpty {
-            return expandedHits
-        }
-
-        // Some apps accept resize drags slightly outside their reported frame.
-        // Fall back to near-frame matching so resize gestures are still tracked.
-        let nearHits = windows.compactMap { window -> (window: WindowRef, distance: CGFloat)? in
-            let distance = distanceToRect(point: point, rect: window.frame)
-            guard distance <= windowNearHitDistance else {
-                return nil
-            }
-            return (window: window, distance: distance)
-        }
-        .sorted {
-            if $0.distance != $1.distance { return $0.distance < $1.distance }
-            return $0.window.windowID < $1.window.windowID
-        }
-        .map(\.window)
-
-        return nearHits
-    }
-
-    private func distanceToRect(point: CGPoint, rect: CGRect) -> CGFloat {
-        let dx = max(rect.minX - point.x, 0, point.x - rect.maxX)
-        let dy = max(rect.minY - point.y, 0, point.y - rect.maxY)
-        return hypot(dx, dy)
     }
 }

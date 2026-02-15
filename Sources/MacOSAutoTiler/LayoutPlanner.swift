@@ -283,10 +283,11 @@ final class LayoutPlanner {
         for window in windows {
             counts[window.spaceID, default: 0] += 1
         }
-        return counts.max(by: { lhs, rhs in
+        let dominant = counts.max(by: { lhs, rhs in
             if lhs.value != rhs.value { return lhs.value < rhs.value }
             return lhs.key > rhs.key
         })?.key ?? 0
+        return dominant
     }
 
     private func makeSlots(

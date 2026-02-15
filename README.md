@@ -38,6 +38,12 @@ Output:
 
 - `dist/macos-auto-tiler.app`
 
+## License
+
+This project is licensed under the MIT License. See:
+
+- `LICENSE`
+
 ## GitHub Actions
 
 `.github/workflows/build-app.yml` builds and uploads:
@@ -70,9 +76,12 @@ If drag capture fails, open System Settings and allow both permissions for the a
 
 - `Sources/MacOSAutoTiler/WindowDiscovery.swift`
   - External window list + geometry (`windowID`, `pid`, `bounds`, title/app)
+  - Space resolution using CGS private APIs (`CGSCopySpacesForWindows`)
+- `Sources/MacOSAutoTiler/CGSSpaceService.swift`
+  - Private CGS bridge for space/window mapping and current display space lookup
 - `Sources/MacOSAutoTiler/EventTapController.swift`
   - Global mouse event tap (`leftMouseDown/Dragged/Up`)
-- `Sources/MacOSAutoTiler/LayoutEngine.swift`
+- `Sources/MacOSAutoTiler/LayoutPlanner.swift`
   - Slot generation, hit testing, reflow order, target frame mapping
 - `Sources/MacOSAutoTiler/OverlayWindowController.swift`
   - Top-most transparent overlay for hover/ghost rendering
@@ -86,4 +95,8 @@ If drag capture fails, open System Settings and allow both permissions for the a
 - Drag-time movement is visual only (overlay), by design.
 - AX matching is heuristic (`CG` frame nearest `AX` frame).
 - Windows with strong size constraints may fail during apply.
-- Spaces/full-screen edge cases are not handled yet.
+- CGS private API usage can break across macOS updates and is not App Store-friendly.
+
+## Acknowledgements
+
+- [Amethyst](https://github.com/ianyh/Amethyst) (MIT License) has been a major reference for Space handling strategy and implementation direction. Thanks to the maintainers and contributors.

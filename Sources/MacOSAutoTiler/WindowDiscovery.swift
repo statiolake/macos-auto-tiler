@@ -10,11 +10,16 @@ final class WindowDiscovery {
     }
 
     private let ruleStore: WindowRuleStore
+    private let cgsSpaceService: CGSSpaceService
     private let logStateLock = NSLock()
     private var lastDiscoverySignature: UInt64?
 
-    init(ruleStore: WindowRuleStore = WindowRuleStore()) {
+    init(
+        ruleStore: WindowRuleStore = WindowRuleStore(),
+        cgsSpaceService: CGSSpaceService = .shared
+    ) {
         self.ruleStore = ruleStore
+        self.cgsSpaceService = cgsSpaceService
     }
 
     func fetchVisibleWindows() -> [WindowRef] {
@@ -26,9 +31,34 @@ final class WindowDiscovery {
         }
 
         let selfPID = getpid()
+        let allWindowIDs = raw.compactMap { info -> CGWindowID? in
+            guard let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
+                return nil
+            }
+            return CGWindowID(windowNumber)
+        }
+        let spaceByWindowID = cgsSpaceService.spacesByWindowID(windowIDs: allWindowIDs)
+
+        var displayIDs = Set<CGDirectDisplayID>()
+        for info in raw {
+            guard
+                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                let frame = CGRect(dictionaryRepresentation: boundsDict)
+            else {
+                continue
+            }
+            let midpoint = CGPoint(x: frame.midX, y: frame.midY)
+            if let displayID = DisplayService.displayID(containing: midpoint) {
+                displayIDs.insert(displayID)
+            }
+        }
+        let currentSpaceByDisplayID = cgsSpaceService.currentSpaceByDisplayID(displayIDs: displayIDs)
+
         var windows: [WindowRef] = []
         windows.reserveCapacity(raw.count)
         var ownerInfoByPID: [pid_t: OwnerProcessInfo] = [:]
+        var droppedMissingSpace = 0
+        var droppedOffActiveSpace = 0
 
         for info in raw {
             guard
@@ -60,9 +90,20 @@ final class WindowDiscovery {
             }
 
             let title = (info[kCGWindowName as String] as? String) ?? ""
-            let spaceID = (info["kCGWindowWorkspace"] as? NSNumber)?.intValue
-                ?? (info["kCGWindowWorkspace"] as? Int)
-                ?? 0
+            let midpoint = CGPoint(x: frame.midX, y: frame.midY)
+            guard
+                let displayID = DisplayService.displayID(containing: midpoint),
+                let spaceID = spaceByWindowID[CGWindowID(windowNumber)]
+            else {
+                droppedMissingSpace += 1
+                continue
+            }
+
+            if let activeSpaceID = currentSpaceByDisplayID[displayID], activeSpaceID != spaceID {
+                droppedOffActiveSpace += 1
+                continue
+            }
+
             windows.append(
                 WindowRef(
                     windowID: CGWindowID(windowNumber),
@@ -73,6 +114,13 @@ final class WindowDiscovery {
                     bundleID: ownerInfo.bundleID,
                     spaceID: spaceID
                 )
+            )
+        }
+
+        if droppedMissingSpace > 0 || droppedOffActiveSpace > 0 {
+            Diagnostics.log(
+                "CGS space filter dropped windows missingSpace=\(droppedMissingSpace) offActiveSpace=\(droppedOffActiveSpace)",
+                level: .debug
             )
         }
 

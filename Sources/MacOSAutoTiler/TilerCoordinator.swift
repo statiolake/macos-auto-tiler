@@ -39,7 +39,7 @@ final class TilerCoordinator {
     private let stableSnapshotsRequired = 3
     private let spaceProbeInterval: TimeInterval = 0.12
     private let maxSpaceTransitionWait: TimeInterval = 1.5
-    private let windowHitSlop: CGFloat = 28
+    private let windowHitSlop: CGFloat = 96
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -113,7 +113,10 @@ final class TilerCoordinator {
         let windows = fetchVisibleWindows()
         let candidates = windowsAtInteractionPoint(point, windows: windows)
         guard !candidates.isEmpty else {
-            Diagnostics.log("Mouse down at \(point) but no window hit", level: .debug)
+            Diagnostics.log(
+                "Mouse down at \(point) but no window hit (windows=\(windows.count) slop=\(windowHitSlop))",
+                level: .debug
+            )
             return
         }
 
@@ -889,12 +892,9 @@ final class TilerCoordinator {
     }
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {
-        let directHits = windows.filter { $0.frame.contains(point) }
-        if !directHits.isEmpty {
-            return directHits
-        }
         return windows.filter {
-            $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
+            $0.frame.contains(point) ||
+                $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
         }
     }
 }

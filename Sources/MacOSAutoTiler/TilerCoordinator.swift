@@ -633,12 +633,7 @@ final class TilerCoordinator {
         if semantics.isSpecialFloating {
             return true
         }
-
-        // Fallback heuristics for apps with weak AX metadata.
-        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tiny = window.frame.width <= 260 || window.frame.height <= 140
-        let dialogLike = title.isEmpty && window.frame.width <= 520 && window.frame.height <= 360
-        return tiny || dialogLike
+        return false
     }
 
     private func isAutomaticallyFloating(
@@ -662,12 +657,7 @@ final class TilerCoordinator {
         if semantics.isSpecialFloating {
             return true
         }
-
-        // Fallback heuristics for apps with weak AX metadata.
-        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let tiny = window.frame.width <= 260 || window.frame.height <= 140
-        let dialogLike = title.isEmpty && window.frame.width <= 520 && window.frame.height <= 360
-        return tiny || dialogLike
+        return false
     }
 
     private func pruneFloatingState(using windows: [WindowRef]) {

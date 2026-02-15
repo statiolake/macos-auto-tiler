@@ -8,6 +8,7 @@ final class WindowLifecycleMonitor {
 
     private let discovery: WindowDiscovery
     private let debounceInterval: TimeInterval
+    private let selfPID = getpid()
 
     private var changeHandler: ChangeHandler?
     private var debounceWorkItem: DispatchWorkItem?
@@ -37,7 +38,7 @@ final class WindowLifecycleMonitor {
         self.changeHandler = changeHandler
 
         let windows = discovery.fetchVisibleWindows()
-        let pids = Set(windows.map(\.pid))
+        let pids = runningApplicationPIDs()
 
         refreshAXObservers(for: pids)
         registerWorkspaceNotifications()
@@ -75,26 +76,73 @@ final class WindowLifecycleMonitor {
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            self?.refreshObserversFromCurrentWindows(triggerReason: "workspace-launch")
+        ) { [weak self] notification in
+            self?.handleWorkspaceLaunch(notification)
         }
 
         let terminated = center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            self?.refreshObserversFromCurrentWindows(triggerReason: "workspace-terminate")
+        ) { [weak self] notification in
+            self?.handleWorkspaceTerminate(notification)
         }
 
         workspaceObservers = [launched, terminated]
     }
 
-    private func refreshObserversFromCurrentWindows(triggerReason: String) {
-        let windows = discovery.fetchVisibleWindows()
-        let pids = Set(windows.map(\.pid))
-        refreshAXObservers(for: pids)
-        enqueueChange(reason: triggerReason)
+    private func handleWorkspaceLaunch(_ notification: Notification) {
+        guard
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        else {
+            refreshAXObservers(for: runningApplicationPIDs())
+            enqueueChange(reason: "workspace-launch")
+            return
+        }
+
+        let pid = app.processIdentifier
+        guard pid != selfPID else {
+            return
+        }
+
+        if observersByPID[pid] == nil {
+            addAXObserver(for: pid)
+            if observersByPID[pid] != nil {
+                Diagnostics.log("Lifecycle monitor added AX observer pid=\(describePID(pid)) (workspace-launch)", level: .debug)
+            }
+        }
+
+        enqueueChange(reason: "workspace-launch")
+    }
+
+    private func handleWorkspaceTerminate(_ notification: Notification) {
+        guard
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        else {
+            refreshAXObservers(for: runningApplicationPIDs())
+            enqueueChange(reason: "workspace-terminate")
+            return
+        }
+
+        let pid = app.processIdentifier
+        guard pid != selfPID else {
+            return
+        }
+
+        if observersByPID[pid] != nil {
+            removeAXObserver(for: pid)
+            Diagnostics.log("Lifecycle monitor removed AX observer pid=\(describePID(pid)) (workspace-terminate)", level: .debug)
+        }
+
+        enqueueChange(reason: "workspace-terminate")
+    }
+
+    private func runningApplicationPIDs() -> Set<pid_t> {
+        Set(
+            NSWorkspace.shared.runningApplications
+                .map(\.processIdentifier)
+                .filter { $0 != selfPID }
+        )
     }
 
     private func refreshAXObservers(for pids: Set<pid_t>) {
@@ -104,10 +152,20 @@ final class WindowLifecycleMonitor {
         for pid in removedPIDs {
             removeAXObserver(for: pid)
         }
+        if !removedPIDs.isEmpty {
+            let removedList = removedPIDs.sorted().map { describePID($0) }.joined(separator: ", ")
+            Diagnostics.log("Lifecycle monitor removed AX observer pids=[\(removedList)]", level: .debug)
+        }
 
         let addedPIDs = pids.subtracting(existingPIDs)
         for pid in addedPIDs {
             addAXObserver(for: pid)
+        }
+        let nowObserved = Set(observersByPID.keys)
+        let actuallyAdded = nowObserved.subtracting(existingPIDs)
+        if !actuallyAdded.isEmpty {
+            let addedList = actuallyAdded.sorted().map { describePID($0) }.joined(separator: ", ")
+            Diagnostics.log("Lifecycle monitor added AX observer pids=[\(addedList)]", level: .debug)
         }
     }
 
@@ -115,6 +173,7 @@ final class WindowLifecycleMonitor {
         var observer: AXObserver?
         let result = AXObserverCreate(pid, Self.axCallback, &observer)
         guard result == .success, let observer else {
+            Diagnostics.log("Lifecycle monitor failed AXObserverCreate pid=\(describePID(pid)) error=\(result.rawValue)", level: .debug)
             return
         }
 
@@ -135,6 +194,7 @@ final class WindowLifecycleMonitor {
         }
 
         guard addedAny else {
+            Diagnostics.log("Lifecycle monitor no supported AX notifications pid=\(describePID(pid))", level: .debug)
             return
         }
 
@@ -157,6 +217,11 @@ final class WindowLifecycleMonitor {
 
     private func handleAXEvent(notification: String) {
         enqueueChange(reason: "ax:\(notification)")
+    }
+
+    private func describePID(_ pid: pid_t) -> String {
+        let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "unknown"
+        return "\(pid):\(appName)"
     }
 
     private func enqueueChange(reason: String) {

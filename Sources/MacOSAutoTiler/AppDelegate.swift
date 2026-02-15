@@ -4,6 +4,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator = TilerCoordinator()
     private let startupPermissionFlow = StartupPermissionFlow()
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Diagnostics.log("Application launched", level: .info)
@@ -25,6 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "Tiler"
         statusItem.button?.toolTip = "macOS Auto Tiler"
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(handleStatusItemClick(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         let menu = NSMenu()
         menu.addItem(
@@ -40,10 +44,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quitApp), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
-        statusItem.menu = menu
+        statusItem.menu = nil
+        statusMenu = menu
 
         self.statusItem = statusItem
         Diagnostics.log("Menu bar item initialized", level: .debug)
+    }
+
+    @objc
+    private func handleStatusItemClick(_ sender: Any?) {
+        guard let event = NSApp.currentEvent else {
+            Diagnostics.log("Status item click with no current event; triggering reflow", level: .debug)
+            coordinator.reflowAllVisibleWindows(reason: "status-left-click")
+            return
+        }
+
+        switch event.type {
+        case .rightMouseUp:
+            guard let statusItem, let statusMenu else {
+                return
+            }
+            statusItem.menu = statusMenu
+            statusItem.button?.performClick(nil)
+            statusItem.menu = nil
+        case .leftMouseUp:
+            coordinator.reflowAllVisibleWindows(reason: "status-left-click")
+        default:
+            break
+        }
     }
 
     @objc

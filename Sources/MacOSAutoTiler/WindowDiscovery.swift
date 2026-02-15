@@ -1,9 +1,21 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
 final class WindowDiscovery {
+    private struct OwnerProcessInfo {
+        let isManageable: Bool
+        let appName: String
+        let bundleID: String?
+    }
+
+    private let ruleStore: WindowRuleStore
     private let logStateLock = NSLock()
     private var lastDiscoverySignature: UInt64?
+
+    init(ruleStore: WindowRuleStore = WindowRuleStore()) {
+        self.ruleStore = ruleStore
+    }
 
     func fetchVisibleWindows() -> [WindowRef] {
         guard
@@ -16,6 +28,7 @@ final class WindowDiscovery {
         let selfPID = getpid()
         var windows: [WindowRef] = []
         windows.reserveCapacity(raw.count)
+        var ownerInfoByPID: [pid_t: OwnerProcessInfo] = [:]
 
         for info in raw {
             guard
@@ -34,15 +47,27 @@ final class WindowDiscovery {
                 continue
             }
 
+            let ownerInfo: OwnerProcessInfo
+            if let cached = ownerInfoByPID[pid] {
+                ownerInfo = cached
+            } else {
+                let computed = ownerProcessInfo(pid: pid, fallbackOwnerName: info[kCGWindowOwnerName as String] as? String)
+                ownerInfoByPID[pid] = computed
+                ownerInfo = computed
+            }
+            guard ownerInfo.isManageable else {
+                continue
+            }
+
             let title = (info[kCGWindowName as String] as? String) ?? ""
-            let appName = (info[kCGWindowOwnerName as String] as? String) ?? "Unknown"
             windows.append(
                 WindowRef(
                     windowID: CGWindowID(windowNumber),
                     pid: pid,
                     frame: frame,
                     title: title,
-                    appName: appName
+                    appName: ownerInfo.appName,
+                    bundleID: ownerInfo.bundleID
                 )
             )
         }
@@ -79,5 +104,41 @@ final class WindowDiscovery {
             hash = hash &* 1_099_511_628_211
         }
         return hash
+    }
+
+    private func ownerProcessInfo(pid: pid_t, fallbackOwnerName: String?) -> OwnerProcessInfo {
+        guard let app = NSRunningApplication(processIdentifier: pid) else {
+            // Keep unknown processes eligible to avoid false negatives for legitimate apps.
+            return OwnerProcessInfo(
+                isManageable: true,
+                appName: fallbackOwnerName ?? "Unknown",
+                bundleID: nil
+            )
+        }
+
+        let appName = app.localizedName ?? fallbackOwnerName ?? "Unknown"
+        let bundleID = app.bundleIdentifier
+
+        if ruleStore.isBundleExcluded(bundleID) {
+            return OwnerProcessInfo(
+                isManageable: false,
+                appName: appName,
+                bundleID: bundleID
+            )
+        }
+
+        guard app.isFinishedLaunching else {
+            return OwnerProcessInfo(
+                isManageable: false,
+                appName: appName,
+                bundleID: bundleID
+            )
+        }
+
+        return OwnerProcessInfo(
+            isManageable: app.activationPolicy == .regular,
+            appName: appName,
+            bundleID: bundleID
+        )
     }
 }

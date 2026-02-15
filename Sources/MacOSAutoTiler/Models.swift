@@ -6,6 +6,7 @@ struct WindowRef {
     let frame: CGRect
     let title: String
     let appName: String
+    let bundleID: String?
 }
 
 struct Slot {

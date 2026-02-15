@@ -2,15 +2,15 @@ import AppKit
 import CoreGraphics
 
 final class TilerCoordinator {
-    private let discovery = WindowDiscovery()
+    private let ruleStore = WindowRuleStore()
+    private lazy var discovery = WindowDiscovery(ruleStore: ruleStore)
     private let layoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
     private let eventTap = EventTapController()
     private let geometryApplier = WindowGeometryApplier()
     private let dragTracker = DragInteractionTracker()
-    private let lifecycleMonitor = WindowLifecycleMonitor()
+    private lazy var lifecycleMonitor = WindowLifecycleMonitor(discovery: discovery)
     private let semanticsClassifier = WindowSemanticsClassifier()
-    private let ruleStore = WindowRuleStore()
     private let typeRegistry = WindowTypeRegistry()
     private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
     private let spaceProbeQueue = DispatchQueue(label: "com.dicen.macosautotiler.spaceprobe", qos: .utility)
@@ -440,7 +440,11 @@ final class TilerCoordinator {
         pruneFloatingState(using: windows)
         for window in windows {
             let semantics = semanticsClassifier.semantics(for: window)
-            typeRegistry.record(appName: window.appName, descriptor: semantics.descriptor)
+            typeRegistry.record(
+                appName: window.appName,
+                bundleID: window.bundleID,
+                descriptor: semantics.descriptor
+            )
         }
         return windows
     }
@@ -509,6 +513,10 @@ final class TilerCoordinator {
     }
 
     private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
+        if ruleStore.isBundleExcluded(window.bundleID) {
+            return true
+        }
+
         if ruleStore.isAppForcedFloating(window.appName) {
             return true
         }
@@ -534,6 +542,10 @@ final class TilerCoordinator {
         ruleSnapshot: WindowRuleSnapshot,
         semanticsClassifier: WindowSemanticsClassifier
     ) -> Bool {
+        if ruleSnapshot.isBundleExcluded(window.bundleID) {
+            return true
+        }
+
         if ruleSnapshot.isAppForcedFloating(window.appName) {
             return true
         }

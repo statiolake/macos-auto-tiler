@@ -2,6 +2,11 @@ import CoreGraphics
 import Foundation
 
 final class DragInteractionTracker {
+    struct ResizeState {
+        let windowID: CGWindowID
+        let originalFrame: CGRect
+    }
+
     private struct PendingState {
         var orderedWindowIDs: [CGWindowID]
         var entriesByWindowID: [CGWindowID: PendingDrag]
@@ -11,7 +16,7 @@ final class DragInteractionTracker {
         case idle
         case pending(PendingState)
         case dragging(DragState)
-        case resizing(CGWindowID)
+        case resizing(ResizeState)
     }
 
     private let moveThreshold: CGFloat
@@ -51,10 +56,17 @@ final class DragInteractionTracker {
     }
 
     var resizingWindowID: CGWindowID? {
-        guard case let .resizing(windowID) = state else {
+        guard case let .resizing(resizeState) = state else {
             return nil
         }
-        return windowID
+        return resizeState.windowID
+    }
+
+    var resizeState: ResizeState? {
+        guard case let .resizing(resizeState) = state else {
+            return nil
+        }
+        return resizeState
     }
 
     func beginPendingDrag(windows: [WindowRef]) {
@@ -120,7 +132,12 @@ final class DragInteractionTracker {
 
             if hasWindowResized(original: pendingDrag.originalFrame, current: latestWindow.frame) {
                 // Resize gestures should never enter tiling-drag mode.
-                state = .resizing(latestWindow.windowID)
+                state = .resizing(
+                    ResizeState(
+                        windowID: latestWindow.windowID,
+                        originalFrame: pendingDrag.originalFrame
+                    )
+                )
                 return nil
             }
 
@@ -183,12 +200,12 @@ final class DragInteractionTracker {
         return dragState
     }
 
-    func finishResize() -> CGWindowID? {
-        guard case let .resizing(windowID) = state else {
+    func finishResize() -> ResizeState? {
+        guard case let .resizing(resizeState) = state else {
             return nil
         }
         state = .idle
-        return windowID
+        return resizeState
     }
 
     private func hasWindowTranslated(original: CGRect, current: CGRect) -> Bool {

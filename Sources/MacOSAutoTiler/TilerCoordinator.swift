@@ -147,8 +147,8 @@ final class TilerCoordinator {
             applyDeferredLifecycleReflowIfNeeded()
         }
 
-        if let resizedWindowID = dragTracker.finishResize() {
-            finishResizeSession(resizedWindowID: resizedWindowID, point: point)
+        if let resizeState = dragTracker.finishResize() {
+            finishResizeSession(resizeState: resizeState, point: point)
             resetInteractionState()
             return
         }
@@ -258,7 +258,11 @@ final class TilerCoordinator {
         }
 
         let tiled = tiledWindows(from: windows)
-        layoutPlanner.syncRatiosFromObservedWindows(tiled)
+        layoutPlanner.syncRatiosFromObservedWindows(
+            tiled,
+            resizingWindowID: resizingWindowID,
+            originalResizingFrame: dragTracker.resizeState?.originalFrame
+        )
 
         let plans = layoutPlanner.buildReflowPlans(from: tiled)
         guard
@@ -279,11 +283,11 @@ final class TilerCoordinator {
         )
     }
 
-    private func finishResizeSession(resizedWindowID: CGWindowID, point: CGPoint) {
+    private func finishResizeSession(resizeState: DragInteractionTracker.ResizeState, point: CGPoint) {
         clearOverlayState()
 
         let windows = fetchVisibleWindows()
-        guard let resizedWindow = windows.first(where: { $0.windowID == resizedWindowID }) else {
+        guard let resizedWindow = windows.first(where: { $0.windowID == resizeState.windowID }) else {
             needsDeferredLifecycleReflow = false
             return
         }
@@ -293,11 +297,15 @@ final class TilerCoordinator {
         }
 
         let tiled = tiledWindows(from: windows)
-        layoutPlanner.syncRatiosFromObservedWindows(tiled)
+        layoutPlanner.syncRatiosFromObservedWindows(
+            tiled,
+            resizingWindowID: resizeState.windowID,
+            originalResizingFrame: resizeState.originalFrame
+        )
         needsDeferredLifecycleReflow = false
 
         Diagnostics.log(
-            "Resize end windowID=\(resizedWindowID) app=\(resizedWindow.appName) point=\(point) -> apply once",
+            "Resize end windowID=\(resizeState.windowID) app=\(resizedWindow.appName) point=\(point) -> apply once",
             level: .info
         )
         reflowAllVisibleWindows(reason: "resize-end")

@@ -102,7 +102,11 @@ final class LayoutPlanner {
         return bestIndex
     }
 
-    func syncRatiosFromObservedWindows(_ windows: [WindowRef]) {
+    func syncRatiosFromObservedWindows(
+        _ windows: [WindowRef],
+        resizingWindowID: CGWindowID? = nil,
+        originalResizingFrame: CGRect? = nil
+    ) {
         let grouped = groupByDisplay(windows)
         guard !grouped.isEmpty else {
             return
@@ -126,25 +130,71 @@ final class LayoutPlanner {
             guard let masterWindow = orderedByPriority.first else {
                 continue
             }
+            let stackWindows = orderedByPriority.dropFirst().sorted {
+                if $0.frame.minY != $1.frame.minY { return $0.frame.minY < $1.frame.minY }
+                return $0.frame.minX < $1.frame.minX
+            }
 
+            if let resizingWindowID {
+                guard let resizingWindow = displayWindows.first(where: { $0.windowID == resizingWindowID }) else {
+                    // During an active resize, keep other displays untouched.
+                    continue
+                }
+
+                if resizingWindow.windowID == masterWindow.windowID {
+                    // Only master boundary should move.
+                    let observedMasterEdge = masterWindow.frame.maxX + slotInset
+                    let observedMasterRatio = clamp(
+                        (observedMasterEdge - bounds.minX) / bounds.width,
+                        minMasterRatio,
+                        maxMasterRatio
+                    )
+                    nextMasterRatios[scope] = observedMasterRatio
+                    continue
+                }
+
+                guard
+                    let originalResizingFrame,
+                    let resizingIndex = stackWindows.firstIndex(where: { $0.windowID == resizingWindowID })
+                else {
+                    continue
+                }
+
+                var rowHeights = normalizedStackWeights(for: scope, stackCount: stackWindows.count)
+                    .map { $0 * bounds.height }
+                applyResizingBoundaryPreference(
+                    rowHeights: &rowHeights,
+                    stackWindows: stackWindows,
+                    resizingIndex: resizingIndex,
+                    originalFrame: originalResizingFrame,
+                    paneMinY: bounds.minY
+                )
+                let sum = rowHeights.reduce(0, +)
+                guard sum > 0 else {
+                    continue
+                }
+                nextStackWeights[scope] = rowHeights.map { $0 / sum }
+                continue
+            }
+
+            // Non-resize sync path: infer from observed full geometry.
+            let observedMasterEdge = masterWindow.frame.maxX + slotInset
             let observedMasterRatio = clamp(
-                (masterWindow.frame.maxX - bounds.minX) / bounds.width,
+                (observedMasterEdge - bounds.minX) / bounds.width,
                 minMasterRatio,
                 maxMasterRatio
             )
             nextMasterRatios[scope] = observedMasterRatio
 
-            let stackWindows = orderedByPriority.dropFirst().sorted {
-                if $0.frame.minY != $1.frame.minY { return $0.frame.minY < $1.frame.minY }
-                return $0.frame.minX < $1.frame.minX
-            }
-            let rawHeights = stackWindows.map { max($0.frame.height, 1) }
+            let rawHeights = stackWindows.map { max($0.frame.height + (slotInset * 2), 1) }
             guard !rawHeights.isEmpty else {
                 continue
             }
-            let sum = rawHeights.reduce(0, +)
-            let weights = rawHeights.map { $0 / sum }
-            nextStackWeights[scope] = weights
+            let observedSum = rawHeights.reduce(0, +)
+            guard observedSum > 0 else {
+                continue
+            }
+            nextStackWeights[scope] = rawHeights.map { $0 / observedSum }
         }
 
         stateLock.lock()
@@ -155,6 +205,56 @@ final class LayoutPlanner {
             stackWeightsByScope[scope] = weights
         }
         stateLock.unlock()
+    }
+
+    private func applyResizingBoundaryPreference(
+        rowHeights: inout [CGFloat],
+        stackWindows: [WindowRef],
+        resizingIndex: Int,
+        originalFrame: CGRect,
+        paneMinY: CGFloat
+    ) {
+        guard resizingIndex >= 0, resizingIndex < stackWindows.count else {
+            return
+        }
+        guard rowHeights.count == stackWindows.count, rowHeights.count >= 2 else {
+            return
+        }
+
+        let current = stackWindows[resizingIndex].frame
+        let movedTop = abs(current.minY - originalFrame.minY)
+        let movedBottom = abs(current.maxY - originalFrame.maxY)
+
+        let boundaryIndex: Int
+        let desiredBoundaryY: CGFloat
+        if movedBottom >= movedTop {
+            guard resizingIndex < rowHeights.count - 1 else {
+                return
+            }
+            boundaryIndex = resizingIndex
+            desiredBoundaryY = current.maxY + slotInset
+        } else {
+            guard resizingIndex > 0 else {
+                return
+            }
+            boundaryIndex = resizingIndex - 1
+            desiredBoundaryY = current.minY - slotInset
+        }
+
+        var currentPrefix = CGFloat.zero
+        for index in 0...boundaryIndex {
+            currentPrefix += rowHeights[index]
+        }
+
+        let desiredPrefix = desiredBoundaryY - paneMinY
+        var delta = desiredPrefix - currentPrefix
+
+        let maxShrinkUpper = rowHeights[boundaryIndex] - minStackSlotExtent
+        let maxGrowUpper = rowHeights[boundaryIndex + 1] - minStackSlotExtent
+        delta = clamp(delta, -maxShrinkUpper, maxGrowUpper)
+
+        rowHeights[boundaryIndex] += delta
+        rowHeights[boundaryIndex + 1] -= delta
     }
 
     func resolveDrop(

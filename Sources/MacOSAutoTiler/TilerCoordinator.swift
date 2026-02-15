@@ -101,6 +101,8 @@ final class TilerCoordinator {
             handleMouseUp(at: point)
         case .secondaryDown:
             handleSecondaryMouseDown(at: point)
+        case .optionPressed:
+            handleOptionKeyPress(at: point)
         }
     }
 
@@ -153,6 +155,14 @@ final class TilerCoordinator {
     }
 
     private func handleSecondaryMouseDown(at point: CGPoint) {
+        toggleFloatingForActiveDrag(at: point)
+    }
+
+    private func handleOptionKeyPress(at point: CGPoint) {
+        toggleFloatingForActiveDrag(at: point)
+    }
+
+    private func toggleFloatingForActiveDrag(at point: CGPoint) {
         guard let draggedWindowID = dragTracker.draggedWindowID else {
             return
         }

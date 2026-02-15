@@ -6,12 +6,14 @@ enum MouseEventType {
     case dragged
     case up
     case secondaryDown
+    case optionPressed
 }
 
 final class EventTapController {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var handler: ((MouseEventType, CGPoint) -> Void)?
+    private var lastFlags: CGEventFlags = []
 
     func start(handler: @escaping (MouseEventType, CGPoint) -> Void) -> Bool {
         stop()
@@ -22,7 +24,8 @@ final class EventTapController {
             (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
             (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
             (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
-            (CGEventMask(1) << CGEventType.rightMouseDown.rawValue)
+            (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) |
+            (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
 
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         guard
@@ -46,6 +49,7 @@ final class EventTapController {
 
         eventTap = tap
         runLoopSource = source
+        lastFlags = []
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         Diagnostics.log("Global mouse event tap enabled", level: .info)
@@ -62,6 +66,7 @@ final class EventTapController {
         runLoopSource = nil
         eventTap = nil
         handler = nil
+        lastFlags = []
         Diagnostics.log("Global mouse event tap stopped", level: .debug)
     }
 
@@ -88,11 +93,42 @@ final class EventTapController {
             handler(.up, point)
         case .rightMouseDown:
             handler(.secondaryDown, point)
+        case .flagsChanged:
+            let flags = event.flags
+            let becameOptionOnly = isOptionOnlyPressTransition(from: lastFlags, to: flags)
+            lastFlags = flags
+            if becameOptionOnly {
+                handler(.optionPressed, point)
+            }
         default:
+            lastFlags = event.flags
             break
         }
 
         return Unmanaged.passUnretained(event)
+    }
+
+    private func isOptionOnlyPressTransition(from previous: CGEventFlags, to current: CGEventFlags) -> Bool {
+        let wasOptionDown = previous.contains(.maskAlternate)
+        let isOptionDown = current.contains(.maskAlternate)
+        return !wasOptionDown && isOptionDown && hasOnlyOptionModifier(current)
+    }
+
+    private func hasOnlyOptionModifier(_ flags: CGEventFlags) -> Bool {
+        guard flags.contains(.maskAlternate) else {
+            return false
+        }
+
+        let disallowed: CGEventFlags = [
+            .maskShift,
+            .maskControl,
+            .maskCommand,
+            .maskAlphaShift,
+            .maskSecondaryFn,
+            .maskNumericPad,
+            .maskHelp,
+        ]
+        return flags.intersection(disallowed).isEmpty
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, refcon in

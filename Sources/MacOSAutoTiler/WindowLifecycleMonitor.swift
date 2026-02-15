@@ -8,22 +8,17 @@ final class WindowLifecycleMonitor {
 
     private let discovery: WindowDiscovery
     private let debounceInterval: TimeInterval
-    private let pollInterval: TimeInterval
-    private let pollLeeway: TimeInterval
-    private let pollQueue = DispatchQueue(label: "com.dicen.macosautotiler.lifecycle.poll", qos: .utility)
 
     private var changeHandler: ChangeHandler?
-    private var pollTimer: DispatchSourceTimer?
     private var debounceWorkItem: DispatchWorkItem?
     private var workspaceObservers: [NSObjectProtocol] = []
-
-    private var lastWindowIDs = Set<CGWindowID>()
 
     private var observersByPID: [pid_t: AXObserver] = [:]
     private var appElementsByPID: [pid_t: AXUIElement] = [:]
 
     private let watchedAXNotifications: [CFString] = [
         kAXWindowCreatedNotification as CFString,
+        kAXWindowResizedNotification as CFString,
         kAXUIElementDestroyedNotification as CFString,
         kAXWindowMiniaturizedNotification as CFString,
         kAXWindowDeminiaturizedNotification as CFString,
@@ -31,14 +26,10 @@ final class WindowLifecycleMonitor {
 
     init(
         discovery: WindowDiscovery = WindowDiscovery(),
-        debounceInterval: TimeInterval = 0.18,
-        pollInterval: TimeInterval = 2.0,
-        pollLeeway: TimeInterval = 0.6
+        debounceInterval: TimeInterval = 0.18
     ) {
         self.discovery = discovery
         self.debounceInterval = debounceInterval
-        self.pollInterval = pollInterval
-        self.pollLeeway = pollLeeway
     }
 
     func start(changeHandler: @escaping ChangeHandler) {
@@ -46,19 +37,13 @@ final class WindowLifecycleMonitor {
         self.changeHandler = changeHandler
 
         let windows = discovery.fetchVisibleWindows()
-        let windowIDs = Set(windows.map(\.windowID))
         let pids = Set(windows.map(\.pid))
 
-        pollQueue.sync {
-            self.lastWindowIDs = windowIDs
-        }
-
         refreshAXObservers(for: pids)
-        startPollingTimer()
         registerWorkspaceNotifications()
 
         Diagnostics.log(
-            "Lifecycle monitor started windows=\(windowIDs.count) pids=\(pids.count)",
+            "Lifecycle monitor started (event-driven) windows=\(windows.count) pids=\(pids.count)",
             level: .info
         )
     }
@@ -66,12 +51,6 @@ final class WindowLifecycleMonitor {
     func stop() {
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
-
-        if let pollTimer {
-            pollTimer.setEventHandler {}
-            pollTimer.cancel()
-        }
-        pollTimer = nil
 
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
@@ -85,26 +64,8 @@ final class WindowLifecycleMonitor {
         observersByPID.removeAll()
         appElementsByPID.removeAll()
 
-        pollQueue.sync {
-            self.lastWindowIDs.removeAll()
-        }
-
         changeHandler = nil
         Diagnostics.log("Lifecycle monitor stopped", level: .debug)
-    }
-
-    private func startPollingTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: pollQueue)
-        timer.schedule(
-            deadline: .now() + pollInterval,
-            repeating: pollInterval,
-            leeway: .milliseconds(Int(pollLeeway * 1000))
-        )
-        timer.setEventHandler { [weak self] in
-            self?.pollVisibleWindows()
-        }
-        timer.resume()
-        pollTimer = timer
     }
 
     private func registerWorkspaceNotifications() {
@@ -127,29 +88,6 @@ final class WindowLifecycleMonitor {
         }
 
         workspaceObservers = [launched, terminated]
-    }
-
-    private func pollVisibleWindows() {
-        let windows = discovery.fetchVisibleWindows()
-        let currentIDs = Set(windows.map(\.windowID))
-        let pids = Set(windows.map(\.pid))
-
-        // This method already runs on pollQueue via the timer handler.
-        // Access queue-owned state directly to avoid self-deadlock.
-        let previousIDs = lastWindowIDs
-        lastWindowIDs = currentIDs
-
-        let added = currentIDs.subtracting(previousIDs)
-        let removed = previousIDs.subtracting(currentIDs)
-        if !added.isEmpty || !removed.isEmpty {
-            DispatchQueue.main.async { [weak self] in
-                self?.enqueueChange(reason: "cg-diff(+\(added.count),-\(removed.count))")
-            }
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshAXObservers(for: pids)
-        }
     }
 
     private func refreshObserversFromCurrentWindows(triggerReason: String) {

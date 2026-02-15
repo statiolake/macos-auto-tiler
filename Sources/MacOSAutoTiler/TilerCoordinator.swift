@@ -39,6 +39,7 @@ final class TilerCoordinator {
     private let stableSnapshotsRequired = 3
     private let spaceProbeInterval: TimeInterval = 0.12
     private let maxSpaceTransitionWait: TimeInterval = 1.5
+    private let windowHitSlop: CGFloat = 14
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -110,19 +111,26 @@ final class TilerCoordinator {
         resetInteractionState()
 
         let windows = fetchVisibleWindows()
-        guard let dragged = windows.first(where: { $0.frame.contains(point) }) else {
+        let candidates = windowsAtInteractionPoint(point, windows: windows)
+        guard !candidates.isEmpty else {
             Diagnostics.log("Mouse down at \(point) but no window hit", level: .debug)
             return
         }
 
-        dragTracker.beginPendingDrag(window: dragged)
+        dragTracker.beginPendingDrag(windows: candidates)
+        let candidateIDs = candidates.map { String($0.windowID) }.joined(separator: ",")
         Diagnostics.log(
-            "Pending drag captured windowID=\(dragged.windowID) app=\(dragged.appName)",
+            "Pending drag captured candidates=[\(candidateIDs)] count=\(candidates.count)",
             level: .debug
         )
     }
 
     private func handleMouseDragged(at point: CGPoint) {
+        if dragTracker.isResizing {
+            updateActiveResizePreview(at: point)
+            return
+        }
+
         if dragTracker.isDragging {
             updateActiveDrag(at: point)
             return
@@ -134,6 +142,12 @@ final class TilerCoordinator {
     private func handleMouseUp(at point: CGPoint) {
         defer {
             applyDeferredLifecycleReflowIfNeeded()
+        }
+
+        if let resizedWindowID = dragTracker.finishResize() {
+            finishResizeSession(resizedWindowID: resizedWindowID, point: point)
+            resetInteractionState()
+            return
         }
 
         guard let currentPreviewPlan = activePlan else {
@@ -187,17 +201,31 @@ final class TilerCoordinator {
     }
 
     private func maybeActivateDrag(at point: CGPoint) {
-        guard let pendingWindowID = dragTracker.pendingWindowID else {
+        let pendingWindowIDs = dragTracker.pendingWindowIDs
+        guard !pendingWindowIDs.isEmpty else {
             return
         }
 
         let windows = fetchVisibleWindows()
-        guard let latestWindow = windows.first(where: { $0.windowID == pendingWindowID }) else {
+        let latestByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
+        if pendingWindowIDs.allSatisfy({ latestByID[$0] == nil }) {
             dragTracker.clearPendingDrag()
             return
         }
 
-        guard dragTracker.maybeActivateDrag(currentPoint: point, latestWindow: latestWindow) != nil else {
+        let activatedDrag = dragTracker.maybeActivateDrag(
+            currentPoint: point,
+            latestWindowsByID: latestByID
+        )
+        if dragTracker.isResizing {
+            updateActiveResizePreview(at: point)
+            return
+        }
+
+        guard
+            let activatedDrag,
+            let latestWindow = latestByID[activatedDrag.draggedWindowID]
+        else {
             return
         }
 
@@ -210,6 +238,68 @@ final class TilerCoordinator {
         activateDragSession(draggedWindow: latestWindow, point: point, windows: windows)
     }
 
+    private func updateActiveResizePreview(at point: CGPoint) {
+        guard let resizingWindowID = dragTracker.resizingWindowID else {
+            return
+        }
+
+        let windows = fetchVisibleWindows()
+        guard let resizingWindow = windows.first(where: { $0.windowID == resizingWindowID }) else {
+            clearOverlayState()
+            return
+        }
+
+        if isFloatingWindow(resizingWindow) {
+            clearOverlayState()
+            return
+        }
+
+        let tiled = tiledWindows(from: windows)
+        layoutPlanner.syncRatiosFromObservedWindows(tiled)
+
+        let plans = layoutPlanner.buildReflowPlans(from: tiled)
+        guard
+            let displayID = DisplayService.displayID(containing: point),
+            let plan = plans.first(where: { $0.displayID == displayID && $0.spaceID == resizingWindow.spaceID })
+                ?? plans.first(where: { $0.displayID == displayID })
+        else {
+            clearOverlayState()
+            return
+        }
+
+        activePlan = plan
+        lastLoggedHoverIndex = nil
+        overlay.show(
+            displayID: plan.displayID,
+            slotRects: plan.slots.map(\.rect),
+            hoverIndex: nil
+        )
+    }
+
+    private func finishResizeSession(resizedWindowID: CGWindowID, point: CGPoint) {
+        clearOverlayState()
+
+        let windows = fetchVisibleWindows()
+        guard let resizedWindow = windows.first(where: { $0.windowID == resizedWindowID }) else {
+            needsDeferredLifecycleReflow = false
+            return
+        }
+        guard !isFloatingWindow(resizedWindow) else {
+            needsDeferredLifecycleReflow = false
+            return
+        }
+
+        let tiled = tiledWindows(from: windows)
+        layoutPlanner.syncRatiosFromObservedWindows(tiled)
+        needsDeferredLifecycleReflow = false
+
+        Diagnostics.log(
+            "Resize end windowID=\(resizedWindowID) app=\(resizedWindow.appName) point=\(point) -> apply once",
+            level: .info
+        )
+        reflowAllVisibleWindows(reason: "resize-end")
+    }
+
     private func activateDragSession(draggedWindow: WindowRef, point: CGPoint, windows: [WindowRef]? = nil) {
         let allWindows = windows ?? fetchVisibleWindows()
         let tiled = tiledWindows(from: allWindows, including: [draggedWindow.windowID])
@@ -218,7 +308,8 @@ final class TilerCoordinator {
             let plan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
                 windows: tiled,
-                draggedWindowID: draggedWindow.windowID
+                draggedWindowID: draggedWindow.windowID,
+                preferredSpaceID: draggedWindow.spaceID
             )
         else {
             Diagnostics.log("No windows found for drag session at point=\(point)", level: .warn)
@@ -265,7 +356,8 @@ final class TilerCoordinator {
             let previewPlan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
                 windows: tiled,
-                draggedWindowID: draggedWindowID
+                draggedWindowID: draggedWindowID,
+                preferredSpaceID: draggedWindow.spaceID
             )
         else {
             clearOverlayState()
@@ -386,6 +478,7 @@ final class TilerCoordinator {
             self?.pruneFloatingState(to: liveWindowIDs)
         }
         let semantics = WindowSemanticsClassifier()
+        let draggedSpaceID = windows.first(where: { $0.windowID == dragState.draggedWindowID })?.spaceID
         let tiled = tiledWindows(
             from: windows,
             floatingState: floatingState,
@@ -397,7 +490,8 @@ final class TilerCoordinator {
             layoutPlanner.buildDragPreviewPlan(
                 at: point,
                 windows: tiled,
-                draggedWindowID: dragState.draggedWindowID
+                draggedWindowID: dragState.draggedWindowID,
+                preferredSpaceID: draggedSpaceID
             ) ?? currentPreviewPlan
 
         let destinationIndex =
@@ -699,23 +793,26 @@ final class TilerCoordinator {
     }
 
     private func spaceSnapshotSignature(for windows: [WindowRef]) -> UInt64 {
-        var pairs: [(CGWindowID, CGDirectDisplayID)] = []
+        var pairs: [(CGWindowID, CGDirectDisplayID, Int)] = []
         pairs.reserveCapacity(windows.count)
         for window in windows {
             let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
             let displayID = DisplayService.displayID(containing: midpoint) ?? 0
-            pairs.append((window.windowID, displayID))
+            pairs.append((window.windowID, displayID, window.spaceID))
         }
         pairs.sort {
             if $0.0 != $1.0 { return $0.0 < $1.0 }
-            return $0.1 < $1.1
+            if $0.1 != $1.1 { return $0.1 < $1.1 }
+            return $0.2 < $1.2
         }
 
         var hash = UInt64(pairs.count)
-        for (windowID, displayID) in pairs {
+        for (windowID, displayID, spaceID) in pairs {
             hash ^= UInt64(windowID)
             hash = hash &* 1_099_511_628_211
             hash ^= UInt64(displayID)
+            hash = hash &* 1_099_511_628_211
+            hash ^= UInt64(bitPattern: Int64(spaceID))
             hash = hash &* 1_099_511_628_211
         }
         return hash
@@ -724,6 +821,19 @@ final class TilerCoordinator {
     private func startLifecycleMonitor() {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
+
+            if isGeometryLifecycleReason(reason) {
+                if dragTracker.isResizing {
+                    needsDeferredLifecycleReflow = true
+                    Diagnostics.log("Lifecycle reflow deferred during resize reason=\(reason)", level: .debug)
+                } else {
+                    Diagnostics.log(
+                        "Lifecycle geometry event ignored to prevent feedback loop reason=\(reason)",
+                        level: .debug
+                    )
+                }
+                return
+            }
 
             if isSpaceTransitioning {
                 needsDeferredLifecycleReflow = true
@@ -740,6 +850,12 @@ final class TilerCoordinator {
                 return
             }
 
+            if dragTracker.isResizing {
+                needsDeferredLifecycleReflow = true
+                Diagnostics.log("Lifecycle reflow deferred during resize reason=\(reason)", level: .debug)
+                return
+            }
+
             Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
             reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
         }
@@ -752,8 +868,15 @@ final class TilerCoordinator {
         guard !isSpaceTransitioning else {
             return
         }
+        guard !dragTracker.isResizing else {
+            return
+        }
         needsDeferredLifecycleReflow = false
         reflowAllVisibleWindows(reason: "lifecycle:deferred")
+    }
+
+    private func isGeometryLifecycleReason(_ reason: String) -> Bool {
+        reason.contains("AXWindowResized") || reason.hasPrefix("cg-geometry")
     }
 
     private func clearOverlayState() {
@@ -773,5 +896,15 @@ final class TilerCoordinator {
             return
         }
         Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
+    }
+
+    private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {
+        let directHits = windows.filter { $0.frame.contains(point) }
+        if !directHits.isEmpty {
+            return directHits
+        }
+        return windows.filter {
+            $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
+        }
     }
 }

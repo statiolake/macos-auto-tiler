@@ -7,6 +7,7 @@ struct WindowRef {
     let title: String
     let appName: String
     let bundleID: String?
+    let spaceID: Int
 }
 
 struct Slot {
@@ -24,10 +25,12 @@ struct DragState {
 struct PendingDrag {
     let windowID: CGWindowID
     let originalFrame: CGRect
+    var moveOnlySampleCount: Int
 }
 
 struct DisplayLayoutPlan {
     let displayID: CGDirectDisplayID
+    let spaceID: Int
     let slots: [Slot]
     let slotToWindowID: [Int: CGWindowID]
     let windowToSlotIndex: [CGWindowID: Int]

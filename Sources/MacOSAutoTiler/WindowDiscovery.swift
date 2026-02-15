@@ -60,6 +60,9 @@ final class WindowDiscovery {
             }
 
             let title = (info[kCGWindowName as String] as? String) ?? ""
+            let spaceID = (info["kCGWindowWorkspace"] as? NSNumber)?.intValue
+                ?? (info["kCGWindowWorkspace"] as? Int)
+                ?? 0
             windows.append(
                 WindowRef(
                     windowID: CGWindowID(windowNumber),
@@ -67,7 +70,8 @@ final class WindowDiscovery {
                     frame: frame,
                     title: title,
                     appName: ownerInfo.appName,
-                    bundleID: ownerInfo.bundleID
+                    bundleID: ownerInfo.bundleID,
+                    spaceID: spaceID
                 )
             )
         }

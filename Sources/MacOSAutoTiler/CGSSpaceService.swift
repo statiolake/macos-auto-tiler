@@ -12,6 +12,8 @@ final class CGSSpaceService {
     private typealias CGSCopyManagedDisplaySpacesFn = @convention(c) (CGSConnectionID) -> Unmanaged<CFArray>?
     private typealias CGSCopyBestManagedDisplayForRectFn =
         @convention(c) (CGSConnectionID, CGRect) -> Unmanaged<CFString>?
+    private typealias CGSManagedDisplaySetCurrentSpaceFn =
+        @convention(c) (CGSConnectionID, CFString, UInt64) -> Void
 
     private let stateLock = NSLock()
     private var isResolved = false
@@ -22,6 +24,7 @@ final class CGSSpaceService {
     private var copySpacesForWindowsFn: CGSCopySpacesForWindowsFn?
     private var copyManagedDisplaySpacesFn: CGSCopyManagedDisplaySpacesFn?
     private var copyBestManagedDisplayForRectFn: CGSCopyBestManagedDisplayForRectFn?
+    private var managedDisplaySetCurrentSpaceFn: CGSManagedDisplaySetCurrentSpaceFn?
 
     private let allSpacesMask: UInt32 = 0x7
 
@@ -118,6 +121,60 @@ final class CGSSpaceService {
         return result
     }
 
+    func switchToAdjacentSpace(displayID: CGDirectDisplayID, goLeft: Bool) -> Bool {
+        guard prepare() else {
+            return false
+        }
+        guard
+            let mainConnectionIDFn,
+            let copyManagedDisplaySpacesFn,
+            let copyBestManagedDisplayForRectFn,
+            let managedDisplaySetCurrentSpaceFn
+        else {
+            return false
+        }
+
+        let connection = mainConnectionIDFn()
+        let bounds = CGDisplayBounds(displayID)
+        guard
+            let managedDisplayID = copyBestManagedDisplayForRectFn(connection, bounds)?.takeRetainedValue()
+        else {
+            return false
+        }
+
+        guard let rawDescriptions = copyManagedDisplaySpacesFn(connection)?.takeRetainedValue() as? [[String: Any]] else {
+            return false
+        }
+
+        guard let displayDescription = rawDescriptions.first(where: {
+            ($0["Display Identifier"] as? String) == (managedDisplayID as String)
+        }) else {
+            return false
+        }
+
+        guard
+            let currentSpace = displayDescription["Current Space"] as? [String: Any],
+            let currentSpaceID = parseSpaceID(currentSpace["ManagedSpaceID"] as AnyObject),
+            let spaces = displayDescription["Spaces"] as? [[String: Any]]
+        else {
+            return false
+        }
+
+        let spaceIDs = spaces.compactMap { parseSpaceID($0["ManagedSpaceID"] as AnyObject) }
+        guard let currentIndex = spaceIDs.firstIndex(of: currentSpaceID) else {
+            return false
+        }
+
+        let targetIndex = goLeft ? currentIndex - 1 : currentIndex + 1
+        guard targetIndex >= 0, targetIndex < spaceIDs.count else {
+            return false
+        }
+
+        let targetSpaceID = spaceIDs[targetIndex]
+        managedDisplaySetCurrentSpaceFn(connection, managedDisplayID, UInt64(targetSpaceID))
+        return true
+    }
+
     private func prepare() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -131,7 +188,8 @@ final class CGSSpaceService {
             mainConnection: "CGSMainConnectionID",
             copySpaces: "CGSCopySpacesForWindows",
             copyManagedDisplays: "CGSCopyManagedDisplaySpaces",
-            bestDisplayForRect: "CGSCopyBestManagedDisplayForRect"
+            bestDisplayForRect: "CGSCopyBestManagedDisplayForRect",
+            setCurrentSpace: "CGSManagedDisplaySetCurrentSpace"
         )
 
         let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
@@ -155,6 +213,10 @@ final class CGSSpaceService {
         copySpacesForWindowsFn = unsafeBitCast(copySpacesPtr, to: CGSCopySpacesForWindowsFn.self)
         copyManagedDisplaySpacesFn = unsafeBitCast(copyManagedDisplaysPtr, to: CGSCopyManagedDisplaySpacesFn.self)
         copyBestManagedDisplayForRectFn = unsafeBitCast(bestDisplayForRectPtr, to: CGSCopyBestManagedDisplayForRectFn.self)
+
+        if let setCurrentSpacePtr = dlsym(handle, symbolNames.setCurrentSpace) {
+            managedDisplaySetCurrentSpaceFn = unsafeBitCast(setCurrentSpacePtr, to: CGSManagedDisplaySetCurrentSpaceFn.self)
+        }
 
         skyLightHandle = handle
         isAvailable = true

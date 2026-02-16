@@ -132,6 +132,19 @@ final class WindowDiscovery {
         fetchVisibleWindows().first { $0.windowID == windowID }
     }
 
+    func fetchWindowFrame(windowID: CGWindowID) -> CGRect? {
+        let windowArray = [windowID] as CFArray
+        guard
+            let infos = CGWindowListCreateDescriptionFromArray(windowArray) as? [[String: Any]],
+            let info = infos.first,
+            let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+            let frame = CGRect(dictionaryRepresentation: boundsDict)
+        else {
+            return nil
+        }
+        return frame
+    }
+
     private func logDiscoveryIfChanged(_ windows: [WindowRef]) {
         let signature = discoverySignature(for: windows)
 

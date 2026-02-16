@@ -29,6 +29,28 @@ enum DisplayService {
         return CGRect(x: visible.minX, y: quartzY, width: visible.width, height: visible.height)
     }
 
+    static func isPointInDockRegion(_ point: CGPoint) -> Bool {
+        guard let displayID = displayID(containing: point) else {
+            return false
+        }
+        let full = bounds(for: displayID)
+        let visible = visibleBounds(for: displayID)
+
+        // Bottom Dock
+        if point.y > visible.maxY && point.y <= full.maxY {
+            return true
+        }
+        // Left Dock
+        if point.x >= full.minX && point.x < visible.minX {
+            return true
+        }
+        // Right Dock
+        if point.x > visible.maxX && point.x <= full.maxX {
+            return true
+        }
+        return false
+    }
+
     static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
         NSScreen.screens.first { screen in
             guard let raw = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {

@@ -25,6 +25,8 @@ final class TilerCoordinator {
     private var activeSpaceObserver: NSObjectProtocol?
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
+    private var cachedWindows: [WindowRef]?
+    private var cachedTiledWindows: [WindowRef]?
     private var needsDeferredLifecycleReflow = false
     private var isSpaceTransitioning = false
     private var spaceTransitionGeneration: UInt64 = 0
@@ -35,11 +37,13 @@ final class TilerCoordinator {
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
+    private var lastSpaceSwitchTime: Date = .distantPast
 
     private let stableSnapshotsRequired = 3
     private let spaceProbeInterval: TimeInterval = 0.12
     private let maxSpaceTransitionWait: TimeInterval = 1.5
-    private let windowHitSlop: CGFloat = 96
+    private let windowHitSlop: CGFloat = 24
+    private let spaceSwitchCooldown: TimeInterval = 0.5
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -50,10 +54,14 @@ final class TilerCoordinator {
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
-        let started = eventTap.start { [weak self] eventType, point in
+        let started = eventTap.start { [weak self] eventType, point -> Bool in
+            if case let .scrollWheel(deltaY) = eventType {
+                return self?.handleScrollWheel(deltaY: deltaY, at: point) ?? false
+            }
             DispatchQueue.main.async {
                 self?.handle(eventType, point: point)
             }
+            return false
         }
 
         if !started {
@@ -104,6 +112,8 @@ final class TilerCoordinator {
             handleSecondaryMouseDown(at: point)
         case .optionPressed:
             handleOptionKeyPress(at: point)
+        case .scrollWheel:
+            break // handled synchronously in start() closure
         }
     }
 
@@ -120,6 +130,7 @@ final class TilerCoordinator {
             return
         }
 
+        cachedWindows = windows
         dragTracker.beginPendingDrag(windows: candidates)
         let candidateIDs = candidates.map { String($0.windowID) }.joined(separator: ",")
         Diagnostics.log(
@@ -209,7 +220,27 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = fetchVisibleWindows()
+        guard var windows = cachedWindows else {
+            return
+        }
+
+        // Update only pending windows' frames using lightweight CG query
+        for pendingID in pendingWindowIDs {
+            guard let index = windows.firstIndex(where: { $0.windowID == pendingID }) else {
+                continue
+            }
+            guard let newFrame = discovery.fetchWindowFrame(windowID: pendingID) else {
+                continue
+            }
+            let old = windows[index]
+            windows[index] = WindowRef(
+                windowID: old.windowID, pid: old.pid, frame: newFrame,
+                title: old.title, appName: old.appName, bundleID: old.bundleID,
+                spaceID: old.spaceID
+            )
+        }
+        cachedWindows = windows
+
         let latestByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
         if pendingWindowIDs.allSatisfy({ latestByID[$0] == nil }) {
             dragTracker.clearPendingDrag()
@@ -246,7 +277,25 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = fetchVisibleWindows()
+        let windows: [WindowRef]
+        if var cached = cachedWindows,
+            let newFrame = discovery.fetchWindowFrame(windowID: resizingWindowID),
+            let index = cached.firstIndex(where: { $0.windowID == resizingWindowID })
+        {
+            let old = cached[index]
+            cached[index] = WindowRef(
+                windowID: old.windowID, pid: old.pid, frame: newFrame,
+                title: old.title, appName: old.appName, bundleID: old.bundleID,
+                spaceID: old.spaceID
+            )
+            cachedWindows = cached
+            windows = cached
+        } else {
+            let fetched = fetchVisibleWindows()
+            cachedWindows = fetched
+            windows = fetched
+        }
+
         guard let resizingWindow = windows.first(where: { $0.windowID == resizingWindowID }) else {
             clearOverlayState()
             return
@@ -315,6 +364,9 @@ final class TilerCoordinator {
         let allWindows = windows ?? fetchVisibleWindows()
         let tiled = tiledWindows(from: allWindows, including: [draggedWindow.windowID])
 
+        cachedWindows = allWindows
+        cachedTiledWindows = tiled
+
         guard
             let plan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
@@ -351,7 +403,10 @@ final class TilerCoordinator {
             return
         }
 
-        let windows = fetchVisibleWindows()
+        guard let windows = cachedWindows else {
+            resetInteractionState()
+            return
+        }
         guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
             resetInteractionState()
             return
@@ -362,17 +417,26 @@ final class TilerCoordinator {
             return
         }
 
-        let tiled = tiledWindows(from: windows, including: [draggedWindowID])
-        guard
-            let previewPlan = layoutPlanner.buildDragPreviewPlan(
-                at: point,
-                windows: tiled,
-                draggedWindowID: draggedWindowID,
-                preferredSpaceID: draggedWindow.spaceID
-            )
-        else {
-            clearOverlayState()
-            return
+        let previousDisplayID = activePlan?.displayID
+        let currentDisplayID = DisplayService.displayID(containing: point)
+
+        let previewPlan: DisplayLayoutPlan
+        if let existing = activePlan, currentDisplayID == existing.displayID {
+            previewPlan = existing
+        } else {
+            let tiled = cachedTiledWindows ?? tiledWindows(from: windows, including: [draggedWindowID])
+            guard
+                let newPlan = layoutPlanner.buildDragPreviewPlan(
+                    at: point,
+                    windows: tiled,
+                    draggedWindowID: draggedWindowID,
+                    preferredSpaceID: draggedWindow.spaceID
+                )
+            else {
+                clearOverlayState()
+                return
+            }
+            previewPlan = newPlan
         }
 
         let hoverIndex = layoutPlanner.slotIndex(at: point, in: previewPlan)
@@ -381,16 +445,19 @@ final class TilerCoordinator {
             return
         }
 
-        let previousDisplayID = activePlan?.displayID
         activePlan = previewPlan
-        if previousDisplayID != nil, previousDisplayID != previewPlan.displayID {
+
+        let displayChanged = previousDisplayID != nil && previousDisplayID != previewPlan.displayID
+        let hoverChanged = dragState.hoverSlotIndex != lastLoggedHoverIndex
+
+        if displayChanged {
             Diagnostics.log(
                 "Drag display changed windowID=\(dragState.draggedWindowID) display=\(previewPlan.displayID)",
                 level: .info
             )
         }
 
-        if dragState.hoverSlotIndex != lastLoggedHoverIndex {
+        if hoverChanged {
             let hoverText = dragState.hoverSlotIndex.map(String.init) ?? "nil"
             Diagnostics.log(
                 "Drag hover changed windowID=\(dragState.draggedWindowID) hover=\(hoverText) point=\(point)",
@@ -399,7 +466,9 @@ final class TilerCoordinator {
             lastLoggedHoverIndex = dragState.hoverSlotIndex
         }
 
-        renderOverlay(dragState: dragState, plan: previewPlan)
+        if hoverChanged || displayChanged {
+            renderOverlay(dragState: dragState, plan: previewPlan)
+        }
     }
 
     private func renderOverlay(dragState: DragState, plan: DisplayLayoutPlan) {
@@ -889,6 +958,8 @@ final class TilerCoordinator {
     private func resetInteractionState() {
         dragTracker.clearAll()
         clearOverlayState()
+        cachedWindows = nil
+        cachedTiledWindows = nil
     }
 
     private func logApplyResult(_ failures: [CGWindowID]) {
@@ -897,6 +968,38 @@ final class TilerCoordinator {
             return
         }
         Diagnostics.log("AX apply failures for window IDs: \(failures)", level: .warn)
+    }
+
+    private func handleScrollWheel(deltaY: Int64, at point: CGPoint) -> Bool {
+        guard DisplayService.isPointInDockRegion(point) else {
+            return false
+        }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastSpaceSwitchTime) >= spaceSwitchCooldown else {
+            return true
+        }
+
+        let goLeft = deltaY > 0
+        lastSpaceSwitchTime = now
+
+        Diagnostics.log(
+            "Dock scroll -> switch Space \(goLeft ? "left" : "right") (deltaY=\(deltaY))",
+            level: .info
+        )
+        simulateSpaceSwitch(goLeft: goLeft, at: point)
+        return true
+    }
+
+    private func simulateSpaceSwitch(goLeft: Bool, at point: CGPoint) {
+        guard let displayID = DisplayService.displayID(containing: point) else {
+            Diagnostics.log("Space switch failed: no display at point", level: .warn)
+            return
+        }
+        let ok = CGSSpaceService.shared.switchToAdjacentSpace(displayID: displayID, goLeft: goLeft)
+        if !ok {
+            Diagnostics.log("Space switch failed: CGS API returned false", level: .warn)
+        }
     }
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {

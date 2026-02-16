@@ -535,7 +535,6 @@ final class LayoutPlanner {
         defer { stateLock.unlock() }
         let existing = stackWeightsByScope[scope] ?? []
         let normalized = normalizeWeights(existing, count: stackCount)
-        stackWeightsByScope[scope] = normalized
         return normalized
     }
 

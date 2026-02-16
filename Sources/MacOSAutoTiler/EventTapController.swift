@@ -7,15 +7,16 @@ enum MouseEventType {
     case up
     case secondaryDown
     case optionPressed
+    case scrollWheel(deltaY: Int64)
 }
 
 final class EventTapController {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var handler: ((MouseEventType, CGPoint) -> Void)?
+    private var handler: ((MouseEventType, CGPoint) -> Bool)?
     private var lastFlags: CGEventFlags = []
 
-    func start(handler: @escaping (MouseEventType, CGPoint) -> Void) -> Bool {
+    func start(handler: @escaping (MouseEventType, CGPoint) -> Bool) -> Bool {
         stop()
         self.handler = handler
         Diagnostics.log("Starting global mouse event tap", level: .info)
@@ -25,7 +26,8 @@ final class EventTapController {
             (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
             (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
             (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) |
-            (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
+            (CGEventMask(1) << CGEventType.flagsChanged.rawValue) |
+            (CGEventMask(1) << CGEventType.scrollWheel.rawValue)
 
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         guard
@@ -84,28 +86,35 @@ final class EventTapController {
         }
 
         let point = event.location
+        var consumed = false
+
         switch type {
         case .leftMouseDown:
-            handler(.down, point)
+            consumed = handler(.down, point)
         case .leftMouseDragged:
-            handler(.dragged, point)
+            consumed = handler(.dragged, point)
         case .leftMouseUp:
-            handler(.up, point)
+            consumed = handler(.up, point)
         case .rightMouseDown:
-            handler(.secondaryDown, point)
+            consumed = handler(.secondaryDown, point)
         case .flagsChanged:
             let flags = event.flags
             let becameOptionOnly = isOptionOnlyPressTransition(from: lastFlags, to: flags)
             lastFlags = flags
             if becameOptionOnly {
-                handler(.optionPressed, point)
+                consumed = handler(.optionPressed, point)
+            }
+        case .scrollWheel:
+            let deltaY = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            if deltaY != 0 {
+                consumed = handler(.scrollWheel(deltaY: deltaY), point)
             }
         default:
             lastFlags = event.flags
             break
         }
 
-        return Unmanaged.passUnretained(event)
+        return consumed ? nil : Unmanaged.passUnretained(event)
     }
 
     private func isOptionOnlyPressTransition(from previous: CGEventFlags, to current: CGEventFlags) -> Bool {

@@ -3,10 +3,8 @@ import CoreGraphics
 import Foundation
 
 final class AXWindowActuator {
-    private var cache: [CGWindowID: AXUIElement] = [:]
     private let applyOriginThreshold: CGFloat = 1.0
     private let applySizeThreshold: CGFloat = 1.0
-    private let frameTolerance: CGFloat = 6
     private let axEnhancedUserInterfaceAttribute: CFString = "AXEnhancedUserInterface" as CFString
 
     func apply(targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
@@ -27,16 +25,7 @@ final class AXWindowActuator {
 
             let success = setFrame(target, on: axWindow, windowID: windowID, pid: window.pid)
             if !success {
-                cache.removeValue(forKey: windowID)
                 failures.append(windowID)
-                continue
-            }
-
-            if let actual = copyFrame(of: axWindow), !GeometryUtils.isApproximatelyEqual(actual, target, tolerance: frameTolerance) {
-                Diagnostics.log(
-                    "AX frame mismatch \(windowLabel(windowID, windows: windows)) target=\(target) actual=\(actual)",
-                    level: .debug
-                )
             }
         }
 
@@ -44,17 +33,7 @@ final class AXWindowActuator {
         return failures.sorted()
     }
 
-    private func windowLabel(_ windowID: CGWindowID, windows: [CGWindowID: WindowRef]) -> String {
-        guard let window = windows[windowID] else {
-            return "windowID=\(windowID)"
-        }
-        return "windowID=\(windowID) app=\(window.appName) title=\"\(window.title)\""
-    }
-
     private func resolveAXWindow(for window: WindowRef) -> AXUIElement? {
-        if let cached = cache[window.windowID] {
-            return cached
-        }
         let appElement = AXUIElementCreateApplication(window.pid)
         var windowsValue: CFTypeRef?
         let windowsResult = AXUIElementCopyAttributeValue(
@@ -83,7 +62,6 @@ final class AXWindowActuator {
             Diagnostics.log("No matching AX window found for CG windowID=\(window.windowID)", level: .warn)
             return nil
         }
-        cache[window.windowID] = resolved
         return resolved
     }
 

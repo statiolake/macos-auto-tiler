@@ -132,17 +132,29 @@ final class WindowDiscovery {
         fetchVisibleWindows().first { $0.windowID == windowID }
     }
 
-    func fetchWindowFrame(windowID: CGWindowID) -> CGRect? {
-        let windowArray = [windowID] as CFArray
+    func fetchWindowFrames(for windowIDs: Set<CGWindowID>) -> [CGWindowID: CGRect] {
         guard
-            let infos = CGWindowListCreateDescriptionFromArray(windowArray) as? [[String: Any]],
-            let info = infos.first,
-            let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-            let frame = CGRect(dictionaryRepresentation: boundsDict)
+            !windowIDs.isEmpty,
+            let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
         else {
-            return nil
+            return [:]
         }
-        return frame
+        var result: [CGWindowID: CGRect] = [:]
+        for info in raw {
+            guard
+                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
+                windowIDs.contains(CGWindowID(windowNumber)),
+                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                let frame = CGRect(dictionaryRepresentation: boundsDict)
+            else {
+                continue
+            }
+            result[CGWindowID(windowNumber)] = frame
+            if result.count == windowIDs.count {
+                break
+            }
+        }
+        return result
     }
 
     private func logDiscoveryIfChanged(_ windows: [WindowRef]) {

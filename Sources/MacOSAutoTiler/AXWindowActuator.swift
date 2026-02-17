@@ -12,6 +12,10 @@ final class AXWindowActuator {
         Diagnostics.log("AX apply start for \(sortedIDs.count) windows", level: .debug)
         var failures: [CGWindowID] = []
 
+        // Phase 1: Resolve all AX windows before moving any.
+        // This prevents same-app swaps from misidentifying windows
+        // after the first window has already been relocated.
+        var resolved: [(windowID: CGWindowID, axWindow: AXUIElement, target: CGRect, pid: pid_t?)] = []
         for windowID in sortedIDs {
             guard
                 let target = targetFrames[windowID],
@@ -22,10 +26,14 @@ final class AXWindowActuator {
                 failures.append(windowID)
                 continue
             }
+            resolved.append((windowID: windowID, axWindow: axWindow, target: target, pid: window.pid))
+        }
 
-            let success = setFrame(target, on: axWindow, windowID: windowID, pid: window.pid)
+        // Phase 2: Apply all frames.
+        for entry in resolved {
+            let success = setFrame(entry.target, on: entry.axWindow, windowID: entry.windowID, pid: entry.pid)
             if !success {
-                failures.append(windowID)
+                failures.append(entry.windowID)
             }
         }
 

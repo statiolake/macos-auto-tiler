@@ -224,12 +224,10 @@ final class TilerCoordinator {
             return
         }
 
-        // Update only pending windows' frames using lightweight CG query
-        for pendingID in pendingWindowIDs {
-            guard let index = windows.firstIndex(where: { $0.windowID == pendingID }) else {
-                continue
-            }
-            guard let newFrame = discovery.fetchWindowFrame(windowID: pendingID) else {
+        // Update only pending windows' frames (skip space/app lookups)
+        let updatedFrames = discovery.fetchWindowFrames(for: Set(pendingWindowIDs))
+        for (windowID, newFrame) in updatedFrames {
+            guard let index = windows.firstIndex(where: { $0.windowID == windowID }) else {
                 continue
             }
             let old = windows[index]
@@ -279,15 +277,17 @@ final class TilerCoordinator {
 
         let windows: [WindowRef]
         if var cached = cachedWindows,
-            let newFrame = discovery.fetchWindowFrame(windowID: resizingWindowID),
             let index = cached.firstIndex(where: { $0.windowID == resizingWindowID })
         {
-            let old = cached[index]
-            cached[index] = WindowRef(
-                windowID: old.windowID, pid: old.pid, frame: newFrame,
-                title: old.title, appName: old.appName, bundleID: old.bundleID,
-                spaceID: old.spaceID
-            )
+            let updatedFrames = discovery.fetchWindowFrames(for: [resizingWindowID])
+            if let newFrame = updatedFrames[resizingWindowID] {
+                let old = cached[index]
+                cached[index] = WindowRef(
+                    windowID: old.windowID, pid: old.pid, frame: newFrame,
+                    title: old.title, appName: old.appName, bundleID: old.bundleID,
+                    spaceID: old.spaceID
+                )
+            }
             cachedWindows = cached
             windows = cached
         } else {

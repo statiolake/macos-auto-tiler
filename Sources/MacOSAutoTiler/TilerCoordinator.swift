@@ -2,15 +2,18 @@ import AppKit
 import CoreGraphics
 
 final class TilerCoordinator {
+    private let axWindowResolver = AXWindowResolver.shared
     private let ruleStore = WindowRuleStore()
     private lazy var discovery = WindowDiscovery(ruleStore: ruleStore)
     private let layoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
     private let eventTap = EventTapController()
-    private let geometryApplier = WindowGeometryApplier()
+    private lazy var geometryApplier = WindowGeometryApplier(
+        actuator: AXWindowActuator(resolver: axWindowResolver)
+    )
     private let dragTracker = DragInteractionTracker()
     private lazy var lifecycleMonitor = WindowLifecycleMonitor(discovery: discovery)
-    private let semanticsClassifier = WindowSemanticsClassifier()
+    private lazy var semanticsClassifier = WindowSemanticsClassifier(resolver: axWindowResolver)
     private let typeRegistry = WindowTypeRegistry()
     private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
     private let spaceProbeQueue = DispatchQueue(label: "com.dicen.macosautotiler.spaceprobe", qos: .utility)
@@ -493,7 +496,7 @@ final class TilerCoordinator {
         DispatchQueue.main.async { [weak self] in
             self?.pruneFloatingState(to: liveWindowIDs)
         }
-        let semantics = WindowSemanticsClassifier()
+        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
         let tiled = tiledWindows(
             from: windows,
             floatingState: floatingState,
@@ -557,7 +560,7 @@ final class TilerCoordinator {
         DispatchQueue.main.async { [weak self] in
             self?.pruneFloatingState(to: liveWindowIDs)
         }
-        let semantics = WindowSemanticsClassifier()
+        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
         let draggedSpaceID = windows.first(where: { $0.windowID == dragState.draggedWindowID })?.spaceID
         let tiled = tiledWindows(
             from: windows,

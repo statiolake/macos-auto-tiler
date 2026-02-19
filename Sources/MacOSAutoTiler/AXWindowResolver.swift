@@ -4,6 +4,8 @@ import Darwin
 import Foundation
 
 final class AXWindowResolver {
+    static let shared = AXWindowResolver()
+
     struct ResolvedWindow {
         let element: AXUIElement
         let windowID: CGWindowID
@@ -20,7 +22,7 @@ final class AXWindowResolver {
     ) -> AXError
 
     private let axWindowNumberAttribute: CFString = "AXWindowNumber" as CFString
-    private let getWindowFunction: AXUIElementGetWindowFunction? = AXWindowResolver.loadGetWindowFunction()
+    private static let getWindowFunction: AXUIElementGetWindowFunction? = AXWindowResolver.loadGetWindowFunction()
 
     func window(pid: pid_t, windowID: CGWindowID) -> ResolvedWindow? {
         windowsByID(pid: pid)[windowID]
@@ -81,7 +83,7 @@ final class AXWindowResolver {
     }
 
     private func copyWindowIDUsingSymbol(from element: AXUIElement) -> CGWindowID? {
-        guard let getWindowFunction else {
+        guard let getWindowFunction = Self.getWindowFunction else {
             return nil
         }
         var windowID = CGWindowID(0)

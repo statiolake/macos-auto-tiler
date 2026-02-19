@@ -7,4 +7,4 @@
 - [x] 5. Avoid repeated display lookups per cycle by introducing a display assignment snapshot.
 - [x] 6. Remove unused `WindowGeometryApplier.applyAsync`.
 - [x] 7. Remove duplicated target frame building logic (`LayoutPlanner` vs `DisplayLayoutPlan`).
-- [ ] 8. Remove unused `WindowSemantics.isManageable` field.
+- [x] 8. Remove unused `WindowSemantics.isManageable` field.

@@ -5,7 +5,6 @@ import Foundation
 struct WindowSemantics {
     let descriptor: WindowTypeDescriptor
     let isSpecialFloating: Bool
-    let isManageable: Bool
 }
 
 final class WindowSemanticsClassifier {
@@ -38,8 +37,7 @@ final class WindowSemanticsClassifier {
             )
             return WindowSemantics(
                 descriptor: WindowTypeDescriptor(role: "AXWindow", subrole: "Unknown"),
-                isSpecialFloating: true,
-                isManageable: false
+                isSpecialFloating: true
             )
         }
         let role = resolvedAX.role
@@ -57,8 +55,7 @@ final class WindowSemanticsClassifier {
         }
         return WindowSemantics(
             descriptor: WindowTypeDescriptor(role: role, subrole: subrole),
-            isSpecialFloating: isSpecialFloating,
-            isManageable: isManageable
+            isSpecialFloating: isSpecialFloating
         )
     }
 

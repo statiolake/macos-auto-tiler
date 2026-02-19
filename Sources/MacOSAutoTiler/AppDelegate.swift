@@ -24,8 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "Tiler"
-        statusItem.button?.toolTip = "macOS Auto Tiler"
+        configureStatusButtonAppearance(statusItem.button)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(handleStatusItemClick(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -49,6 +48,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.statusItem = statusItem
         Diagnostics.log("Menu bar item initialized", level: .debug)
+    }
+
+    private func configureStatusButtonAppearance(_ button: NSStatusBarButton?) {
+        guard let button else {
+            return
+        }
+
+        button.toolTip = "macOS Auto Tiler"
+        button.imagePosition = .imageOnly
+
+        if let image = NSImage(systemSymbolName: "square.split.2x1", accessibilityDescription: "Auto Tiler") {
+            image.isTemplate = true
+            button.image = image
+            button.title = ""
+            return
+        }
+
+        // Fallback for environments where SF Symbols are unavailable.
+        button.image = nil
+        button.title = "Tiler"
     }
 
     @objc

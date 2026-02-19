@@ -7,11 +7,9 @@ final class WindowLifecycleMonitor {
     typealias ChangeHandler = (String) -> Void
 
     private let discovery: WindowDiscovery
-    private let debounceInterval: TimeInterval
     private let selfPID = getpid()
 
     private var changeHandler: ChangeHandler?
-    private var debounceWorkItem: DispatchWorkItem?
     private var workspaceObservers: [NSObjectProtocol] = []
 
     private var observersByPID: [pid_t: AXObserver] = [:]
@@ -26,11 +24,9 @@ final class WindowLifecycleMonitor {
     ]
 
     init(
-        discovery: WindowDiscovery = WindowDiscovery(),
-        debounceInterval: TimeInterval = 0.18
+        discovery: WindowDiscovery = WindowDiscovery()
     ) {
         self.discovery = discovery
-        self.debounceInterval = debounceInterval
     }
 
     func start(changeHandler: @escaping ChangeHandler) {
@@ -50,9 +46,6 @@ final class WindowLifecycleMonitor {
     }
 
     func stop() {
-        debounceWorkItem?.cancel()
-        debounceWorkItem = nil
-
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -225,17 +218,12 @@ final class WindowLifecycleMonitor {
     }
 
     private func enqueueChange(reason: String) {
-        debounceWorkItem?.cancel()
-
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, let changeHandler else {
-                return
-            }
+        guard let changeHandler else {
+            return
+        }
+        DispatchQueue.main.async {
             changeHandler(reason)
         }
-
-        debounceWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + debounceInterval, execute: workItem)
     }
 
     private static let axCallback: AXObserverCallback = { _, _, notification, refcon in

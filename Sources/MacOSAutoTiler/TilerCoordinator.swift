@@ -17,6 +17,7 @@ final class TilerCoordinator {
     private let typeRegistry = WindowTypeRegistry()
     private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
     private let spaceProbeQueue = DispatchQueue(label: "com.dicen.macosautotiler.spaceprobe", qos: .utility)
+    private let reflowStateLock = NSLock()
 
     private lazy var rulesPanelController = WindowRulesPanelController(
         registry: typeRegistry,
@@ -31,16 +32,14 @@ final class TilerCoordinator {
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
     private var needsDeferredLifecycleReflow = false
-    private var isSpaceTransitioning = false
-    private var spaceTransitionGeneration: UInt64 = 0
-    private var spaceTransitionStartedAt: Date?
-    private var lastSpaceSnapshotSignature: UInt64?
-    private var stableSpaceSnapshotCount = 0
-    private var spaceProbeWorkItem: DispatchWorkItem?
+    private lazy var spaceTransitionStabilizer = makeSpaceTransitionStabilizer()
+    private lazy var postReflowStabilizer = makePostReflowStabilizer()
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
     private var lastSpaceSwitchTime: Date = .distantPast
+    private var queuedFullReflow: QueuedFullReflow?
+    private var fullReflowWorkerScheduled = false
 
     private let stableSnapshotsRequired = 3
     private let spaceProbeInterval: TimeInterval = 0.12
@@ -52,6 +51,11 @@ final class TilerCoordinator {
         let userFloatingWindowIDs: Set<CGWindowID>
         let userTiledWindowIDs: Set<CGWindowID>
         let ruleSnapshot: WindowRuleSnapshot
+    }
+
+    private struct QueuedFullReflow {
+        let reason: String
+        let floatingState: FloatingStateSnapshot
     }
 
     private struct FloatingEvaluationContext {
@@ -70,6 +74,77 @@ final class TilerCoordinator {
         case ignoreGeometry
         case deferred(context: String)
         case reflowNow
+    }
+
+    private func makeSpaceTransitionStabilizer() -> WindowSnapshotStabilizer {
+        WindowSnapshotStabilizer(
+            stableSnapshotsRequired: stableSnapshotsRequired,
+            probeInterval: spaceProbeInterval,
+            timeout: maxSpaceTransitionWait,
+            probeQueue: spaceProbeQueue,
+            snapshotProvider: { [weak self] in
+                guard let self else {
+                    return .init(signature: 0, windowCount: 0)
+                }
+                let windows = self.discovery.fetchVisibleWindows()
+                return .init(
+                    signature: self.spaceSnapshotSignature(for: windows),
+                    windowCount: windows.count
+                )
+            },
+            probeHandler: { [weak self] generation, stableCount, required, windowCount in
+                guard self != nil else { return }
+                Diagnostics.log(
+                    "Space transition probe generation=\(generation) stable=\(stableCount)/\(required) windows=\(windowCount)",
+                    level: .debug
+                )
+            },
+            settledHandler: { [weak self] generation, settleReason in
+                guard let self else { return }
+                Diagnostics.log(
+                    "Space transition settled reason=\(settleReason.rawValue) generation=\(generation)",
+                    level: .info
+                )
+                self.needsDeferredLifecycleReflow = false
+                self.reflowAllVisibleWindows(reason: "space-settled:\(settleReason.rawValue)")
+            }
+        )
+    }
+
+    private func makePostReflowStabilizer() -> WindowSnapshotStabilizer {
+        WindowSnapshotStabilizer(
+            stableSnapshotsRequired: stableSnapshotsRequired,
+            probeInterval: spaceProbeInterval,
+            timeout: maxSpaceTransitionWait,
+            probeQueue: spaceProbeQueue,
+            snapshotProvider: { [weak self] in
+                guard let self else {
+                    return .init(signature: 0, windowCount: 0)
+                }
+                let windows = self.discovery.fetchVisibleWindows()
+                return .init(
+                    signature: self.spaceSnapshotSignature(for: windows),
+                    windowCount: windows.count
+                )
+            },
+            probeHandler: { [weak self] generation, stableCount, required, windowCount in
+                guard self != nil else { return }
+                Diagnostics.log(
+                    "Post-reflow probe generation=\(generation) stable=\(stableCount)/\(required) windows=\(windowCount)",
+                    level: .debug
+                )
+            },
+            settledHandler: { [weak self] generation, settleReason in
+                guard let self else { return }
+                Diagnostics.log(
+                    "Post-reflow settled reason=\(settleReason.rawValue) generation=\(generation)",
+                    level: .debug
+                )
+                self.reflowQueue.async { [weak self] in
+                    self?.resumeReflowWorkerAfterStabilization()
+                }
+            }
+        )
     }
 
     func start() {
@@ -506,12 +581,62 @@ final class TilerCoordinator {
 
     private func enqueueFullReflow(reason: String) {
         let floatingState = captureFloatingStateSnapshot()
-        reflowQueue.async { [weak self] in
-            self?.performFullReflow(reason: reason, floatingState: floatingState)
+        let queued = QueuedFullReflow(reason: reason, floatingState: floatingState)
+
+        var scheduleWorker = false
+        var replacedReason: String?
+        reflowStateLock.lock()
+        if let existing = queuedFullReflow {
+            replacedReason = existing.reason
+        }
+        queuedFullReflow = queued
+        if !fullReflowWorkerScheduled {
+            fullReflowWorkerScheduled = true
+            scheduleWorker = true
+        }
+        reflowStateLock.unlock()
+
+        if let replacedReason {
+            Diagnostics.log(
+                "Reflow request coalesced old=\(replacedReason) new=\(reason)",
+                level: .debug
+            )
+        }
+
+        if scheduleWorker {
+            reflowQueue.async { [weak self] in
+                self?.processQueuedFullReflow()
+            }
         }
     }
 
-    private func performFullReflow(reason: String, floatingState: FloatingStateSnapshot) {
+    private func processQueuedFullReflow() {
+        if postReflowStabilizer.isActive {
+            Diagnostics.log("Reflow worker paused waiting for post-reflow stabilization", level: .debug)
+            return
+        }
+
+        let request: QueuedFullReflow?
+        reflowStateLock.lock()
+        request = queuedFullReflow
+        queuedFullReflow = nil
+        reflowStateLock.unlock()
+
+        guard let request else {
+            reflowStateLock.lock()
+            fullReflowWorkerScheduled = false
+            reflowStateLock.unlock()
+            return
+        }
+
+        let didApply = performFullReflow(reason: request.reason, floatingState: request.floatingState)
+        if didApply {
+            beginPostReflowStabilization(context: "full:\(request.reason)")
+        }
+        resumeReflowWorkerAfterStabilization()
+    }
+
+    private func performFullReflow(reason: String, floatingState: FloatingStateSnapshot) -> Bool {
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
         let context = buildReflowContext(floatingState: floatingState)
         let windows = context.windows
@@ -522,7 +647,7 @@ final class TilerCoordinator {
                 "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count), floating=\(windows.count - tiled.count))",
                 level: .debug
             )
-            return
+            return false
         }
 
         var totalTargets = 0
@@ -549,6 +674,7 @@ final class TilerCoordinator {
         } else {
             Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
         }
+        return totalTargets > 0
     }
 
     private func enqueueDropReflow(point: CGPoint, dragState: DragState, currentPreviewPlan: DisplayLayoutPlan) {
@@ -628,6 +754,35 @@ final class TilerCoordinator {
             windowsByID: drop.windowsByID
         )
         logApplyResult(failures)
+        beginPostReflowStabilization(context: "drop:\(dragState.draggedWindowID)")
+    }
+
+    private func beginPostReflowStabilization(context: String) {
+        let generation = postReflowStabilizer.start()
+        Diagnostics.log(
+            "Post-reflow stabilization started context=\(context) generation=\(generation)",
+            level: .debug
+        )
+    }
+
+    private func resumeReflowWorkerAfterStabilization() {
+        if postReflowStabilizer.isActive {
+            return
+        }
+        let shouldContinue: Bool
+        reflowStateLock.lock()
+        shouldContinue = queuedFullReflow != nil
+        if !shouldContinue {
+            fullReflowWorkerScheduled = false
+        }
+        reflowStateLock.unlock()
+
+        guard shouldContinue else {
+            return
+        }
+        reflowQueue.async { [weak self] in
+            self?.processQueuedFullReflow()
+        }
     }
 
     private func buildReflowContext(
@@ -761,99 +916,16 @@ final class TilerCoordinator {
     }
 
     private func beginSpaceTransition() {
-        spaceTransitionGeneration &+= 1
-        let generation = spaceTransitionGeneration
-        isSpaceTransitioning = true
-        spaceTransitionStartedAt = Date()
-        lastSpaceSnapshotSignature = nil
-        stableSpaceSnapshotCount = 0
-        spaceProbeWorkItem?.cancel()
-        spaceProbeWorkItem = nil
-
+        let generation = spaceTransitionStabilizer.start()
         Diagnostics.log(
             "Active space changed, entering transition mode generation=\(generation)",
             level: .info
         )
-
-        probeSpaceSnapshot(generation: generation)
-    }
-
-    private func probeSpaceSnapshot(generation: UInt64) {
-        spaceProbeQueue.async { [weak self] in
-            guard let self else { return }
-            let windows = self.discovery.fetchVisibleWindows()
-            let signature = self.spaceSnapshotSignature(for: windows)
-            let windowCount = windows.count
-            DispatchQueue.main.async { [weak self] in
-                self?.handleSpaceSnapshotProbe(
-                    generation: generation,
-                    signature: signature,
-                    windowCount: windowCount
-                )
-            }
-        }
-    }
-
-    private func handleSpaceSnapshotProbe(generation: UInt64, signature: UInt64, windowCount: Int) {
-        guard isSpaceTransitioning, generation == spaceTransitionGeneration else {
-            return
-        }
-
-        if signature == lastSpaceSnapshotSignature {
-            stableSpaceSnapshotCount += 1
-        } else {
-            lastSpaceSnapshotSignature = signature
-            stableSpaceSnapshotCount = 1
-        }
-
-        let elapsed = Date().timeIntervalSince(spaceTransitionStartedAt ?? Date())
-        let reachedStability = stableSpaceSnapshotCount >= stableSnapshotsRequired
-        let reachedTimeout = elapsed >= maxSpaceTransitionWait
-
-        Diagnostics.log(
-            "Space transition probe generation=\(generation) stable=\(stableSpaceSnapshotCount)/\(stableSnapshotsRequired) windows=\(windowCount)",
-            level: .debug
-        )
-
-        if reachedStability || reachedTimeout {
-            let settleReason = reachedStability ? "stable" : "timeout"
-            isSpaceTransitioning = false
-            spaceTransitionStartedAt = nil
-            lastSpaceSnapshotSignature = nil
-            stableSpaceSnapshotCount = 0
-            spaceProbeWorkItem?.cancel()
-            spaceProbeWorkItem = nil
-
-            Diagnostics.log(
-                "Space transition settled reason=\(settleReason) generation=\(generation)",
-                level: .info
-            )
-
-            needsDeferredLifecycleReflow = false
-            reflowAllVisibleWindows(reason: "space-settled:\(settleReason)")
-            return
-        }
-
-        scheduleNextSpaceProbe(generation: generation)
-    }
-
-    private func scheduleNextSpaceProbe(generation: UInt64) {
-        spaceProbeWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.probeSpaceSnapshot(generation: generation)
-        }
-        spaceProbeWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + spaceProbeInterval, execute: workItem)
     }
 
     private func resetSpaceTransitionState() {
-        isSpaceTransitioning = false
-        spaceTransitionStartedAt = nil
-        lastSpaceSnapshotSignature = nil
-        stableSpaceSnapshotCount = 0
-        spaceTransitionGeneration &+= 1
-        spaceProbeWorkItem?.cancel()
-        spaceProbeWorkItem = nil
+        spaceTransitionStabilizer.cancel()
+        postReflowStabilizer.cancel()
     }
 
     private func spaceSnapshotSignature(for windows: [WindowRef]) -> UInt64 {
@@ -902,8 +974,11 @@ final class TilerCoordinator {
         if isGeometryLifecycleReason(reason) {
             return dragTracker.isResizing ? .deferred(context: "resize") : .ignoreGeometry
         }
-        if isSpaceTransitioning {
+        if spaceTransitionStabilizer.isActive {
             return .deferred(context: "space transition")
+        }
+        if postReflowStabilizer.isActive {
+            return .deferred(context: "post-reflow stabilization")
         }
         if dragTracker.isDragging {
             return .deferred(context: "drag")
@@ -923,7 +998,10 @@ final class TilerCoordinator {
         guard needsDeferredLifecycleReflow else {
             return
         }
-        guard !isSpaceTransitioning else {
+        guard !spaceTransitionStabilizer.isActive else {
+            return
+        }
+        guard !postReflowStabilizer.isActive else {
             return
         }
         guard !dragTracker.isResizing else {

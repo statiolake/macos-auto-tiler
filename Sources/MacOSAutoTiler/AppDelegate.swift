@@ -74,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleStatusItemClick(_ sender: Any?) {
         guard let event = NSApp.currentEvent else {
             Diagnostics.log("Status item click with no current event; triggering reflow", level: .debug)
-            coordinator.reflowAllVisibleWindows(reason: "status-left-click")
+            coordinator.requestFullReflow(reason: "status-left-click")
             return
         }
 
@@ -87,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
         case .leftMouseUp:
-            coordinator.reflowAllVisibleWindows(reason: "status-left-click")
+            coordinator.requestFullReflow(reason: "status-left-click")
         default:
             break
         }
@@ -96,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc
     private func reflowNow() {
         Diagnostics.log("Manual reflow requested from menu", level: .info)
-        coordinator.reflowAllVisibleWindows(reason: "menu")
+        coordinator.requestFullReflow(reason: "menu")
     }
 
     @objc

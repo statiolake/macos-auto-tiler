@@ -21,7 +21,7 @@ final class TilerCoordinator {
         registry: typeRegistry,
         ruleStore: ruleStore
     ) { [weak self] in
-        self?.reflowAllVisibleWindows(reason: "rules-updated")
+        self?.requestFullReflow(reason: "rules-updated")
     }
 
     private var activeSpaceObserver: NSObjectProtocol?
@@ -29,8 +29,6 @@ final class TilerCoordinator {
     private var lastLoggedHoverIndex: Int?
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
-    private lazy var spaceTransitionStabilizer = makeSpaceTransitionStabilizer()
-    private lazy var postReflowStabilizer = makePostReflowStabilizer()
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
@@ -43,7 +41,8 @@ final class TilerCoordinator {
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let spaceSwitchCooldown: TimeInterval = 0.5
-    private let reflowRetryIntervalNanoseconds: UInt64 = 120_000_000
+    private let interactionWaitNanoseconds: UInt64 = 120_000_000
+    private let frameEpsilon: CGFloat = 1.0
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -52,12 +51,10 @@ final class TilerCoordinator {
     }
 
     private struct QueuedFullReflow {
-        let enqueuedAtUptime: UInt64
         let reason: String
     }
 
     private struct QueuedDropReflow {
-        let enqueuedAtUptime: UInt64
         let point: CGPoint
         let draggedWindowID: CGWindowID
         let hoverSlotIndex: Int?
@@ -80,33 +77,56 @@ final class TilerCoordinator {
         let tiledWindows: [WindowRef]
     }
 
-    private enum LifecycleDecision {
-        case ignoreGeometry
-        case reflowNow
-    }
-
-    private static func isHigherPriorityReflowRequest(_ lhs: QueuedReflowRequest, _ rhs: QueuedReflowRequest) -> Bool {
-        switch (lhs, rhs) {
-        case (.drop, .full):
-            return true
-        case (.full, .drop):
-            return false
-        case let (.drop(lhsDrop), .drop(rhsDrop)):
-            return lhsDrop.enqueuedAtUptime < rhsDrop.enqueuedAtUptime
-        case let (.full(lhsFull), .full(rhsFull)):
-            return lhsFull.enqueuedAtUptime < rhsFull.enqueuedAtUptime
-        }
-    }
-
-    private static func nowUptime() -> UInt64 {
-        DispatchTime.now().uptimeNanoseconds
-    }
-
     private actor ReflowRequestState {
-        private var queue = PriorityQueue<QueuedReflowRequest>(sort: {
-            TilerCoordinator.isHigherPriorityReflowRequest($0, $1)
-        })
-        private var lastStartedReflowUptime: UInt64 = 0
+        private struct PriorityQueue {
+            private var dropQueue: [QueuedDropReflow] = []
+            private var dropHeadIndex = 0
+            private var fullReflowRequested = false
+            private var latestFullReflowReason = "manual"
+
+            mutating func enqueue(_ request: QueuedReflowRequest) {
+                switch request {
+                case let .drop(drop):
+                    dropQueue.append(drop)
+                case let .full(full):
+                    fullReflowRequested = true
+                    latestFullReflowReason = full.reason
+                }
+            }
+
+            mutating func dequeue() -> QueuedReflowRequest? {
+                if let drop = dequeueDrop() {
+                    return .drop(drop)
+                }
+                guard fullReflowRequested else {
+                    return nil
+                }
+                fullReflowRequested = false
+                return .full(QueuedFullReflow(reason: latestFullReflowReason))
+            }
+
+            private var hasDropRequests: Bool {
+                dropHeadIndex < dropQueue.count
+            }
+
+            private mutating func dequeueDrop() -> QueuedDropReflow? {
+                guard hasDropRequests else {
+                    dropQueue.removeAll(keepingCapacity: true)
+                    dropHeadIndex = 0
+                    return nil
+                }
+                let drop = dropQueue[dropHeadIndex]
+                dropHeadIndex += 1
+
+                if dropHeadIndex >= 32, dropHeadIndex * 2 >= dropQueue.count {
+                    dropQueue.removeFirst(dropHeadIndex)
+                    dropHeadIndex = 0
+                }
+                return drop
+            }
+        }
+
+        private var queue = PriorityQueue()
         private var waitingContinuation: CheckedContinuation<Void, Never>?
 
         func enqueue(_ request: QueuedReflowRequest) {
@@ -120,7 +140,7 @@ final class TilerCoordinator {
                 if Task.isCancelled {
                     return nil
                 }
-                if let request = dequeueProcessable() {
+                if let request = queue.dequeue() {
                     return request
                 }
                 await withCheckedContinuation { continuation in
@@ -129,100 +149,11 @@ final class TilerCoordinator {
             }
         }
 
-        func markStartedNow() {
-            lastStartedReflowUptime = TilerCoordinator.nowUptime()
-        }
-
         func reset() {
-            queue = PriorityQueue<QueuedReflowRequest>(sort: {
-                TilerCoordinator.isHigherPriorityReflowRequest($0, $1)
-            })
-            lastStartedReflowUptime = 0
+            queue = PriorityQueue()
             waitingContinuation?.resume()
             waitingContinuation = nil
         }
-
-        private func dequeueProcessable() -> QueuedReflowRequest? {
-            while let request = queue.dequeue() {
-                switch request {
-                case .drop:
-                    return request
-                case let .full(full):
-                    guard full.enqueuedAtUptime > lastStartedReflowUptime else {
-                        continue
-                    }
-                    return request
-                }
-            }
-            return nil
-        }
-    }
-
-    private func makeSpaceTransitionStabilizer() -> WindowSnapshotStabilizer {
-        WindowSnapshotStabilizer(
-            stableSnapshotsRequired: stableSnapshotsRequired,
-            probeInterval: spaceProbeInterval,
-            timeout: maxSpaceTransitionWait,
-            probeQueue: spaceProbeQueue,
-            snapshotProvider: { [weak self] in
-                guard let self else {
-                    return .init(signature: 0, windowCount: 0)
-                }
-                let windows = self.discovery.fetchVisibleWindows()
-                return .init(
-                    signature: self.spaceSnapshotSignature(for: windows),
-                    windowCount: windows.count
-                )
-            },
-            probeHandler: { [weak self] generation, stableCount, required, windowCount in
-                guard self != nil else { return }
-                Diagnostics.log(
-                    "Space transition probe generation=\(generation) stable=\(stableCount)/\(required) windows=\(windowCount)",
-                    level: .debug
-                )
-            },
-            settledHandler: { [weak self] generation, settleReason in
-                guard let self else { return }
-                Diagnostics.log(
-                    "Space transition settled reason=\(settleReason.rawValue) generation=\(generation)",
-                    level: .info
-                )
-                self.reflowAllVisibleWindows(reason: "space-settled:\(settleReason.rawValue)")
-            }
-        )
-    }
-
-    private func makePostReflowStabilizer() -> WindowSnapshotStabilizer {
-        WindowSnapshotStabilizer(
-            stableSnapshotsRequired: stableSnapshotsRequired,
-            probeInterval: spaceProbeInterval,
-            timeout: maxSpaceTransitionWait,
-            probeQueue: spaceProbeQueue,
-            snapshotProvider: { [weak self] in
-                guard let self else {
-                    return .init(signature: 0, windowCount: 0)
-                }
-                let windows = self.discovery.fetchVisibleWindows()
-                return .init(
-                    signature: self.spaceSnapshotSignature(for: windows),
-                    windowCount: windows.count
-                )
-            },
-            probeHandler: { [weak self] generation, stableCount, required, windowCount in
-                guard self != nil else { return }
-                Diagnostics.log(
-                    "Post-reflow probe generation=\(generation) stable=\(stableCount)/\(required) windows=\(windowCount)",
-                    level: .debug
-                )
-            },
-            settledHandler: { [weak self] generation, settleReason in
-                guard self != nil else { return }
-                Diagnostics.log(
-                    "Post-reflow settled reason=\(settleReason.rawValue) generation=\(generation)",
-                    level: .debug
-                )
-            }
-        )
     }
 
     func start() {
@@ -248,7 +179,7 @@ final class TilerCoordinator {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
-            self.reflowAllVisibleWindows(reason: "startup")
+            self.requestFullReflow(reason: "startup")
         }
 
         setupActiveSpaceObserver()
@@ -267,7 +198,6 @@ final class TilerCoordinator {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
         }
-        resetSpaceTransitionState()
         resetInteractionState()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
@@ -276,8 +206,14 @@ final class TilerCoordinator {
         rulesPanelController.present()
     }
 
-    func reflowAllVisibleWindows(reason: String = "manual") {
-        enqueueFullReflow(reason: reason)
+    func requestFullReflow(reason: String = "manual") {
+        enqueueReflowRequest(
+            .full(
+                QueuedFullReflow(
+                    reason: reason
+                )
+            )
+        )
     }
 
     private func handle(_ eventType: MouseEventType, point: CGPoint) {
@@ -351,9 +287,14 @@ final class TilerCoordinator {
         }
 
         clearOverlayState()
-        enqueueDropReflow(
-            point: point,
-            dragState: dragState
+        enqueueReflowRequest(
+            .drop(
+                QueuedDropReflow(
+                    point: point,
+                    draggedWindowID: dragState.draggedWindowID,
+                    hoverSlotIndex: dragState.hoverSlotIndex
+                )
+            )
         )
     }
 
@@ -385,7 +326,7 @@ final class TilerCoordinator {
             userFloatingWindowIDs.insert(draggedWindowID)
             Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> floating", level: .info)
             clearOverlayState()
-            reflowAllVisibleWindows(reason: "floating-toggle")
+            requestFullReflow(reason: "floating-toggle")
         }
     }
 
@@ -533,7 +474,7 @@ final class TilerCoordinator {
             "Resize end windowID=\(resizeState.windowID) app=\(resizedWindow.appName) point=\(point) -> apply once",
             level: .info
         )
-        reflowAllVisibleWindows(reason: "resize-end")
+        requestFullReflow(reason: "resize-end")
     }
 
     private func activateDragSession(draggedWindow: WindowRef, point: CGPoint, windows: [WindowRef]? = nil) {
@@ -666,30 +607,6 @@ final class TilerCoordinator {
         }
     }
 
-    private func enqueueFullReflow(reason: String) {
-        enqueueReflowRequest(
-            .full(
-                QueuedFullReflow(
-                    enqueuedAtUptime: Self.nowUptime(),
-                    reason: reason
-                )
-            )
-        )
-    }
-
-    private func enqueueDropReflow(point: CGPoint, dragState: DragState) {
-        enqueueReflowRequest(
-            .drop(
-                QueuedDropReflow(
-                    enqueuedAtUptime: Self.nowUptime(),
-                    point: point,
-                    draggedWindowID: dragState.draggedWindowID,
-                    hoverSlotIndex: dragState.hoverSlotIndex
-                )
-            )
-        )
-    }
-
     private func enqueueReflowRequest(_ request: QueuedReflowRequest) {
         Task { [weak self] in
             guard let self else { return }
@@ -702,55 +619,82 @@ final class TilerCoordinator {
             if Task.isCancelled {
                 return
             }
-            while await isReflowExecutionBlocked() {
-                if Task.isCancelled {
-                    return
-                }
-                try? await Task.sleep(nanoseconds: reflowRetryIntervalNanoseconds)
-            }
 
             guard let request = await reflowState.nextRequest() else {
                 continue
             }
 
-            if await isReflowExecutionBlocked() {
-                await reflowState.enqueue(request)
-                continue
-            }
+            await waitForInteractionIdle()
+            await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
+            await waitForInteractionIdle()
 
-            await reflowState.markStartedNow()
-
-            let didApply: Bool
             switch request {
             case let .drop(drop):
-                didApply = performDropReflow(
+                _ = performDropReflow(
                     point: drop.point,
                     draggedWindowID: drop.draggedWindowID,
                     hoverSlotIndex: drop.hoverSlotIndex
                 )
-                if didApply {
-                    beginPostReflowStabilization(context: "drop:\(drop.draggedWindowID)")
-                }
             case let .full(full):
-                didApply = performFullReflow(reason: full.reason)
-                if didApply {
-                    beginPostReflowStabilization(context: "full:\(full.reason)")
-                }
-            }
-
-            if didApply {
-                // Wait for stabilization before applying the next request.
-                continue
+                _ = performFullReflow(reason: full.reason)
             }
         }
     }
 
-    private func isReflowExecutionBlocked() async -> Bool {
-        let isInteractionActive = await MainActor.run { [weak self] in
-            guard let self else { return false }
-            return self.dragTracker.isDragging || self.dragTracker.isResizing
+    private func waitForInteractionIdle() async {
+        while true {
+            if Task.isCancelled {
+                return
+            }
+            let isInteractionActive = await MainActor.run { [weak self] in
+                guard let self else { return false }
+                return self.dragTracker.isDragging || self.dragTracker.isResizing
+            }
+            if !isInteractionActive {
+                return
+            }
+            try? await Task.sleep(nanoseconds: interactionWaitNanoseconds)
         }
-        return spaceTransitionStabilizer.isActive || postReflowStabilizer.isActive || isInteractionActive
+    }
+
+    private func waitForReflowStabilization(trigger: String) async {
+        let stabilizer = WindowSnapshotStabilizer(
+            stableSnapshotsRequired: stableSnapshotsRequired,
+            probeInterval: spaceProbeInterval,
+            timeout: maxSpaceTransitionWait,
+            probeQueue: spaceProbeQueue,
+            snapshotProvider: { [weak self] in
+                guard let self else {
+                    return .init(signature: 0, windowCount: 0)
+                }
+                let windows = self.discovery.fetchVisibleWindows()
+                return .init(
+                    signature: self.spaceSnapshotSignature(for: windows),
+                    windowCount: windows.count
+                )
+            },
+            probeHandler: { generation, stableCount, required, windowCount in
+                Diagnostics.log(
+                    "Reflow probe generation=\(generation) trigger=\(trigger) stable=\(stableCount)/\(required) windows=\(windowCount)",
+                    level: .debug
+                )
+            }
+        )
+
+        let result = await stabilizer.waitForStabilize()
+        Diagnostics.log(
+            "Reflow stabilization settled generation=\(result.generation) trigger=\(trigger) reason=\(result.reason.rawValue)",
+            level: .debug
+        )
+    }
+
+    private func reflowTriggerDescription(for request: QueuedReflowRequest) -> String {
+        switch request {
+        case let .drop(drop):
+            return "drop:\(drop.draggedWindowID)"
+        case let .full(full):
+            return "full:\(full.reason)"
+        }
     }
 
     private func performFullReflow(reason: String) -> Bool {
@@ -771,7 +715,17 @@ final class TilerCoordinator {
         var totalTargets = 0
         var totalFailures: [CGWindowID] = []
         for plan in plans {
-            let targets = plan.targetFrames
+            let targets = targetFramesNeedingApply(
+                targetFrames: plan.targetFrames,
+                windowsByID: plan.windowsByID
+            )
+            guard !targets.isEmpty else {
+                Diagnostics.log(
+                    "Reflow (\(reason)) display=\(plan.displayID) skipped: all targets already satisfied",
+                    level: .debug
+                )
+                continue
+            }
             totalTargets += targets.count
 
             Diagnostics.log(
@@ -788,7 +742,11 @@ final class TilerCoordinator {
         }
 
         if totalFailures.isEmpty {
-            Diagnostics.log("Reflow (\(reason)) finished successfully for \(totalTargets) windows", level: .info)
+            if totalTargets == 0 {
+                Diagnostics.log("Reflow (\(reason)) no-op: target frames already applied", level: .debug)
+            } else {
+                Diagnostics.log("Reflow (\(reason)) finished successfully for \(totalTargets) windows", level: .info)
+            }
         } else {
             Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
         }
@@ -859,26 +817,30 @@ final class TilerCoordinator {
         }
 
         let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
+        let targetFrames = targetFramesNeedingApply(
+            targetFrames: drop.targetFrames,
+            windowsByID: drop.windowsByID
+        )
+        guard !targetFrames.isEmpty else {
+            Diagnostics.log(
+                "Drop no-op windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
+                level: .debug
+            )
+            return false
+        }
+
         Diagnostics.log(
-            "Applying layout from drop windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
+            "Applying layout from drop windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(targetFrames.count)",
             level: .info
         )
 
         let failures = geometryApplier.applySync(
             reason: "drop/window=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
-            targetFrames: drop.targetFrames,
+            targetFrames: targetFrames,
             windowsByID: drop.windowsByID
         )
         logApplyResult(failures)
-        return !drop.targetFrames.isEmpty
-    }
-
-    private func beginPostReflowStabilization(context: String) {
-        let generation = postReflowStabilizer.start()
-        Diagnostics.log(
-            "Post-reflow stabilization started context=\(context) generation=\(generation)",
-            level: .debug
-        )
+        return !targetFrames.isEmpty
     }
 
     private func buildReflowContext(
@@ -1007,21 +969,9 @@ final class TilerCoordinator {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            self.beginSpaceTransition()
+            Diagnostics.log("Active space changed", level: .debug)
+            self.requestFullReflow(reason: "space-change")
         }
-    }
-
-    private func beginSpaceTransition() {
-        let generation = spaceTransitionStabilizer.start()
-        Diagnostics.log(
-            "Active space changed, entering transition mode generation=\(generation)",
-            level: .info
-        )
-    }
-
-    private func resetSpaceTransitionState() {
-        spaceTransitionStabilizer.cancel()
-        postReflowStabilizer.cancel()
     }
 
     private func spaceSnapshotSignature(for windows: [WindowRef]) -> UInt64 {
@@ -1051,28 +1001,28 @@ final class TilerCoordinator {
     private func startLifecycleMonitor() {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
-            switch lifecycleDecision(for: reason) {
-            case .ignoreGeometry:
-                Diagnostics.log(
-                    "Lifecycle geometry event ignored to prevent feedback loop reason=\(reason)",
-                    level: .debug
-                )
-            case .reflowNow:
-                Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
-                reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
+            Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
+            requestFullReflow(reason: "lifecycle:\(reason)")
+        }
+    }
+
+    private func targetFramesNeedingApply(
+        targetFrames: [CGWindowID: CGRect],
+        windowsByID: [CGWindowID: WindowRef]
+    ) -> [CGWindowID: CGRect] {
+        targetFrames.filter { windowID, targetFrame in
+            guard let window = windowsByID[windowID] else {
+                return true
             }
+            return !framesApproximatelyEqual(window.frame, targetFrame)
         }
     }
 
-    private func lifecycleDecision(for reason: String) -> LifecycleDecision {
-        if isGeometryLifecycleReason(reason) {
-            return .ignoreGeometry
-        }
-        return .reflowNow
-    }
-
-    private func isGeometryLifecycleReason(_ reason: String) -> Bool {
-        reason.contains("AXWindowResized") || reason.hasPrefix("cg-geometry")
+    private func framesApproximatelyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) <= frameEpsilon
+            && abs(lhs.origin.y - rhs.origin.y) <= frameEpsilon
+            && abs(lhs.size.width - rhs.size.width) <= frameEpsilon
+            && abs(lhs.size.height - rhs.size.height) <= frameEpsilon
     }
 
     private func clearOverlayState() {

@@ -17,6 +17,8 @@ final class WindowLifecycleMonitor {
 
     private let watchedAXNotifications: [CFString] = [
         kAXWindowCreatedNotification as CFString,
+        kAXFocusedWindowChangedNotification as CFString,
+        kAXMainWindowChangedNotification as CFString,
         kAXWindowResizedNotification as CFString,
         kAXUIElementDestroyedNotification as CFString,
         kAXWindowMiniaturizedNotification as CFString,

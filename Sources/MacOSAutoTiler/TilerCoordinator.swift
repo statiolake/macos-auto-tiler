@@ -61,6 +61,11 @@ final class TilerCoordinator {
         let semanticsClassifier: WindowSemanticsClassifier
     }
 
+    private struct ReflowContext {
+        let windows: [WindowRef]
+        let tiledWindows: [WindowRef]
+    }
+
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
@@ -498,20 +503,9 @@ final class TilerCoordinator {
 
     private func performFullReflow(reason: String, floatingState: FloatingStateSnapshot) {
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
-        let windows = discovery.fetchVisibleWindows()
-        let liveWindowIDs = Set(windows.map(\.windowID))
-        DispatchQueue.main.async { [weak self] in
-            self?.pruneFloatingState(to: liveWindowIDs)
-        }
-        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
-        let floatingContext = makeFloatingContext(
-            from: floatingState,
-            semanticsClassifier: semantics
-        )
-        let tiled = tiledWindows(
-            from: windows,
-            floatingContext: floatingContext
-        )
+        let context = buildReflowContext(floatingState: floatingState)
+        let windows = context.windows
+        let tiled = context.tiledWindows
         let plans = layoutPlanner.buildReflowPlans(from: tiled)
         guard !plans.isEmpty else {
             Diagnostics.log(
@@ -565,22 +559,13 @@ final class TilerCoordinator {
         currentPreviewPlan: DisplayLayoutPlan,
         floatingState: FloatingStateSnapshot
     ) {
-        let windows = discovery.fetchVisibleWindows()
-        let liveWindowIDs = Set(windows.map(\.windowID))
-        DispatchQueue.main.async { [weak self] in
-            self?.pruneFloatingState(to: liveWindowIDs)
-        }
-        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
-        let floatingContext = makeFloatingContext(
-            from: floatingState,
-            semanticsClassifier: semantics
+        let context = buildReflowContext(
+            floatingState: floatingState,
+            including: [dragState.draggedWindowID]
         )
+        let windows = context.windows
         let draggedSpaceID = windows.first(where: { $0.windowID == dragState.draggedWindowID })?.spaceID
-        let tiled = tiledWindows(
-            from: windows,
-            including: [dragState.draggedWindowID],
-            floatingContext: floatingContext
-        )
+        let tiled = context.tiledWindows
 
         let previewPlan =
             layoutPlanner.buildDragPreviewPlan(
@@ -633,6 +618,29 @@ final class TilerCoordinator {
             windowsByID: drop.windowsByID
         )
         logApplyResult(failures)
+    }
+
+    private func buildReflowContext(
+        floatingState: FloatingStateSnapshot,
+        including includedWindowIDs: Set<CGWindowID> = []
+    ) -> ReflowContext {
+        let windows = discovery.fetchVisibleWindows()
+        let liveWindowIDs = Set(windows.map(\.windowID))
+        DispatchQueue.main.async { [weak self] in
+            self?.pruneFloatingState(to: liveWindowIDs)
+        }
+
+        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
+        let floatingContext = makeFloatingContext(
+            from: floatingState,
+            semanticsClassifier: semantics
+        )
+        let tiled = tiledWindows(
+            from: windows,
+            including: includedWindowIDs,
+            floatingContext: floatingContext
+        )
+        return ReflowContext(windows: windows, tiledWindows: tiled)
     }
 
     private func fetchVisibleWindows() -> [WindowRef] {

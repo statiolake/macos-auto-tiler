@@ -1,7 +1,7 @@
 # Refactor TODO
 
 - [x] 1. Share `AXWindowResolver` so resolver/dlopen initialization does not repeat across reflow paths.
-- [ ] 2. Remove duplicated floating decision branches by unifying snapshot/live evaluation.
+- [x] 2. Remove duplicated floating decision branches by unifying snapshot/live evaluation.
 - [ ] 3. Unify duplicated reflow context setup shared by full/drop reflow paths.
 - [ ] 4. Simplify deferred lifecycle reflow logic into a single scheduling decision point.
 - [ ] 5. Avoid repeated display lookups per cycle by introducing a display assignment snapshot.

@@ -54,6 +54,13 @@ final class TilerCoordinator {
         let ruleSnapshot: WindowRuleSnapshot
     }
 
+    private struct FloatingEvaluationContext {
+        let userFloatingWindowIDs: Set<CGWindowID>
+        let userTiledWindowIDs: Set<CGWindowID>
+        let ruleSnapshot: WindowRuleSnapshot
+        let semanticsClassifier: WindowSemanticsClassifier
+    }
+
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
@@ -497,10 +504,13 @@ final class TilerCoordinator {
             self?.pruneFloatingState(to: liveWindowIDs)
         }
         let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
+        let floatingContext = makeFloatingContext(
+            from: floatingState,
+            semanticsClassifier: semantics
+        )
         let tiled = tiledWindows(
             from: windows,
-            floatingState: floatingState,
-            semanticsClassifier: semantics
+            floatingContext: floatingContext
         )
         let plans = layoutPlanner.buildReflowPlans(from: tiled)
         guard !plans.isEmpty else {
@@ -561,12 +571,15 @@ final class TilerCoordinator {
             self?.pruneFloatingState(to: liveWindowIDs)
         }
         let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
+        let floatingContext = makeFloatingContext(
+            from: floatingState,
+            semanticsClassifier: semantics
+        )
         let draggedSpaceID = windows.first(where: { $0.windowID == dragState.draggedWindowID })?.spaceID
         let tiled = tiledWindows(
             from: windows,
-            floatingState: floatingState,
             including: [dragState.draggedWindowID],
-            semanticsClassifier: semantics
+            floatingContext: floatingContext
         )
 
         let previewPlan =
@@ -644,103 +657,63 @@ final class TilerCoordinator {
         )
     }
 
-    private func tiledWindows(from windows: [WindowRef], including included: Set<CGWindowID> = []) -> [WindowRef] {
-        windows.filter { window in
-            if included.contains(window.windowID) {
-                return true
-            }
-            return !isFloatingWindow(window)
-        }
-    }
-
-    private func tiledWindows(
-        from windows: [WindowRef],
-        floatingState: FloatingStateSnapshot,
-        including included: Set<CGWindowID> = [],
+    private func makeFloatingContext(
+        from snapshot: FloatingStateSnapshot,
         semanticsClassifier: WindowSemanticsClassifier
-    ) -> [WindowRef] {
-        windows.filter { window in
-            if included.contains(window.windowID) {
-                return true
-            }
-            return !isFloatingWindow(
-                window,
-                floatingState: floatingState,
-                semanticsClassifier: semanticsClassifier
-            )
-        }
-    }
-
-    private func isFloatingWindow(_ window: WindowRef) -> Bool {
-        if userFloatingWindowIDs.contains(window.windowID) {
-            return true
-        }
-        if userTiledWindowIDs.contains(window.windowID) {
-            return false
-        }
-        return isAutomaticallyFloating(window)
-    }
-
-    private func isFloatingWindow(
-        _ window: WindowRef,
-        floatingState: FloatingStateSnapshot,
-        semanticsClassifier: WindowSemanticsClassifier
-    ) -> Bool {
-        if floatingState.userFloatingWindowIDs.contains(window.windowID) {
-            return true
-        }
-        if floatingState.userTiledWindowIDs.contains(window.windowID) {
-            return false
-        }
-        return isAutomaticallyFloating(
-            window,
-            ruleSnapshot: floatingState.ruleSnapshot,
+    ) -> FloatingEvaluationContext {
+        FloatingEvaluationContext(
+            userFloatingWindowIDs: snapshot.userFloatingWindowIDs,
+            userTiledWindowIDs: snapshot.userTiledWindowIDs,
+            ruleSnapshot: snapshot.ruleSnapshot,
             semanticsClassifier: semanticsClassifier
         )
     }
 
-    private func isAutomaticallyFloating(_ window: WindowRef) -> Bool {
-        if ruleStore.isBundleExcluded(window.bundleID) {
-            return true
+    private func tiledWindows(
+        from windows: [WindowRef],
+        including included: Set<CGWindowID> = [],
+        floatingContext: FloatingEvaluationContext? = nil
+    ) -> [WindowRef] {
+        let context = floatingContext ?? liveFloatingContext()
+        return windows.filter { window in
+            if included.contains(window.windowID) {
+                return true
+            }
+            return !isFloatingWindow(window, context: context)
         }
-
-        if ruleStore.isAppForcedFloating(window.appName) {
-            return true
-        }
-
-        let semantics = semanticsClassifier.semantics(for: window)
-        if ruleStore.isTypeForcedFloating(semantics.descriptor) {
-            return true
-        }
-
-        if semantics.isSpecialFloating {
-            return true
-        }
-        return false
     }
 
-    private func isAutomaticallyFloating(
-        _ window: WindowRef,
-        ruleSnapshot: WindowRuleSnapshot,
-        semanticsClassifier: WindowSemanticsClassifier
-    ) -> Bool {
-        if ruleSnapshot.isBundleExcluded(window.bundleID) {
-            return true
-        }
+    private func liveFloatingContext() -> FloatingEvaluationContext {
+        FloatingEvaluationContext(
+            userFloatingWindowIDs: userFloatingWindowIDs,
+            userTiledWindowIDs: userTiledWindowIDs,
+            ruleSnapshot: ruleStore.snapshot(),
+            semanticsClassifier: semanticsClassifier
+        )
+    }
 
-        if ruleSnapshot.isAppForcedFloating(window.appName) {
-            return true
-        }
+    private func isFloatingWindow(_ window: WindowRef) -> Bool {
+        isFloatingWindow(window, context: liveFloatingContext())
+    }
 
-        let semantics = semanticsClassifier.semantics(for: window)
-        if ruleSnapshot.isTypeForcedFloating(semantics.descriptor) {
+    private func isFloatingWindow(_ window: WindowRef, context: FloatingEvaluationContext) -> Bool {
+        if context.userFloatingWindowIDs.contains(window.windowID) {
             return true
         }
-
-        if semantics.isSpecialFloating {
+        if context.userTiledWindowIDs.contains(window.windowID) {
+            return false
+        }
+        if context.ruleSnapshot.isBundleExcluded(window.bundleID) {
             return true
         }
-        return false
+        if context.ruleSnapshot.isAppForcedFloating(window.appName) {
+            return true
+        }
+        let semantics = context.semanticsClassifier.semantics(for: window)
+        if context.ruleSnapshot.isTypeForcedFloating(semantics.descriptor) {
+            return true
+        }
+        return semantics.isSpecialFloating
     }
 
     private func pruneFloatingState(using windows: [WindowRef]) {

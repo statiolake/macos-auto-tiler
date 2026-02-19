@@ -3,35 +3,53 @@ import CoreGraphics
 import Foundation
 
 final class AXWindowActuator {
+    private let resolver: AXWindowResolver
     private let applyOriginThreshold: CGFloat = 1.0
     private let applySizeThreshold: CGFloat = 1.0
     private let axEnhancedUserInterfaceAttribute: CFString = "AXEnhancedUserInterface" as CFString
+
+    init(resolver: AXWindowResolver = AXWindowResolver()) {
+        self.resolver = resolver
+    }
 
     func apply(targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
         let sortedIDs = targetFrames.keys.sorted()
         Diagnostics.log("AX apply start for \(sortedIDs.count) windows", level: .debug)
         var failures: [CGWindowID] = []
+        var resolvedByPID: [pid_t: [CGWindowID: AXWindowResolver.ResolvedWindow]] = [:]
 
-        // Phase 1: Resolve all AX windows before moving any.
-        // This prevents same-app swaps from misidentifying windows
-        // after the first window has already been relocated.
-        var resolved: [(windowID: CGWindowID, axWindow: AXUIElement, target: CGRect, pid: pid_t?)] = []
+        // Resolve every target before applying any frame so same-app operations stay deterministic.
+        var resolved: [(windowID: CGWindowID, resolvedAX: AXWindowResolver.ResolvedWindow, target: CGRect, window: WindowRef)] = []
         for windowID in sortedIDs {
-            guard
-                let target = targetFrames[windowID],
-                let window = windows[windowID],
-                let axWindow = resolveAXWindow(for: window)
-            else {
-                Diagnostics.log("AX resolve failed for windowID=\(windowID)", level: .warn)
+            guard let target = targetFrames[windowID] else {
+                Diagnostics.log("AX apply skipped windowID=\(windowID): missing target frame", level: .warn)
                 failures.append(windowID)
                 continue
             }
-            resolved.append((windowID: windowID, axWindow: axWindow, target: target, pid: window.pid))
+            guard let window = windows[windowID] else {
+                Diagnostics.log("AX apply skipped windowID=\(windowID): missing WindowRef", level: .warn)
+                failures.append(windowID)
+                continue
+            }
+
+            let perPID = resolvedByPID[window.pid] ?? resolver.windowsByID(pid: window.pid)
+            resolvedByPID[window.pid] = perPID
+
+            guard let resolvedAX = perPID[window.windowID] else {
+                logResolveFailure(
+                    window: window,
+                    target: target,
+                    knownWindowIDs: perPID.keys.sorted()
+                )
+                failures.append(windowID)
+                continue
+            }
+            logResolvedTarget(window: window, target: target, resolvedAX: resolvedAX)
+            resolved.append((windowID: windowID, resolvedAX: resolvedAX, target: target, window: window))
         }
 
-        // Phase 2: Apply all frames.
         for entry in resolved {
-            let success = setFrame(entry.target, on: entry.axWindow, windowID: entry.windowID, pid: entry.pid)
+            let success = setFrame(entry.target, on: entry.resolvedAX, window: entry.window)
             if !success {
                 failures.append(entry.windowID)
             }
@@ -39,38 +57,6 @@ final class AXWindowActuator {
 
         Diagnostics.log("AX apply completed with failures=\(failures.count)", level: .debug)
         return failures.sorted()
-    }
-
-    private func resolveAXWindow(for window: WindowRef) -> AXUIElement? {
-        let appElement = AXUIElementCreateApplication(window.pid)
-        var windowsValue: CFTypeRef?
-        let windowsResult = AXUIElementCopyAttributeValue(
-            appElement,
-            kAXWindowsAttribute as CFString,
-            &windowsValue
-        )
-        guard windowsResult == .success, let axWindows = windowsValue as? [AXUIElement], !axWindows.isEmpty else {
-            return nil
-        }
-
-        var bestWindow: AXUIElement?
-        var bestScore = CGFloat.greatestFiniteMagnitude
-        for axWindow in axWindows {
-            guard let candidateFrame = copyFrame(of: axWindow) else {
-                continue
-            }
-            let score = frameDistance(candidateFrame, window.frame)
-            if score < bestScore {
-                bestScore = score
-                bestWindow = axWindow
-            }
-        }
-
-        guard let resolved = bestWindow else {
-            Diagnostics.log("No matching AX window found for CG windowID=\(window.windowID)", level: .warn)
-            return nil
-        }
-        return resolved
     }
 
     private func copyFrame(of axWindow: AXUIElement) -> CGRect? {
@@ -138,11 +124,16 @@ final class AXWindowActuator {
         return AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, value)
     }
 
-    private func setFrame(_ frame: CGRect, on axWindow: AXUIElement, windowID: CGWindowID, pid: pid_t?) -> Bool {
+    private func setFrame(
+        _ frame: CGRect,
+        on resolvedAX: AXWindowResolver.ResolvedWindow,
+        window: WindowRef
+    ) -> Bool {
         let work: () -> Bool = { [self] in
+            let axWindow = resolvedAX.element
             let current = self.copyFrame(of: axWindow)
-            let canSetPosition = self.isAttributeSettable(kAXPositionAttribute as CFString, on: axWindow)
-            let canSetSize = self.isAttributeSettable(kAXSizeAttribute as CFString, on: axWindow)
+            let canSetPosition = resolvedAX.canSetPosition
+            let canSetSize = resolvedAX.canSetSize
 
             let shouldSetPosition: Bool = {
                 guard canSetPosition else { return false }
@@ -171,23 +162,18 @@ final class AXWindowActuator {
             let ok = sizeResultA == .success && positionResult == .success && sizeResultB == .success
             if !ok {
                 Diagnostics.log(
-                    "AX set failed windowID=\(windowID) canSetSize=\(canSetSize) canSetPosition=\(canSetPosition) sizeA=\(sizeResultA.rawValue) pos=\(positionResult.rawValue) sizeB=\(sizeResultB.rawValue) target=\(frame)",
+                    "AX set failed \(self.windowSummary(window)) role=\(resolvedAX.role) subrole=\(resolvedAX.subrole) canSetSize=\(canSetSize) canSetPosition=\(canSetPosition) sizeA=\(sizeResultA.rawValue) pos=\(positionResult.rawValue) sizeB=\(sizeResultB.rawValue) current=\(String(describing: current)) target=\(frame)",
                     level: .warn
                 )
             }
             return ok
         }
 
-        guard let pid else {
+        let pid = window.pid
+        guard pid > 0 else {
             return work()
         }
         return withEnhancedUIIfNeededDisabled(pid: pid, operation: work)
-    }
-
-    private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
-        var settable = DarwinBoolean(false)
-        let result = AXUIElementIsAttributeSettable(element, attribute, &settable)
-        return result == .success && settable.boolValue
     }
 
     private func withEnhancedUIIfNeededDisabled(pid: pid_t, operation: () -> Bool) -> Bool {
@@ -227,9 +213,27 @@ final class AXWindowActuator {
         return AXUIElementSetAttributeValue(element, attribute, cfValue) == .success
     }
 
-    private func frameDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        let originDistance = GeometryUtils.centerDistance(lhs, rhs)
-        let sizeDistance = abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
-        return originDistance + sizeDistance
+    private func windowSummary(_ window: WindowRef) -> String {
+        let bundle = window.bundleID ?? "-"
+        return "windowID=\(window.windowID) pid=\(window.pid) app=\(window.appName) bundle=\(bundle) title=\"\(window.title)\" frame=\(window.frame)"
+    }
+
+    private func logResolveFailure(window: WindowRef, target: CGRect, knownWindowIDs: [CGWindowID]) {
+        let known = knownWindowIDs.map(String.init).joined(separator: ",")
+        Diagnostics.log(
+            "AX resolve failed exact \(windowSummary(window)) target=\(target) knownAXWindowIDs=[\(known)]",
+            level: .warn
+        )
+    }
+
+    private func logResolvedTarget(
+        window: WindowRef,
+        target: CGRect,
+        resolvedAX: AXWindowResolver.ResolvedWindow
+    ) {
+        Diagnostics.log(
+            "AX resolved exact \(windowSummary(window)) resolvedWindowID=\(resolvedAX.windowID) role=\(resolvedAX.role) subrole=\(resolvedAX.subrole) canSetPos=\(resolvedAX.canSetPosition) canSetSize=\(resolvedAX.canSetSize) cgFrame=\(window.frame) axFrame=\(String(describing: resolvedAX.frame)) target=\(target)",
+            level: .debug
+        )
     }
 }

@@ -5,10 +5,16 @@ import Foundation
 struct WindowSemantics {
     let descriptor: WindowTypeDescriptor
     let isSpecialFloating: Bool
+    let isManageable: Bool
 }
 
 final class WindowSemanticsClassifier {
+    private let resolver: AXWindowResolver
     private var cache: [CGWindowID: WindowSemantics] = [:]
+
+    init(resolver: AXWindowResolver = AXWindowResolver()) {
+        self.resolver = resolver
+    }
 
     func semantics(for window: WindowRef) -> WindowSemantics {
         if let cached = cache[window.windowID] {
@@ -25,105 +31,35 @@ final class WindowSemanticsClassifier {
     }
 
     private func classify(window: WindowRef) -> WindowSemantics {
-        guard let axWindow = resolveAXWindow(window: window) else {
+        guard let resolvedAX = resolver.window(pid: window.pid, windowID: window.windowID) else {
+            Diagnostics.log(
+                "Window semantics unresolved windowID=\(window.windowID) pid=\(window.pid) app=\(window.appName) title=\"\(window.title)\"",
+                level: .debug
+            )
             return WindowSemantics(
                 descriptor: WindowTypeDescriptor(role: "AXWindow", subrole: "Unknown"),
-                isSpecialFloating: false
+                isSpecialFloating: true,
+                isManageable: false
             )
         }
+        let role = resolvedAX.role
+        let subrole = resolvedAX.subrole
+        let isStandardWindow = subrole == (kAXStandardWindowSubrole as String)
+        let isMovable = resolvedAX.canSetPosition
+        let isManageable = (role == (kAXWindowRole as String)) && isStandardWindow && isMovable
 
-        let role = copyStringAttribute(kAXRoleAttribute as CFString, from: axWindow) ?? "AXWindow"
-        let subrole = copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow) ?? "None"
-
-        let isSpecialFloating = floatingRoles.contains(role) || floatingSubroles.contains(subrole)
+        let isSpecialFloating = !isManageable || floatingRoles.contains(role) || floatingSubroles.contains(subrole)
+        if !isManageable {
+            Diagnostics.log(
+                "Window semantics marked non-manageable windowID=\(window.windowID) app=\(window.appName) title=\"\(window.title)\" role=\(role) subrole=\(subrole) movable=\(isMovable)",
+                level: .debug
+            )
+        }
         return WindowSemantics(
             descriptor: WindowTypeDescriptor(role: role, subrole: subrole),
-            isSpecialFloating: isSpecialFloating
+            isSpecialFloating: isSpecialFloating,
+            isManageable: isManageable
         )
-    }
-
-    private func resolveAXWindow(window: WindowRef) -> AXUIElement? {
-        let appElement = AXUIElementCreateApplication(window.pid)
-        var windowsValue: CFTypeRef?
-        let windowsResult = AXUIElementCopyAttributeValue(
-            appElement,
-            kAXWindowsAttribute as CFString,
-            &windowsValue
-        )
-
-        guard
-            windowsResult == .success,
-            let axWindows = windowsValue as? [AXUIElement],
-            !axWindows.isEmpty
-        else {
-            return nil
-        }
-
-        var bestWindow: AXUIElement?
-        var bestScore = CGFloat.greatestFiniteMagnitude
-
-        for candidate in axWindows {
-            guard let frame = copyFrame(of: candidate) else {
-                continue
-            }
-            let score = GeometryUtils.centerDistance(frame, window.frame)
-                + abs(frame.width - window.frame.width)
-                + abs(frame.height - window.frame.height)
-            if score < bestScore {
-                bestScore = score
-                bestWindow = candidate
-            }
-        }
-
-        return bestWindow
-    }
-
-    private func copyFrame(of element: AXUIElement) -> CGRect? {
-        guard
-            let position = copyCGPointAttribute(kAXPositionAttribute as CFString, from: element),
-            let size = copyCGSizeAttribute(kAXSizeAttribute as CFString, from: element)
-        else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
-    }
-
-    private func copyStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value, CFGetTypeID(value) == CFStringGetTypeID() else {
-            return nil
-        }
-        return value as? String
-    }
-
-    private func copyCGPointAttribute(_ attribute: CFString, from element: AXUIElement) -> CGPoint? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgPoint) else {
-            return nil
-        }
-
-        var point = CGPoint.zero
-        return AXValueGetValue(axValue, .cgPoint, &point) ? point : nil
-    }
-
-    private func copyCGSizeAttribute(_ attribute: CFString, from element: AXUIElement) -> CGSize? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgSize) else {
-            return nil
-        }
-
-        var size = CGSize.zero
-        return AXValueGetValue(axValue, .cgSize, &size) ? size : nil
-    }
-
-    private func copyAXValue(attribute: CFString, from element: AXUIElement, type: AXValueType) -> AXValue? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        let axValue = unsafeBitCast(value, to: AXValue.self)
-        return AXValueGetType(axValue) == type ? axValue : nil
     }
 
     private let floatingRoles: Set<String> = [

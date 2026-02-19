@@ -66,6 +66,12 @@ final class TilerCoordinator {
         let tiledWindows: [WindowRef]
     }
 
+    private enum LifecycleDecision {
+        case ignoreGeometry
+        case deferred(context: String)
+        case reflowNow
+    }
+
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
 
@@ -874,44 +880,40 @@ final class TilerCoordinator {
     private func startLifecycleMonitor() {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
-
-            if isGeometryLifecycleReason(reason) {
-                if dragTracker.isResizing {
-                    needsDeferredLifecycleReflow = true
-                    Diagnostics.log("Lifecycle reflow deferred during resize reason=\(reason)", level: .debug)
-                } else {
-                    Diagnostics.log(
-                        "Lifecycle geometry event ignored to prevent feedback loop reason=\(reason)",
-                        level: .debug
-                    )
-                }
-                return
-            }
-
-            if isSpaceTransitioning {
-                needsDeferredLifecycleReflow = true
+            switch lifecycleDecision(for: reason) {
+            case .ignoreGeometry:
                 Diagnostics.log(
-                    "Lifecycle reflow deferred during space transition reason=\(reason)",
+                    "Lifecycle geometry event ignored to prevent feedback loop reason=\(reason)",
                     level: .debug
                 )
-                return
+            case let .deferred(context):
+                deferLifecycleReflow(reason: reason, context: context)
+            case .reflowNow:
+                Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
+                reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
             }
-
-            if dragTracker.isDragging {
-                needsDeferredLifecycleReflow = true
-                Diagnostics.log("Lifecycle reflow deferred during drag reason=\(reason)", level: .debug)
-                return
-            }
-
-            if dragTracker.isResizing {
-                needsDeferredLifecycleReflow = true
-                Diagnostics.log("Lifecycle reflow deferred during resize reason=\(reason)", level: .debug)
-                return
-            }
-
-            Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
-            reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
         }
+    }
+
+    private func lifecycleDecision(for reason: String) -> LifecycleDecision {
+        if isGeometryLifecycleReason(reason) {
+            return dragTracker.isResizing ? .deferred(context: "resize") : .ignoreGeometry
+        }
+        if isSpaceTransitioning {
+            return .deferred(context: "space transition")
+        }
+        if dragTracker.isDragging {
+            return .deferred(context: "drag")
+        }
+        if dragTracker.isResizing {
+            return .deferred(context: "resize")
+        }
+        return .reflowNow
+    }
+
+    private func deferLifecycleReflow(reason: String, context: String) {
+        needsDeferredLifecycleReflow = true
+        Diagnostics.log("Lifecycle reflow deferred during \(context) reason=\(reason)", level: .debug)
     }
 
     private func applyDeferredLifecycleReflowIfNeeded() {

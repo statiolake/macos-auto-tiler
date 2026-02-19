@@ -7,7 +7,7 @@ final class WindowGeometryApplier {
 
     init(
         actuator: AXWindowActuator = AXWindowActuator(),
-        queue: DispatchQueue = DispatchQueue(label: "com.dicen.macosautotiler.actuation")
+        queue: DispatchQueue = DispatchQueue(label: "com.statiolake.macosautotiler.actuation")
     ) {
         self.actuator = actuator
         self.queue = queue

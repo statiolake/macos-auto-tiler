@@ -15,9 +15,7 @@ final class TilerCoordinator {
     private lazy var lifecycleMonitor = WindowLifecycleMonitor(discovery: discovery)
     private lazy var semanticsClassifier = WindowSemanticsClassifier(resolver: axWindowResolver)
     private let typeRegistry = WindowTypeRegistry()
-    private let reflowQueue = DispatchQueue(label: "com.dicen.macosautotiler.reflow", qos: .userInitiated)
-    private let spaceProbeQueue = DispatchQueue(label: "com.dicen.macosautotiler.spaceprobe", qos: .utility)
-    private let reflowStateLock = NSLock()
+    private let spaceProbeQueue = DispatchQueue(label: "com.statiolake.macosautotiler.spaceprobe", qos: .utility)
 
     private lazy var rulesPanelController = WindowRulesPanelController(
         registry: typeRegistry,
@@ -31,21 +29,21 @@ final class TilerCoordinator {
     private var lastLoggedHoverIndex: Int?
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
-    private var needsDeferredLifecycleReflow = false
     private lazy var spaceTransitionStabilizer = makeSpaceTransitionStabilizer()
     private lazy var postReflowStabilizer = makePostReflowStabilizer()
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
     private var lastSpaceSwitchTime: Date = .distantPast
-    private var queuedFullReflow: QueuedFullReflow?
-    private var fullReflowWorkerScheduled = false
+    private let reflowState = ReflowRequestState()
+    private var reflowWorkerTask: Task<Void, Never>?
 
     private let stableSnapshotsRequired = 3
     private let spaceProbeInterval: TimeInterval = 0.12
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let spaceSwitchCooldown: TimeInterval = 0.5
+    private let reflowRetryIntervalNanoseconds: UInt64 = 120_000_000
 
     private struct FloatingStateSnapshot {
         let userFloatingWindowIDs: Set<CGWindowID>
@@ -54,8 +52,20 @@ final class TilerCoordinator {
     }
 
     private struct QueuedFullReflow {
+        let enqueuedAtUptime: UInt64
         let reason: String
-        let floatingState: FloatingStateSnapshot
+    }
+
+    private struct QueuedDropReflow {
+        let enqueuedAtUptime: UInt64
+        let point: CGPoint
+        let draggedWindowID: CGWindowID
+        let hoverSlotIndex: Int?
+    }
+
+    private enum QueuedReflowRequest {
+        case drop(QueuedDropReflow)
+        case full(QueuedFullReflow)
     }
 
     private struct FloatingEvaluationContext {
@@ -72,8 +82,80 @@ final class TilerCoordinator {
 
     private enum LifecycleDecision {
         case ignoreGeometry
-        case deferred(context: String)
         case reflowNow
+    }
+
+    private static func isHigherPriorityReflowRequest(_ lhs: QueuedReflowRequest, _ rhs: QueuedReflowRequest) -> Bool {
+        switch (lhs, rhs) {
+        case (.drop, .full):
+            return true
+        case (.full, .drop):
+            return false
+        case let (.drop(lhsDrop), .drop(rhsDrop)):
+            return lhsDrop.enqueuedAtUptime < rhsDrop.enqueuedAtUptime
+        case let (.full(lhsFull), .full(rhsFull)):
+            return lhsFull.enqueuedAtUptime < rhsFull.enqueuedAtUptime
+        }
+    }
+
+    private static func nowUptime() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private actor ReflowRequestState {
+        private var queue = PriorityQueue<QueuedReflowRequest>(sort: {
+            TilerCoordinator.isHigherPriorityReflowRequest($0, $1)
+        })
+        private var lastStartedReflowUptime: UInt64 = 0
+        private var waitingContinuation: CheckedContinuation<Void, Never>?
+
+        func enqueue(_ request: QueuedReflowRequest) {
+            queue.enqueue(request)
+            waitingContinuation?.resume()
+            waitingContinuation = nil
+        }
+
+        func nextRequest() async -> QueuedReflowRequest? {
+            while true {
+                if Task.isCancelled {
+                    return nil
+                }
+                if let request = dequeueProcessable() {
+                    return request
+                }
+                await withCheckedContinuation { continuation in
+                    waitingContinuation = continuation
+                }
+            }
+        }
+
+        func markStartedNow() {
+            lastStartedReflowUptime = TilerCoordinator.nowUptime()
+        }
+
+        func reset() {
+            queue = PriorityQueue<QueuedReflowRequest>(sort: {
+                TilerCoordinator.isHigherPriorityReflowRequest($0, $1)
+            })
+            lastStartedReflowUptime = 0
+            waitingContinuation?.resume()
+            waitingContinuation = nil
+        }
+
+        private func dequeueProcessable() -> QueuedReflowRequest? {
+            while let request = queue.dequeue() {
+                switch request {
+                case .drop:
+                    return request
+                case let .full(full):
+                    guard full.enqueuedAtUptime > lastStartedReflowUptime else {
+                        continue
+                    }
+                    return request
+                }
+            }
+            return nil
+        }
     }
 
     private func makeSpaceTransitionStabilizer() -> WindowSnapshotStabilizer {
@@ -105,7 +187,6 @@ final class TilerCoordinator {
                     "Space transition settled reason=\(settleReason.rawValue) generation=\(generation)",
                     level: .info
                 )
-                self.needsDeferredLifecycleReflow = false
                 self.reflowAllVisibleWindows(reason: "space-settled:\(settleReason.rawValue)")
             }
         )
@@ -135,20 +216,18 @@ final class TilerCoordinator {
                 )
             },
             settledHandler: { [weak self] generation, settleReason in
-                guard let self else { return }
+                guard self != nil else { return }
                 Diagnostics.log(
                     "Post-reflow settled reason=\(settleReason.rawValue) generation=\(generation)",
                     level: .debug
                 )
-                self.reflowQueue.async { [weak self] in
-                    self?.resumeReflowWorkerAfterStabilization()
-                }
             }
         )
     }
 
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
+        startReflowWorkerIfNeeded()
 
         let started = eventTap.start { [weak self] eventType, point -> Bool in
             if case let .scrollWheel(deltaY) = eventType {
@@ -179,6 +258,11 @@ final class TilerCoordinator {
     func stop() {
         lifecycleMonitor.stop()
         eventTap.stop()
+        reflowWorkerTask?.cancel()
+        reflowWorkerTask = nil
+        Task { [reflowState] in
+            await reflowState.reset()
+        }
         if let activeSpaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
@@ -250,17 +334,13 @@ final class TilerCoordinator {
     }
 
     private func handleMouseUp(at point: CGPoint) {
-        defer {
-            applyDeferredLifecycleReflowIfNeeded()
-        }
-
         if let resizeState = dragTracker.finishResize() {
             finishResizeSession(resizeState: resizeState, point: point)
             resetInteractionState()
             return
         }
 
-        guard let currentPreviewPlan = activePlan else {
+        guard activePlan != nil else {
             resetInteractionState()
             return
         }
@@ -273,8 +353,7 @@ final class TilerCoordinator {
         clearOverlayState()
         enqueueDropReflow(
             point: point,
-            dragState: dragState,
-            currentPreviewPlan: currentPreviewPlan
+            dragState: dragState
         )
     }
 
@@ -437,11 +516,9 @@ final class TilerCoordinator {
 
         let windows = fetchVisibleWindows()
         guard let resizedWindow = windows.first(where: { $0.windowID == resizeState.windowID }) else {
-            needsDeferredLifecycleReflow = false
             return
         }
         guard !isFloatingWindow(resizedWindow) else {
-            needsDeferredLifecycleReflow = false
             return
         }
 
@@ -451,7 +528,6 @@ final class TilerCoordinator {
             resizingWindowID: resizeState.windowID,
             originalResizingFrame: resizeState.originalFrame
         )
-        needsDeferredLifecycleReflow = false
 
         Diagnostics.log(
             "Resize end windowID=\(resizeState.windowID) app=\(resizedWindow.appName) point=\(point) -> apply once",
@@ -579,64 +655,106 @@ final class TilerCoordinator {
         )
     }
 
+    private func startReflowWorkerIfNeeded() {
+        guard reflowWorkerTask == nil else {
+            return
+        }
+
+        reflowWorkerTask = Task { [weak self] in
+            guard let self else { return }
+            await runReflowWorker()
+        }
+    }
+
     private func enqueueFullReflow(reason: String) {
-        let floatingState = captureFloatingStateSnapshot()
-        let queued = QueuedFullReflow(reason: reason, floatingState: floatingState)
-
-        var scheduleWorker = false
-        var replacedReason: String?
-        reflowStateLock.lock()
-        if let existing = queuedFullReflow {
-            replacedReason = existing.reason
-        }
-        queuedFullReflow = queued
-        if !fullReflowWorkerScheduled {
-            fullReflowWorkerScheduled = true
-            scheduleWorker = true
-        }
-        reflowStateLock.unlock()
-
-        if let replacedReason {
-            Diagnostics.log(
-                "Reflow request coalesced old=\(replacedReason) new=\(reason)",
-                level: .debug
+        enqueueReflowRequest(
+            .full(
+                QueuedFullReflow(
+                    enqueuedAtUptime: Self.nowUptime(),
+                    reason: reason
+                )
             )
-        }
+        )
+    }
 
-        if scheduleWorker {
-            reflowQueue.async { [weak self] in
-                self?.processQueuedFullReflow()
+    private func enqueueDropReflow(point: CGPoint, dragState: DragState) {
+        enqueueReflowRequest(
+            .drop(
+                QueuedDropReflow(
+                    enqueuedAtUptime: Self.nowUptime(),
+                    point: point,
+                    draggedWindowID: dragState.draggedWindowID,
+                    hoverSlotIndex: dragState.hoverSlotIndex
+                )
+            )
+        )
+    }
+
+    private func enqueueReflowRequest(_ request: QueuedReflowRequest) {
+        Task { [weak self] in
+            guard let self else { return }
+            await reflowState.enqueue(request)
+        }
+    }
+
+    private func runReflowWorker() async {
+        while true {
+            if Task.isCancelled {
+                return
+            }
+            while await isReflowExecutionBlocked() {
+                if Task.isCancelled {
+                    return
+                }
+                try? await Task.sleep(nanoseconds: reflowRetryIntervalNanoseconds)
+            }
+
+            guard let request = await reflowState.nextRequest() else {
+                continue
+            }
+
+            if await isReflowExecutionBlocked() {
+                await reflowState.enqueue(request)
+                continue
+            }
+
+            await reflowState.markStartedNow()
+
+            let didApply: Bool
+            switch request {
+            case let .drop(drop):
+                didApply = performDropReflow(
+                    point: drop.point,
+                    draggedWindowID: drop.draggedWindowID,
+                    hoverSlotIndex: drop.hoverSlotIndex
+                )
+                if didApply {
+                    beginPostReflowStabilization(context: "drop:\(drop.draggedWindowID)")
+                }
+            case let .full(full):
+                didApply = performFullReflow(reason: full.reason)
+                if didApply {
+                    beginPostReflowStabilization(context: "full:\(full.reason)")
+                }
+            }
+
+            if didApply {
+                // Wait for stabilization before applying the next request.
+                continue
             }
         }
     }
 
-    private func processQueuedFullReflow() {
-        if postReflowStabilizer.isActive {
-            Diagnostics.log("Reflow worker paused waiting for post-reflow stabilization", level: .debug)
-            return
+    private func isReflowExecutionBlocked() async -> Bool {
+        let isInteractionActive = await MainActor.run { [weak self] in
+            guard let self else { return false }
+            return self.dragTracker.isDragging || self.dragTracker.isResizing
         }
-
-        let request: QueuedFullReflow?
-        reflowStateLock.lock()
-        request = queuedFullReflow
-        queuedFullReflow = nil
-        reflowStateLock.unlock()
-
-        guard let request else {
-            reflowStateLock.lock()
-            fullReflowWorkerScheduled = false
-            reflowStateLock.unlock()
-            return
-        }
-
-        let didApply = performFullReflow(reason: request.reason, floatingState: request.floatingState)
-        if didApply {
-            beginPostReflowStabilization(context: "full:\(request.reason)")
-        }
-        resumeReflowWorkerAfterStabilization()
+        return spaceTransitionStabilizer.isActive || postReflowStabilizer.isActive || isInteractionActive
     }
 
-    private func performFullReflow(reason: String, floatingState: FloatingStateSnapshot) -> Bool {
+    private func performFullReflow(reason: String) -> Bool {
+        let floatingState = captureFloatingStateSnapshot()
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
         let context = buildReflowContext(floatingState: floatingState)
         let windows = context.windows
@@ -677,50 +795,49 @@ final class TilerCoordinator {
         return totalTargets > 0
     }
 
-    private func enqueueDropReflow(point: CGPoint, dragState: DragState, currentPreviewPlan: DisplayLayoutPlan) {
-        let floatingState = captureFloatingStateSnapshot()
-        reflowQueue.async { [weak self] in
-            self?.performDropReflow(
-                point: point,
-                dragState: dragState,
-                currentPreviewPlan: currentPreviewPlan,
-                floatingState: floatingState
-            )
-        }
-    }
-
     private func performDropReflow(
         point: CGPoint,
-        dragState: DragState,
-        currentPreviewPlan: DisplayLayoutPlan,
-        floatingState: FloatingStateSnapshot
-    ) {
+        draggedWindowID: CGWindowID,
+        hoverSlotIndex: Int?
+    ) -> Bool {
+        let floatingState = captureFloatingStateSnapshot()
         let context = buildReflowContext(
             floatingState: floatingState,
-            including: [dragState.draggedWindowID]
+            including: [draggedWindowID]
         )
         let windows = context.windows
-        let draggedSpaceID = windows.first(where: { $0.windowID == dragState.draggedWindowID })?.spaceID
         let tiled = context.tiledWindows
 
-        let previewPlan =
-            layoutPlanner.buildDragPreviewPlan(
+        guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
+            Diagnostics.log("Drop fallback: dragged window missing windowID=\(draggedWindowID)", level: .warn)
+            return performFullReflow(reason: "drop-fallback:missing-window")
+        }
+
+        guard
+            let previewPlan = layoutPlanner.buildDragPreviewPlan(
                 at: point,
                 windows: tiled,
-                draggedWindowID: dragState.draggedWindowID,
-                preferredSpaceID: draggedSpaceID
-            ) ?? currentPreviewPlan
-
-        let destinationIndex =
-            layoutPlanner.slotIndex(at: point, in: previewPlan)
-            ?? dragState.hoverSlotIndex
-        guard let destinationIndex else {
-            Diagnostics.log(
-                "Drag end windowID=\(dragState.draggedWindowID) with no destination slot",
-                level: .debug
+                draggedWindowID: draggedWindowID,
+                preferredSpaceID: draggedWindow.spaceID
             )
-            return
+        else {
+            Diagnostics.log("Drop fallback: failed to build preview plan windowID=\(draggedWindowID)", level: .warn)
+            return performFullReflow(reason: "drop-fallback:preview-plan")
         }
+
+        let destinationIndex = layoutPlanner.slotIndex(at: point, in: previewPlan) ?? hoverSlotIndex
+        guard let destinationIndex else {
+            Diagnostics.log("Drop fallback: no destination slot windowID=\(draggedWindowID)", level: .warn)
+            return performFullReflow(reason: "drop-fallback:destination")
+        }
+
+        let dragState = DragState(
+            draggedWindowID: draggedWindowID,
+            startPoint: point,
+            currentPoint: point,
+            originalFrame: draggedWindow.frame,
+            hoverSlotIndex: hoverSlotIndex
+        )
 
         guard
             let drop = layoutPlanner.resolveDrop(
@@ -730,31 +847,30 @@ final class TilerCoordinator {
                 allWindows: tiled
             )
         else {
-            Diagnostics.log("Failed to resolve drop for windowID=\(dragState.draggedWindowID)", level: .warn)
-            return
+            Diagnostics.log("Drop fallback: resolve failed windowID=\(draggedWindowID)", level: .warn)
+            return performFullReflow(reason: "drop-fallback:resolve")
         }
 
         if !drop.shouldApply {
             Diagnostics.log(
-                "Drop skipped windowID=\(dragState.draggedWindowID) destination=\(drop.destinationSlotIndex)",
+                "Drop requested with unchanged destination windowID=\(draggedWindowID) destination=\(drop.destinationSlotIndex); applying full layout anyway",
                 level: .debug
             )
-            return
         }
 
         let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
         Diagnostics.log(
-            "Applying layout from drop windowID=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
+            "Applying layout from drop windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(drop.targetFrames.count)",
             level: .info
         )
 
         let failures = geometryApplier.applySync(
-            reason: "drop/window=\(dragState.draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
+            reason: "drop/window=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
             targetFrames: drop.targetFrames,
             windowsByID: drop.windowsByID
         )
         logApplyResult(failures)
-        beginPostReflowStabilization(context: "drop:\(dragState.draggedWindowID)")
+        return !drop.targetFrames.isEmpty
     }
 
     private func beginPostReflowStabilization(context: String) {
@@ -763,26 +879,6 @@ final class TilerCoordinator {
             "Post-reflow stabilization started context=\(context) generation=\(generation)",
             level: .debug
         )
-    }
-
-    private func resumeReflowWorkerAfterStabilization() {
-        if postReflowStabilizer.isActive {
-            return
-        }
-        let shouldContinue: Bool
-        reflowStateLock.lock()
-        shouldContinue = queuedFullReflow != nil
-        if !shouldContinue {
-            fullReflowWorkerScheduled = false
-        }
-        reflowStateLock.unlock()
-
-        guard shouldContinue else {
-            return
-        }
-        reflowQueue.async { [weak self] in
-            self?.processQueuedFullReflow()
-        }
     }
 
     private func buildReflowContext(
@@ -961,8 +1057,6 @@ final class TilerCoordinator {
                     "Lifecycle geometry event ignored to prevent feedback loop reason=\(reason)",
                     level: .debug
                 )
-            case let .deferred(context):
-                deferLifecycleReflow(reason: reason, context: context)
             case .reflowNow:
                 Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
                 reflowAllVisibleWindows(reason: "lifecycle:\(reason)")
@@ -972,43 +1066,9 @@ final class TilerCoordinator {
 
     private func lifecycleDecision(for reason: String) -> LifecycleDecision {
         if isGeometryLifecycleReason(reason) {
-            return dragTracker.isResizing ? .deferred(context: "resize") : .ignoreGeometry
-        }
-        if spaceTransitionStabilizer.isActive {
-            return .deferred(context: "space transition")
-        }
-        if postReflowStabilizer.isActive {
-            return .deferred(context: "post-reflow stabilization")
-        }
-        if dragTracker.isDragging {
-            return .deferred(context: "drag")
-        }
-        if dragTracker.isResizing {
-            return .deferred(context: "resize")
+            return .ignoreGeometry
         }
         return .reflowNow
-    }
-
-    private func deferLifecycleReflow(reason: String, context: String) {
-        needsDeferredLifecycleReflow = true
-        Diagnostics.log("Lifecycle reflow deferred during \(context) reason=\(reason)", level: .debug)
-    }
-
-    private func applyDeferredLifecycleReflowIfNeeded() {
-        guard needsDeferredLifecycleReflow else {
-            return
-        }
-        guard !spaceTransitionStabilizer.isActive else {
-            return
-        }
-        guard !postReflowStabilizer.isActive else {
-            return
-        }
-        guard !dragTracker.isResizing else {
-            return
-        }
-        needsDeferredLifecycleReflow = false
-        reflowAllVisibleWindows(reason: "lifecycle:deferred")
     }
 
     private func isGeometryLifecycleReason(_ reason: String) -> Bool {

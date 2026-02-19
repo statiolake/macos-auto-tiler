@@ -47,18 +47,20 @@ final class WindowDiscovery {
             else {
                 continue
             }
-            let midpoint = CGPoint(x: frame.midX, y: frame.midY)
-            if let displayID = DisplayService.displayID(containing: midpoint) {
+            if let displayID = DisplayService.displayID(for: frame) {
                 displayIDs.insert(displayID)
             }
         }
         let currentSpaceByDisplayID = cgsSpaceService.currentSpaceByDisplayID(displayIDs: displayIDs)
+        let visibleSpaceIDs = Set(currentSpaceByDisplayID.values)
 
         var windows: [WindowRef] = []
         windows.reserveCapacity(raw.count)
         var ownerInfoByPID: [pid_t: OwnerProcessInfo] = [:]
+        var droppedMissingDisplay = 0
         var droppedMissingSpace = 0
-        var droppedOffActiveSpace = 0
+        var droppedOffVisibleSpaces = 0
+        var inferredSpaceFromDisplay = 0
 
         for info in raw {
             guard
@@ -90,36 +92,45 @@ final class WindowDiscovery {
             }
 
             let title = (info[kCGWindowName as String] as? String) ?? ""
-            let midpoint = CGPoint(x: frame.midX, y: frame.midY)
-            guard
-                let displayID = DisplayService.displayID(containing: midpoint),
-                let spaceID = spaceByWindowID[CGWindowID(windowNumber)]
-            else {
-                droppedMissingSpace += 1
+            guard let displayID = DisplayService.displayID(for: frame) else {
+                droppedMissingDisplay += 1
                 continue
             }
-
-            if let activeSpaceID = currentSpaceByDisplayID[displayID], activeSpaceID != spaceID {
-                droppedOffActiveSpace += 1
+            let windowID = CGWindowID(windowNumber)
+            let resolvedSpaceID: Int
+            if let spaceID = spaceByWindowID[windowID] {
+                resolvedSpaceID = spaceID
+                if !visibleSpaceIDs.isEmpty, !visibleSpaceIDs.contains(spaceID) {
+                    droppedOffVisibleSpaces += 1
+                    continue
+                }
+            } else if let displaySpaceID = currentSpaceByDisplayID[displayID] {
+                // Prefer keeping currently visible windows managed even when per-window
+                // CGS lookup is transiently unavailable.
+                resolvedSpaceID = displaySpaceID
+                droppedMissingSpace += 1
+                inferredSpaceFromDisplay += 1
+            } else {
+                droppedMissingSpace += 1
                 continue
             }
 
             windows.append(
                 WindowRef(
-                    windowID: CGWindowID(windowNumber),
+                    windowID: windowID,
                     pid: pid,
                     frame: frame,
                     title: title,
                     appName: ownerInfo.appName,
                     bundleID: ownerInfo.bundleID,
-                    spaceID: spaceID
+                    spaceID: resolvedSpaceID
                 )
             )
         }
 
-        if droppedMissingSpace > 0 || droppedOffActiveSpace > 0 {
+        if droppedMissingDisplay > 0 || droppedMissingSpace > 0 || droppedOffVisibleSpaces > 0 || inferredSpaceFromDisplay > 0 {
             Diagnostics.log(
-                "CGS space filter dropped windows missingSpace=\(droppedMissingSpace) offActiveSpace=\(droppedOffActiveSpace)",
+                "CGS space filter dropped windows missingDisplay=\(droppedMissingDisplay) missingSpace=\(droppedMissingSpace) inferredSpace=\(inferredSpaceFromDisplay) offVisibleSpaces=\(droppedOffVisibleSpaces)",
                 level: .debug
             )
         }

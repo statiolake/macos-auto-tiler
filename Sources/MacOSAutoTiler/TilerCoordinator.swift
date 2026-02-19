@@ -866,8 +866,7 @@ final class TilerCoordinator {
         var pairs: [(CGWindowID, CGDirectDisplayID, Int)] = []
         pairs.reserveCapacity(windows.count)
         for window in windows {
-            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            let displayID = DisplayService.displayID(containing: midpoint) ?? 0
+            let displayID = DisplayService.displayID(for: window.frame) ?? 0
             pairs.append((window.windowID, displayID, window.spaceID))
         }
         pairs.sort {

@@ -357,8 +357,7 @@ final class LayoutPlanner {
 
         var groupedByDisplay: [CGDirectDisplayID: [WindowRef]] = [:]
         for window in windows {
-            let midpoint = CGPoint(x: window.frame.midX, y: window.frame.midY)
-            guard let displayID = DisplayService.displayID(containing: midpoint) else {
+            guard let displayID = DisplayService.displayID(for: window.frame) else {
                 continue
             }
             groupedByDisplay[displayID, default: []].append(window)

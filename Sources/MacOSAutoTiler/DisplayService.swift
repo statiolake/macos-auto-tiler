@@ -12,6 +12,35 @@ enum DisplayService {
         return displayID
     }
 
+    static func displayID(for frame: CGRect) -> CGDirectDisplayID? {
+        guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else {
+            return nil
+        }
+
+        var bestDisplayID: CGDirectDisplayID?
+        var bestArea: CGFloat = 0
+
+        for displayID in activeDisplayIDs() {
+            let intersection = frame.intersection(bounds(for: displayID))
+            guard !intersection.isNull, !intersection.isEmpty else {
+                continue
+            }
+            let area = intersection.width * intersection.height
+            if area > bestArea {
+                bestArea = area
+                bestDisplayID = displayID
+            }
+        }
+
+        if let bestDisplayID {
+            return bestDisplayID
+        }
+
+        // Fallback keeps behavior stable when no intersection is reported.
+        let midpoint = CGPoint(x: frame.midX, y: frame.midY)
+        return displayID(containing: midpoint)
+    }
+
     static func bounds(for displayID: CGDirectDisplayID) -> CGRect {
         CGDisplayBounds(displayID)
     }
@@ -66,5 +95,21 @@ enum DisplayService {
             return screen.frame
         }
         return NSScreen.screens.first?.frame ?? .zero
+    }
+
+    private static func activeDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        let countResult = CGGetActiveDisplayList(0, nil, &count)
+        guard countResult == .success, count > 0 else {
+            return []
+        }
+
+        var displays = Array<CGDirectDisplayID>(repeating: 0, count: Int(count))
+        var actualCount: UInt32 = 0
+        let listResult = CGGetActiveDisplayList(count, &displays, &actualCount)
+        guard listResult == .success else {
+            return []
+        }
+        return Array(displays.prefix(Int(actualCount)))
     }
 }

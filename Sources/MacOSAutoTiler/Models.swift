@@ -3,6 +3,7 @@ import CoreGraphics
 struct WindowRef {
     let windowID: CGWindowID
     let pid: pid_t
+    let displayID: CGDirectDisplayID
     let frame: CGRect
     let title: String
     let appName: String

@@ -357,10 +357,7 @@ final class LayoutPlanner {
 
         var groupedByDisplay: [CGDirectDisplayID: [WindowRef]] = [:]
         for window in windows {
-            guard let displayID = DisplayService.displayID(for: window.frame) else {
-                continue
-            }
-            groupedByDisplay[displayID, default: []].append(window)
+            groupedByDisplay[window.displayID, default: []].append(window)
         }
         return groupedByDisplay
     }

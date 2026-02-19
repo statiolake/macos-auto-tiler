@@ -253,7 +253,9 @@ final class TilerCoordinator {
             }
             let old = windows[index]
             windows[index] = WindowRef(
-                windowID: old.windowID, pid: old.pid, frame: newFrame,
+                windowID: old.windowID, pid: old.pid,
+                displayID: DisplayService.displayID(for: newFrame) ?? old.displayID,
+                frame: newFrame,
                 title: old.title, appName: old.appName, bundleID: old.bundleID,
                 spaceID: old.spaceID
             )
@@ -304,7 +306,9 @@ final class TilerCoordinator {
             if let newFrame = updatedFrames[resizingWindowID] {
                 let old = cached[index]
                 cached[index] = WindowRef(
-                    windowID: old.windowID, pid: old.pid, frame: newFrame,
+                    windowID: old.windowID, pid: old.pid,
+                    displayID: DisplayService.displayID(for: newFrame) ?? old.displayID,
+                    frame: newFrame,
                     title: old.title, appName: old.appName, bundleID: old.bundleID,
                     spaceID: old.spaceID
                 )
@@ -856,8 +860,7 @@ final class TilerCoordinator {
         var pairs: [(CGWindowID, CGDirectDisplayID, Int)] = []
         pairs.reserveCapacity(windows.count)
         for window in windows {
-            let displayID = DisplayService.displayID(for: window.frame) ?? 0
-            pairs.append((window.windowID, displayID, window.spaceID))
+            pairs.append((window.windowID, window.displayID, window.spaceID))
         }
         pairs.sort {
             if $0.0 != $1.0 { return $0.0 < $1.0 }

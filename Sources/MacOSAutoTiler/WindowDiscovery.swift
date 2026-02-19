@@ -31,6 +31,8 @@ final class WindowDiscovery {
         }
 
         let selfPID = getpid()
+        var displayByWindowID: [CGWindowID: CGDirectDisplayID] = [:]
+        displayByWindowID.reserveCapacity(raw.count)
         let allWindowIDs = raw.compactMap { info -> CGWindowID? in
             guard let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
                 return nil
@@ -42,13 +44,16 @@ final class WindowDiscovery {
         var displayIDs = Set<CGDirectDisplayID>()
         for info in raw {
             guard
+                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
                 let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                 let frame = CGRect(dictionaryRepresentation: boundsDict)
             else {
                 continue
             }
+            let windowID = CGWindowID(windowNumber)
             if let displayID = DisplayService.displayID(for: frame) {
                 displayIDs.insert(displayID)
+                displayByWindowID[windowID] = displayID
             }
         }
         let currentSpaceByDisplayID = cgsSpaceService.currentSpaceByDisplayID(displayIDs: displayIDs)
@@ -92,11 +97,11 @@ final class WindowDiscovery {
             }
 
             let title = (info[kCGWindowName as String] as? String) ?? ""
-            guard let displayID = DisplayService.displayID(for: frame) else {
+            let windowID = CGWindowID(windowNumber)
+            guard let displayID = displayByWindowID[windowID] else {
                 droppedMissingDisplay += 1
                 continue
             }
-            let windowID = CGWindowID(windowNumber)
             let resolvedSpaceID: Int
             if let spaceID = spaceByWindowID[windowID] {
                 resolvedSpaceID = spaceID
@@ -119,6 +124,7 @@ final class WindowDiscovery {
                 WindowRef(
                     windowID: windowID,
                     pid: pid,
+                    displayID: displayID,
                     frame: frame,
                     title: title,
                     appName: ownerInfo.appName,

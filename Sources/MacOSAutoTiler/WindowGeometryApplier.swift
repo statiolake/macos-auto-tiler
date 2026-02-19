@@ -26,22 +26,4 @@ final class WindowGeometryApplier {
             actuator.apply(targetFrames: targetFrames, windows: windowsByID)
         }
     }
-
-    func applyAsync(
-        reason: String,
-        targetFrames: [CGWindowID: CGRect],
-        windowsByID: [CGWindowID: WindowRef],
-        completion: @escaping ([CGWindowID]) -> Void
-    ) {
-        Diagnostics.log(
-            "AX apply(async) queued reason=\(reason) targets=\(targetFrames.count)",
-            level: .debug
-        )
-        queue.async { [actuator] in
-            let failures = actuator.apply(targetFrames: targetFrames, windows: windowsByID)
-            DispatchQueue.main.async {
-                completion(failures)
-            }
-        }
-    }
 }

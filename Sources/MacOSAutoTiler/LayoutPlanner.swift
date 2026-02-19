@@ -300,7 +300,15 @@ final class LayoutPlanner {
             }
         }
 
-        let previewTargets = targetFrames(for: previewPlan.slots, slotToWindowID: nextSlotToWindowID)
+        let updatedPreviewPlan = DisplayLayoutPlan(
+            displayID: previewPlan.displayID,
+            spaceID: previewPlan.spaceID,
+            slots: previewPlan.slots,
+            slotToWindowID: nextSlotToWindowID,
+            windowToSlotIndex: previewPlan.windowToSlotIndex,
+            windowsByID: previewPlan.windowsByID
+        )
+        let previewTargets = updatedPreviewPlan.targetFrames
         combinedTargets.merge(previewTargets, uniquingKeysWith: { _, new in new })
 
         let shouldApply = !GeometryUtils.isApproximatelyEqual(
@@ -501,18 +509,6 @@ final class LayoutPlanner {
         }
 
         return (slotToWindowID, windowToSlotIndex)
-    }
-
-    private func targetFrames(for slots: [Slot], slotToWindowID: [Int: CGWindowID]) -> [CGWindowID: CGRect] {
-        var result: [CGWindowID: CGRect] = [:]
-        result.reserveCapacity(slotToWindowID.count)
-        for (slotIndex, windowID) in slotToWindowID {
-            guard slotIndex >= 0, slotIndex < slots.count else {
-                continue
-            }
-            result[windowID] = slots[slotIndex].rect
-        }
-        return result
     }
 
     private func masterRatio(for scope: LayoutScopeKey) -> CGFloat {

@@ -37,7 +37,7 @@ final class TilerCoordinator {
     private var reflowWorkerTask: Task<Void, Never>?
 
     private let stableSnapshotsRequired = 3
-    private let spaceProbeInterval: TimeInterval = 0.12
+    private let spaceProbeInterval: TimeInterval = 0.06
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let spaceSwitchCooldown: TimeInterval = 0.5

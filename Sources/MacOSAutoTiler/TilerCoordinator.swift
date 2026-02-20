@@ -109,6 +109,10 @@ final class TilerCoordinator {
                 dropHeadIndex < dropQueue.count
             }
 
+            var hasPendingDropRequests: Bool {
+                hasDropRequests
+            }
+
             private mutating func dequeueDrop() -> QueuedDropReflow? {
                 guard hasDropRequests else {
                     dropQueue.removeAll(keepingCapacity: true)
@@ -153,6 +157,10 @@ final class TilerCoordinator {
             queue = PriorityQueue()
             waitingContinuation?.resume()
             waitingContinuation = nil
+        }
+
+        func hasPendingDropRequests() -> Bool {
+            queue.hasPendingDropRequests
         }
     }
 
@@ -624,18 +632,25 @@ final class TilerCoordinator {
                 continue
             }
 
-            await waitForInteractionIdle()
-            await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
-            await waitForInteractionIdle()
-
             switch request {
             case let .drop(drop):
+                await waitForInteractionIdle()
+                await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
+                await waitForInteractionIdle()
                 _ = performDropReflow(
                     point: drop.point,
                     draggedWindowID: drop.draggedWindowID,
                     hoverSlotIndex: drop.hoverSlotIndex
                 )
             case let .full(full):
+                await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
+                if await shouldSkipFullReflow(reason: full.reason) {
+                    Diagnostics.log(
+                        "Skipping full reflow reason=\(full.reason)",
+                        level: .debug
+                    )
+                    continue
+                }
                 _ = performFullReflow(reason: full.reason)
             }
         }
@@ -646,15 +661,47 @@ final class TilerCoordinator {
             if Task.isCancelled {
                 return
             }
-            let isInteractionActive = await MainActor.run { [weak self] in
-                guard let self else { return false }
-                return self.dragTracker.isDragging || self.dragTracker.isResizing
-            }
-            if !isInteractionActive {
+            if !(await isInteractionActive()) {
                 return
             }
             try? await Task.sleep(nanoseconds: interactionWaitNanoseconds)
         }
+    }
+
+    private func isInteractionActive() async -> Bool {
+        await MainActor.run { [weak self] in
+            guard let self else { return false }
+            return self.dragTracker.isDragging
+                || self.dragTracker.isResizing
+                || !self.dragTracker.pendingWindowIDs.isEmpty
+        }
+    }
+
+    private func shouldSkipFullReflow(reason: String) async -> Bool {
+        let interactingNow = await isInteractionActive()
+        let pendingDropRequestNow = await reflowState.hasPendingDropRequests()
+        if interactingNow || pendingDropRequestNow {
+            Diagnostics.log(
+                "Skipping full reflow pre-check reason=\(reason) interaction=\(interactingNow) pendingDropRequest=\(pendingDropRequestNow)",
+                level: .debug
+            )
+            return true
+        }
+
+        // Give same-turn drop enqueue a chance before applying full reflow.
+        await Task.yield()
+
+        let interactingAfterYield = await isInteractionActive()
+        let pendingDropRequestAfterYield = await reflowState.hasPendingDropRequests()
+        if interactingAfterYield || pendingDropRequestAfterYield {
+            Diagnostics.log(
+                "Skipping full reflow post-yield reason=\(reason) interaction=\(interactingAfterYield) pendingDropRequest=\(pendingDropRequestAfterYield)",
+                level: .debug
+            )
+            return true
+        }
+
+        return false
     }
 
     private func waitForReflowStabilization(trigger: String) async {

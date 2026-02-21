@@ -17,7 +17,6 @@ final class StartupPermissionFlow {
         }
 
         Diagnostics.log("Accessibility permission is missing at startup", level: .warn)
-        _ = Permissions.ensureAccessibilityPermission(prompt: true)
 
         while !Permissions.ensureAccessibilityPermission(prompt: false) {
             let response = showAlert(

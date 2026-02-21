@@ -1104,25 +1104,30 @@ final class TilerCoordinator {
         }
 
         let goLeft = deltaY > 0
-        lastSpaceSwitchTime = now
+        let switched = simulateSpaceSwitch(goLeft: goLeft, at: point, deltaY: deltaY)
+        if switched {
+            lastSpaceSwitchTime = now
+        }
+        return switched
+    }
+
+    private func simulateSpaceSwitch(goLeft: Bool, at point: CGPoint, deltaY: Int64) -> Bool {
+        guard let displayID = DisplayService.displayID(containing: point) else {
+            Diagnostics.log("Space switch failed: no display at point", level: .warn)
+            return false
+        }
 
         Diagnostics.log(
             "Dock scroll -> switch Space \(goLeft ? "left" : "right") (deltaY=\(deltaY))",
             level: .info
         )
-        simulateSpaceSwitch(goLeft: goLeft, at: point)
-        return true
-    }
 
-    private func simulateSpaceSwitch(goLeft: Bool, at point: CGPoint) {
-        guard let displayID = DisplayService.displayID(containing: point) else {
-            Diagnostics.log("Space switch failed: no display at point", level: .warn)
-            return
+        let switched = CGSSpaceService.shared.switchToAdjacentSpace(displayID: displayID, goLeft: goLeft)
+        if !switched {
+            Diagnostics.log("Space switch failed: no adjacent target or shortcut post failed", level: .warn)
+            return false
         }
-        let ok = CGSSpaceService.shared.switchToAdjacentSpace(displayID: displayID, goLeft: goLeft)
-        if !ok {
-            Diagnostics.log("Space switch failed: CGS API returned false", level: .warn)
-        }
+        return true
     }
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {

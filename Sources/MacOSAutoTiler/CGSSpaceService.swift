@@ -12,8 +12,9 @@ final class CGSSpaceService {
     private typealias CGSCopyManagedDisplaySpacesFn = @convention(c) (CGSConnectionID) -> Unmanaged<CFArray>?
     private typealias CGSCopyBestManagedDisplayForRectFn =
         @convention(c) (CGSConnectionID, CGRect) -> Unmanaged<CFString>?
-    private typealias CGSManagedDisplaySetCurrentSpaceFn =
-        @convention(c) (CGSConnectionID, CFString, UInt64) -> Void
+    private typealias CGSGetSymbolicHotKeyValueFn =
+        @convention(c) (UInt32, UnsafeMutablePointer<UInt16>?, UnsafeMutablePointer<UInt16>?, UnsafeMutablePointer<UInt32>?) -> Int32
+    private typealias CGSIsSymbolicHotKeyEnabledFn = @convention(c) (UInt32) -> Bool
 
     private let stateLock = NSLock()
     private var isResolved = false
@@ -24,9 +25,26 @@ final class CGSSpaceService {
     private var copySpacesForWindowsFn: CGSCopySpacesForWindowsFn?
     private var copyManagedDisplaySpacesFn: CGSCopyManagedDisplaySpacesFn?
     private var copyBestManagedDisplayForRectFn: CGSCopyBestManagedDisplayForRectFn?
-    private var managedDisplaySetCurrentSpaceFn: CGSManagedDisplaySetCurrentSpaceFn?
+    private let moveLeftSpaceKeyCode: CGKeyCode = 123
+    private let moveRightSpaceKeyCode: CGKeyCode = 124
+    private var getSymbolicHotKeyValueFn: CGSGetSymbolicHotKeyValueFn?
+    private var isSymbolicHotKeyEnabledFn: CGSIsSymbolicHotKeyEnabledFn?
+
+    private let spaceLeftHotKey: UInt32 = 79
+    private let spaceRightHotKey: UInt32 = 81
 
     private let allSpacesMask: UInt32 = 0x7
+
+    private struct SpaceSwitchShortcut {
+        let keyCode: CGKeyCode
+        let flags: CGEventFlags
+    }
+
+    private enum SpaceShortcutResolution {
+        case resolved(SpaceSwitchShortcut)
+        case disabled
+        case unavailable
+    }
 
     private init() {}
 
@@ -122,16 +140,27 @@ final class CGSSpaceService {
     }
 
     func switchToAdjacentSpace(displayID: CGDirectDisplayID, goLeft: Bool) -> Bool {
-        guard prepare() else {
+        if let canSwitch = canSwitchToAdjacentSpace(displayID: displayID, goLeft: goLeft), !canSwitch {
             return false
+        }
+
+        guard postSystemSpaceSwitchShortcut(goLeft: goLeft) else {
+            Diagnostics.log("Space switch failed: symbolic hotkey is disabled or event post failed", level: .warn)
+            return false
+        }
+        return true
+    }
+
+    private func canSwitchToAdjacentSpace(displayID: CGDirectDisplayID, goLeft: Bool) -> Bool? {
+        guard prepare() else {
+            return nil
         }
         guard
             let mainConnectionIDFn,
             let copyManagedDisplaySpacesFn,
-            let copyBestManagedDisplayForRectFn,
-            let managedDisplaySetCurrentSpaceFn
+            let copyBestManagedDisplayForRectFn
         else {
-            return false
+            return nil
         }
 
         let connection = mainConnectionIDFn()
@@ -139,17 +168,17 @@ final class CGSSpaceService {
         guard
             let managedDisplayID = copyBestManagedDisplayForRectFn(connection, bounds)?.takeRetainedValue()
         else {
-            return false
+            return nil
         }
 
         guard let rawDescriptions = copyManagedDisplaySpacesFn(connection)?.takeRetainedValue() as? [[String: Any]] else {
-            return false
+            return nil
         }
 
         guard let displayDescription = rawDescriptions.first(where: {
             ($0["Display Identifier"] as? String) == (managedDisplayID as String)
         }) else {
-            return false
+            return nil
         }
 
         guard
@@ -157,22 +186,83 @@ final class CGSSpaceService {
             let currentSpaceID = parseSpaceID(currentSpace["ManagedSpaceID"] as AnyObject),
             let spaces = displayDescription["Spaces"] as? [[String: Any]]
         else {
-            return false
+            return nil
         }
 
         let spaceIDs = spaces.compactMap { parseSpaceID($0["ManagedSpaceID"] as AnyObject) }
         guard let currentIndex = spaceIDs.firstIndex(of: currentSpaceID) else {
-            return false
+            return nil
         }
 
         let targetIndex = goLeft ? currentIndex - 1 : currentIndex + 1
-        guard targetIndex >= 0, targetIndex < spaceIDs.count else {
+        return targetIndex >= 0 && targetIndex < spaceIDs.count
+    }
+
+    private func postSystemSpaceSwitchShortcut(goLeft: Bool) -> Bool {
+        guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
             return false
         }
 
-        let targetSpaceID = spaceIDs[targetIndex]
-        managedDisplaySetCurrentSpaceFn(connection, managedDisplayID, UInt64(targetSpaceID))
+        let shortcut: SpaceSwitchShortcut
+        switch symbolicHotKeySpaceShortcut(goLeft: goLeft) {
+        case let .resolved(value):
+            shortcut = value
+        case .disabled:
+            return false
+        case .unavailable:
+            shortcut = defaultSpaceShortcut(goLeft: goLeft)
+        }
+
+        guard
+            let keyDown = CGEvent(keyboardEventSource: eventSource, virtualKey: shortcut.keyCode, keyDown: true),
+            let keyUp = CGEvent(keyboardEventSource: eventSource, virtualKey: shortcut.keyCode, keyDown: false)
+        else {
+            return false
+        }
+
+        keyDown.flags = shortcut.flags
+        keyUp.flags = []
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
         return true
+    }
+
+    private func defaultSpaceShortcut(goLeft: Bool) -> SpaceSwitchShortcut {
+        SpaceSwitchShortcut(
+            keyCode: goLeft ? moveLeftSpaceKeyCode : moveRightSpaceKeyCode,
+            flags: .maskControl
+        )
+    }
+
+    private func symbolicHotKeySpaceShortcut(goLeft: Bool) -> SpaceShortcutResolution {
+        guard prepare() else {
+            return .unavailable
+        }
+        guard
+            let getSymbolicHotKeyValueFn,
+            let isSymbolicHotKeyEnabledFn
+        else {
+            return .unavailable
+        }
+
+        let hotKey = goLeft ? spaceLeftHotKey : spaceRightHotKey
+        guard isSymbolicHotKeyEnabledFn(hotKey) else {
+            return .disabled
+        }
+
+        var keyCode: UInt16 = 0
+        var flagsRaw: UInt32 = 0
+        let error = getSymbolicHotKeyValueFn(hotKey, nil, &keyCode, &flagsRaw)
+        guard error == 0 else {
+            return .unavailable
+        }
+
+        return .resolved(
+            SpaceSwitchShortcut(
+                keyCode: CGKeyCode(keyCode),
+                flags: CGEventFlags(rawValue: UInt64(flagsRaw))
+            )
+        )
     }
 
     private func prepare() -> Bool {
@@ -189,7 +279,8 @@ final class CGSSpaceService {
             copySpaces: "CGSCopySpacesForWindows",
             copyManagedDisplays: "CGSCopyManagedDisplaySpaces",
             bestDisplayForRect: "CGSCopyBestManagedDisplayForRect",
-            setCurrentSpace: "CGSManagedDisplaySetCurrentSpace"
+            getSymbolicHotKeyValue: "CGSGetSymbolicHotKeyValue",
+            isSymbolicHotKeyEnabled: "CGSIsSymbolicHotKeyEnabled"
         )
 
         let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
@@ -213,9 +304,11 @@ final class CGSSpaceService {
         copySpacesForWindowsFn = unsafeBitCast(copySpacesPtr, to: CGSCopySpacesForWindowsFn.self)
         copyManagedDisplaySpacesFn = unsafeBitCast(copyManagedDisplaysPtr, to: CGSCopyManagedDisplaySpacesFn.self)
         copyBestManagedDisplayForRectFn = unsafeBitCast(bestDisplayForRectPtr, to: CGSCopyBestManagedDisplayForRectFn.self)
-
-        if let setCurrentSpacePtr = dlsym(handle, symbolNames.setCurrentSpace) {
-            managedDisplaySetCurrentSpaceFn = unsafeBitCast(setCurrentSpacePtr, to: CGSManagedDisplaySetCurrentSpaceFn.self)
+        if let getSymbolicHotKeyValuePtr = dlsym(handle, symbolNames.getSymbolicHotKeyValue) {
+            getSymbolicHotKeyValueFn = unsafeBitCast(getSymbolicHotKeyValuePtr, to: CGSGetSymbolicHotKeyValueFn.self)
+        }
+        if let isSymbolicHotKeyEnabledPtr = dlsym(handle, symbolNames.isSymbolicHotKeyEnabled) {
+            isSymbolicHotKeyEnabledFn = unsafeBitCast(isSymbolicHotKeyEnabledPtr, to: CGSIsSymbolicHotKeyEnabledFn.self)
         }
 
         skyLightHandle = handle

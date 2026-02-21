@@ -105,7 +105,9 @@ final class EventTapController {
                 consumed = handler(.optionPressed, point)
             }
         case .scrollWheel:
-            let deltaY = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            let lineDeltaY = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            let pointDeltaY = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
+            let deltaY = lineDeltaY != 0 ? lineDeltaY : pointDeltaY
             if deltaY != 0 {
                 consumed = handler(.scrollWheel(deltaY: deltaY), point)
             }

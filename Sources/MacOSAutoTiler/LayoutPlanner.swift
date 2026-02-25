@@ -144,11 +144,8 @@ final class LayoutPlanner {
                 if resizingWindow.windowID == masterWindow.windowID {
                     // Only master boundary should move.
                     let observedMasterEdge = masterWindow.frame.maxX + slotInset
-                    let observedMasterRatio = clamp(
-                        (observedMasterEdge - bounds.minX) / bounds.width,
-                        minMasterRatio,
-                        maxMasterRatio
-                    )
+                    let observedMasterRatio = ((observedMasterEdge - bounds.minX) / bounds.width)
+                        .clamped(to: minMasterRatio...maxMasterRatio)
                     nextMasterRatios[scope] = observedMasterRatio
                     continue
                 }
@@ -179,11 +176,8 @@ final class LayoutPlanner {
 
             // Non-resize sync path: infer from observed full geometry.
             let observedMasterEdge = masterWindow.frame.maxX + slotInset
-            let observedMasterRatio = clamp(
-                (observedMasterEdge - bounds.minX) / bounds.width,
-                minMasterRatio,
-                maxMasterRatio
-            )
+            let observedMasterRatio = ((observedMasterEdge - bounds.minX) / bounds.width)
+                .clamped(to: minMasterRatio...maxMasterRatio)
             nextMasterRatios[scope] = observedMasterRatio
 
             let rawHeights = stackWindows.map { max($0.frame.height + (slotInset * 2), 1) }
@@ -251,7 +245,7 @@ final class LayoutPlanner {
 
         let maxShrinkUpper = rowHeights[boundaryIndex] - minStackSlotExtent
         let maxGrowUpper = rowHeights[boundaryIndex + 1] - minStackSlotExtent
-        delta = clamp(delta, -maxShrinkUpper, maxGrowUpper)
+        delta = delta.clamped(to: -maxShrinkUpper...maxGrowUpper)
 
         rowHeights[boundaryIndex] += delta
         rowHeights[boundaryIndex + 1] -= delta
@@ -300,12 +294,18 @@ final class LayoutPlanner {
             }
         }
 
+        var nextWindowToSlotIndex: [CGWindowID: Int] = [:]
+        nextWindowToSlotIndex.reserveCapacity(nextSlotToWindowID.count)
+        for (slotIndex, windowID) in nextSlotToWindowID {
+            nextWindowToSlotIndex[windowID] = slotIndex
+        }
+
         let updatedPreviewPlan = DisplayLayoutPlan(
             displayID: previewPlan.displayID,
             spaceID: previewPlan.spaceID,
             slots: previewPlan.slots,
             slotToWindowID: nextSlotToWindowID,
-            windowToSlotIndex: previewPlan.windowToSlotIndex,
+            windowToSlotIndex: nextWindowToSlotIndex,
             windowsByID: previewPlan.windowsByID
         )
         let previewTargets = updatedPreviewPlan.targetFrames
@@ -515,7 +515,7 @@ final class LayoutPlanner {
         stateLock.lock()
         defer { stateLock.unlock() }
         let ratio = masterRatioByScope[scope] ?? defaultMasterRatio
-        return clamp(ratio, minMasterRatio, maxMasterRatio)
+        return ratio.clamped(to: minMasterRatio...maxMasterRatio)
     }
 
     private func normalizedStackWeights(for scope: LayoutScopeKey, stackCount: Int) -> [CGFloat] {
@@ -576,7 +576,7 @@ final class LayoutPlanner {
             let allocated: CGFloat
             if remainingTotal >= minimumExtent + reserveForRest {
                 let maxAllowed = remainingTotal - reserveForRest
-                allocated = clamp(desired, minimumExtent, maxAllowed)
+                allocated = desired.clamped(to: minimumExtent...maxAllowed)
             } else {
                 allocated = min(remainingTotal, minimumExtent)
             }
@@ -596,7 +596,4 @@ final class LayoutPlanner {
         return (dx * dx + dy * dy).squareRoot()
     }
 
-    private func clamp(_ value: CGFloat, _ lower: CGFloat, _ upper: CGFloat) -> CGFloat {
-        min(max(value, lower), upper)
-    }
 }

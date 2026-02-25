@@ -9,6 +9,19 @@ struct WindowRef {
     let appName: String
     let bundleID: String?
     let spaceID: Int
+
+    func with(frame: CGRect, displayID: CGDirectDisplayID? = nil) -> WindowRef {
+        WindowRef(
+            windowID: windowID,
+            pid: pid,
+            displayID: displayID ?? self.displayID,
+            frame: frame,
+            title: title,
+            appName: appName,
+            bundleID: bundleID,
+            spaceID: spaceID
+        )
+    }
 }
 
 struct Slot {

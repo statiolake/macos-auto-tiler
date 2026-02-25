@@ -200,8 +200,7 @@ final class WindowDiscovery {
     private func discoverySignature(for windows: [WindowRef]) -> UInt64 {
         var hash = UInt64(windows.count)
         for id in windows.map(\.windowID).sorted() {
-            hash ^= UInt64(id)
-            hash = hash &* 1_099_511_628_211
+            FNV1a64.combine(&hash, UInt64(id))
         }
         return hash
     }

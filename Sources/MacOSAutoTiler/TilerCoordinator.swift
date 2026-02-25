@@ -58,16 +58,6 @@ final class TilerCoordinator {
         let ruleSnapshot: WindowRuleSnapshot
     }
 
-    private struct QueuedFullReflow {
-        let reason: String
-    }
-
-    private struct QueuedDropReflow {
-        let point: CGPoint
-        let draggedWindowID: CGWindowID
-        let hoverSlotIndex: Int?
-    }
-
     private struct PendingDragCheckpoint {
         var lastPoint: CGPoint
         var cumulativeDistance: CGFloat
@@ -91,11 +81,6 @@ final class TilerCoordinator {
         let edges: ResizeProjectionEdges
     }
 
-    private enum QueuedReflowRequest {
-        case drop(QueuedDropReflow)
-        case full(QueuedFullReflow)
-    }
-
     private struct FloatingEvaluationContext {
         let userFloatingWindowIDs: Set<CGWindowID>
         let userTiledWindowIDs: Set<CGWindowID>
@@ -106,93 +91,6 @@ final class TilerCoordinator {
     private struct ReflowContext {
         let windows: [WindowRef]
         let tiledWindows: [WindowRef]
-    }
-
-    private actor ReflowRequestState {
-        private struct PriorityQueue {
-            private var dropQueue: [QueuedDropReflow] = []
-            private var dropHeadIndex = 0
-            private var fullReflowRequested = false
-            private var latestFullReflowReason = "manual"
-
-            mutating func enqueue(_ request: QueuedReflowRequest) {
-                switch request {
-                case let .drop(drop):
-                    dropQueue.append(drop)
-                case let .full(full):
-                    fullReflowRequested = true
-                    latestFullReflowReason = full.reason
-                }
-            }
-
-            mutating func dequeue() -> QueuedReflowRequest? {
-                if let drop = dequeueDrop() {
-                    return .drop(drop)
-                }
-                guard fullReflowRequested else {
-                    return nil
-                }
-                fullReflowRequested = false
-                return .full(QueuedFullReflow(reason: latestFullReflowReason))
-            }
-
-            private var hasDropRequests: Bool {
-                dropHeadIndex < dropQueue.count
-            }
-
-            var hasPendingDropRequests: Bool {
-                hasDropRequests
-            }
-
-            private mutating func dequeueDrop() -> QueuedDropReflow? {
-                guard hasDropRequests else {
-                    dropQueue.removeAll(keepingCapacity: true)
-                    dropHeadIndex = 0
-                    return nil
-                }
-                let drop = dropQueue[dropHeadIndex]
-                dropHeadIndex += 1
-
-                if dropHeadIndex >= 32, dropHeadIndex * 2 >= dropQueue.count {
-                    dropQueue.removeFirst(dropHeadIndex)
-                    dropHeadIndex = 0
-                }
-                return drop
-            }
-        }
-
-        private var queue = PriorityQueue()
-        private var waitingContinuation: CheckedContinuation<Void, Never>?
-
-        func enqueue(_ request: QueuedReflowRequest) {
-            queue.enqueue(request)
-            waitingContinuation?.resume()
-            waitingContinuation = nil
-        }
-
-        func nextRequest() async -> QueuedReflowRequest? {
-            while true {
-                if Task.isCancelled {
-                    return nil
-                }
-                if let request = queue.dequeue() {
-                    return request
-                }
-                await withCheckedContinuation { continuation in
-                    waitingContinuation = continuation
-                }
-            }
-        }
-
-        func reset() {
-            queue = PriorityQueue()
-            waitingContinuation?.resume()
-            waitingContinuation = nil
-        }
-
-        func hasPendingDropRequests() -> Bool {
-            queue.hasPendingDropRequests
-        }
     }
 
     func start() {
@@ -361,7 +259,8 @@ final class TilerCoordinator {
             return
         }
 
-        if isFloatingWindow(draggedWindow) {
+        let floatingContext = liveFloatingContext()
+        if isFloatingWindow(draggedWindow, context: floatingContext) {
             userFloatingWindowIDs.remove(draggedWindowID)
             userTiledWindowIDs.insert(draggedWindowID)
             Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> tiled", level: .info)
@@ -397,12 +296,9 @@ final class TilerCoordinator {
                 continue
             }
             let old = windows[index]
-            windows[index] = WindowRef(
-                windowID: old.windowID, pid: old.pid,
-                displayID: DisplayService.displayID(for: newFrame) ?? old.displayID,
+            windows[index] = old.with(
                 frame: newFrame,
-                title: old.title, appName: old.appName, bundleID: old.bundleID,
-                spaceID: old.spaceID
+                displayID: DisplayService.displayID(for: newFrame)
             )
         }
         cachedWindows = windows
@@ -451,7 +347,8 @@ final class TilerCoordinator {
             return
         }
 
-        if isFloatingWindow(latestWindow) {
+        let floatingContext = liveFloatingContext()
+        if isFloatingWindow(latestWindow, context: floatingContext) {
             Diagnostics.log("Dragging floating windowID=\(latestWindow.windowID) (tiler preview disabled)", level: .debug)
             clearOverlayState()
             return
@@ -481,13 +378,7 @@ final class TilerCoordinator {
             }
 
             if let newFrame = resolvedFrame {
-                cached[index] = WindowRef(
-                    windowID: old.windowID, pid: old.pid,
-                    displayID: old.displayID,
-                    frame: newFrame,
-                    title: old.title, appName: old.appName, bundleID: old.bundleID,
-                    spaceID: old.spaceID
-                )
+                cached[index] = old.with(frame: newFrame)
             } else {
                 cached[index] = old
             }
@@ -504,12 +395,13 @@ final class TilerCoordinator {
             return
         }
 
-        if isFloatingWindow(resizingWindow) {
+        let floatingContext = liveFloatingContext()
+        if isFloatingWindow(resizingWindow, context: floatingContext) {
             clearOverlayState()
             return
         }
 
-        let tiled = tiledWindows(from: windows)
+        let tiled = tiledWindows(from: windows, floatingContext: floatingContext)
         layoutPlanner.syncRatiosFromObservedWindows(
             tiled,
             resizingWindowID: resizingWindowID,
@@ -542,11 +434,12 @@ final class TilerCoordinator {
         guard let resizedWindow = windows.first(where: { $0.windowID == resizeState.windowID }) else {
             return
         }
-        guard !isFloatingWindow(resizedWindow) else {
+        let floatingContext = liveFloatingContext()
+        guard !isFloatingWindow(resizedWindow, context: floatingContext) else {
             return
         }
 
-        let tiled = tiledWindows(from: windows)
+        let tiled = tiledWindows(from: windows, floatingContext: floatingContext)
         layoutPlanner.syncRatiosFromObservedWindows(
             tiled,
             resizingWindowID: resizeState.windowID,
@@ -562,7 +455,12 @@ final class TilerCoordinator {
 
     private func activateDragSession(draggedWindow: WindowRef, point: CGPoint, windows: [WindowRef]? = nil) {
         let allWindows = windows ?? fetchVisibleWindows()
-        let tiled = tiledWindows(from: allWindows, including: [draggedWindow.windowID])
+        let floatingContext = liveFloatingContext()
+        let tiled = tiledWindows(
+            from: allWindows,
+            including: [draggedWindow.windowID],
+            floatingContext: floatingContext
+        )
 
         cachedWindows = allWindows
         cachedTiledWindows = tiled
@@ -612,7 +510,8 @@ final class TilerCoordinator {
             return
         }
 
-        if isFloatingWindow(draggedWindow) {
+        let floatingContext = liveFloatingContext()
+        if isFloatingWindow(draggedWindow, context: floatingContext) {
             clearOverlayState()
             return
         }
@@ -624,7 +523,12 @@ final class TilerCoordinator {
         if let existing = activePlan, currentDisplayID == existing.displayID {
             previewPlan = existing
         } else {
-            let tiled = cachedTiledWindows ?? tiledWindows(from: windows, including: [draggedWindowID])
+            let tiled = cachedTiledWindows
+                ?? tiledWindows(
+                    from: windows,
+                    including: [draggedWindowID],
+                    floatingContext: floatingContext
+                )
             guard
                 let newPlan = layoutPlanner.buildDragPreviewPlan(
                     at: point,
@@ -1021,10 +925,9 @@ final class TilerCoordinator {
             self?.pruneFloatingState(to: liveWindowIDs)
         }
 
-        let semantics = WindowSemanticsClassifier(resolver: axWindowResolver)
         let floatingContext = makeFloatingContext(
             from: floatingState,
-            semanticsClassifier: semantics
+            semanticsClassifier: semanticsClassifier
         )
         let tiled = tiledWindows(
             from: windows,
@@ -1089,10 +992,6 @@ final class TilerCoordinator {
             ruleSnapshot: ruleStore.snapshot(),
             semanticsClassifier: semanticsClassifier
         )
-    }
-
-    private func isFloatingWindow(_ window: WindowRef) -> Bool {
-        isFloatingWindow(window, context: liveFloatingContext())
     }
 
     private func isFloatingWindow(_ window: WindowRef, context: FloatingEvaluationContext) -> Bool {
@@ -1257,12 +1156,9 @@ final class TilerCoordinator {
 
         var hash = UInt64(pairs.count)
         for (windowID, displayID, spaceID) in pairs {
-            hash ^= UInt64(windowID)
-            hash = hash &* 1_099_511_628_211
-            hash ^= UInt64(displayID)
-            hash = hash &* 1_099_511_628_211
-            hash ^= UInt64(bitPattern: Int64(spaceID))
-            hash = hash &* 1_099_511_628_211
+            FNV1a64.combine(&hash, UInt64(windowID))
+            FNV1a64.combine(&hash, UInt64(displayID))
+            FNV1a64.combine(&hash, signed: spaceID)
         }
         return hash
     }
@@ -1298,15 +1194,8 @@ final class TilerCoordinator {
             guard let window = windowsByID[windowID] else {
                 return true
             }
-            return !framesApproximatelyEqual(window.frame, targetFrame)
+            return !GeometryUtils.isApproximatelyEqual(window.frame, targetFrame, tolerance: frameEpsilon)
         }
-    }
-
-    private func framesApproximatelyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        abs(lhs.origin.x - rhs.origin.x) <= frameEpsilon
-            && abs(lhs.origin.y - rhs.origin.y) <= frameEpsilon
-            && abs(lhs.size.width - rhs.size.width) <= frameEpsilon
-            && abs(lhs.size.height - rhs.size.height) <= frameEpsilon
     }
 
     private func clearOverlayState() {
@@ -1494,8 +1383,7 @@ final class TilerCoordinator {
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {
         return windows.filter {
-            $0.frame.contains(point) ||
-                $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
+            $0.frame.insetBy(dx: -windowHitSlop, dy: -windowHitSlop).contains(point)
         }
     }
 }

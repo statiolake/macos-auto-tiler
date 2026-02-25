@@ -63,7 +63,7 @@ final class AXWindowResolver {
             let resolved = ResolvedWindow(
                 element: element,
                 windowID: windowID,
-                frame: copyFrame(of: element),
+                frame: AXValueUtils.copyFrame(of: element),
                 role: copyStringAttribute(kAXRoleAttribute as CFString, from: element) ?? "Unknown",
                 subrole: copyStringAttribute(kAXSubroleAttribute as CFString, from: element) ?? "Unknown",
                 canSetPosition: isAttributeSettable(kAXPositionAttribute as CFString, on: element),
@@ -103,16 +103,6 @@ final class AXWindowResolver {
         return CGWindowID(number.uint32Value)
     }
 
-    private func copyFrame(of element: AXUIElement) -> CGRect? {
-        guard
-            let position = copyCGPointAttribute(kAXPositionAttribute as CFString, from: element),
-            let size = copyCGSizeAttribute(kAXSizeAttribute as CFString, from: element)
-        else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
-    }
-
     private func copyStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, attribute, &value)
@@ -120,32 +110,6 @@ final class AXWindowResolver {
             return nil
         }
         return value as? String
-    }
-
-    private func copyCGPointAttribute(_ attribute: CFString, from element: AXUIElement) -> CGPoint? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgPoint) else {
-            return nil
-        }
-        var point = CGPoint.zero
-        return AXValueGetValue(axValue, .cgPoint, &point) ? point : nil
-    }
-
-    private func copyCGSizeAttribute(_ attribute: CFString, from element: AXUIElement) -> CGSize? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgSize) else {
-            return nil
-        }
-        var size = CGSize.zero
-        return AXValueGetValue(axValue, .cgSize, &size) ? size : nil
-    }
-
-    private func copyAXValue(attribute: CFString, from element: AXUIElement, type: AXValueType) -> AXValue? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
-            return nil
-        }
-        let axValue = unsafeBitCast(value, to: AXValue.self)
-        return AXValueGetType(axValue) == type ? axValue : nil
     }
 
     private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {

@@ -70,55 +70,6 @@ final class AXWindowActuator {
         return failures.sorted()
     }
 
-    private func copyFrame(of axWindow: AXUIElement) -> CGRect? {
-        guard
-            let position = copyCGPoint(attribute: kAXPositionAttribute as CFString, from: axWindow),
-            let size = copyCGSize(attribute: kAXSizeAttribute as CFString, from: axWindow)
-        else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
-    }
-
-    private func copyCGPoint(attribute: CFString, from element: AXUIElement) -> CGPoint? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgPoint) else {
-            return nil
-        }
-        var point = CGPoint.zero
-        guard AXValueGetValue(axValue, .cgPoint, &point) else {
-            return nil
-        }
-        return point
-    }
-
-    private func copyCGSize(attribute: CFString, from element: AXUIElement) -> CGSize? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgSize) else {
-            return nil
-        }
-        var size = CGSize.zero
-        guard AXValueGetValue(axValue, .cgSize, &size) else {
-            return nil
-        }
-        return size
-    }
-
-    private func copyAXValue(attribute: CFString, from element: AXUIElement, type: AXValueType) -> AXValue? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard
-            result == .success,
-            let rawValue = value,
-            CFGetTypeID(rawValue) == AXValueGetTypeID()
-        else {
-            return nil
-        }
-        let axValue = unsafeBitCast(rawValue, to: AXValue.self)
-        guard AXValueGetType(axValue) == type else {
-            return nil
-        }
-        return axValue
-    }
-
     private func setPosition(_ point: CGPoint, on axWindow: AXUIElement) -> AXError {
         var mutable = point
         guard let value = AXValueCreate(.cgPoint, &mutable) else {
@@ -142,7 +93,7 @@ final class AXWindowActuator {
     ) -> Bool {
         let work: () -> Bool = { [self] in
             let axWindow = resolvedAX.element
-            let current = self.copyFrame(of: axWindow)
+            let current = AXValueUtils.copyFrame(of: axWindow)
             let canSetPosition = resolvedAX.canSetPosition
             let canSetSize = resolvedAX.canSetSize
 

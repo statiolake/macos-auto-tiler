@@ -9,6 +9,7 @@ struct WindowSemantics {
 
 final class WindowSemanticsClassifier {
     private let resolver: AXWindowResolver
+    private let cacheLock = NSLock()
     private var cache: [CGWindowID: WindowSemantics] = [:]
 
     init(resolver: AXWindowResolver = AXWindowResolver()) {
@@ -16,16 +17,27 @@ final class WindowSemanticsClassifier {
     }
 
     func semantics(for window: WindowRef) -> WindowSemantics {
+        cacheLock.lock()
         if let cached = cache[window.windowID] {
+            cacheLock.unlock()
             return cached
         }
+        cacheLock.unlock()
 
         let semantics = classify(window: window)
+        cacheLock.lock()
+        if let cached = cache[window.windowID] {
+            cacheLock.unlock()
+            return cached
+        }
         cache[window.windowID] = semantics
+        cacheLock.unlock()
         return semantics
     }
 
     func prune(to liveWindowIDs: Set<CGWindowID>) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         cache = cache.filter { liveWindowIDs.contains($0.key) }
     }
 

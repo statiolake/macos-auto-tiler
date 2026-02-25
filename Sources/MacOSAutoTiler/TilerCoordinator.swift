@@ -40,7 +40,7 @@ final class TilerCoordinator {
     private let spaceProbeInterval: TimeInterval = 0.06
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
-    private let spaceSwitchCooldown: TimeInterval = 0.5
+    private let spaceSwitchCooldown: TimeInterval = 0.3
     private let interactionWaitNanoseconds: UInt64 = 120_000_000
     private let frameEpsilon: CGFloat = 1.0
 

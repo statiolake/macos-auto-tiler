@@ -2,6 +2,13 @@ import CoreGraphics
 import Foundation
 
 final class DragInteractionTracker {
+    enum PendingDragCheckpointResult {
+        case dragActivated(DragState)
+        case resizeActivated
+        case noWindowGeometryChange
+        case pendingCleared
+    }
+
     struct ResizeState {
         let windowID: CGWindowID
         let originalFrame: CGRect
@@ -20,15 +27,10 @@ final class DragInteractionTracker {
     }
 
     private let moveThreshold: CGFloat
-    private let requiredMoveOnlySamples: Int
     private var state: State = .idle
 
-    init(
-        moveThreshold: CGFloat = 4,
-        requiredMoveOnlySamples: Int = 2
-    ) {
+    init(moveThreshold: CGFloat = 4) {
         self.moveThreshold = moveThreshold
-        self.requiredMoveOnlySamples = max(1, requiredMoveOnlySamples)
     }
 
     var isDragging: Bool {
@@ -82,8 +84,7 @@ final class DragInteractionTracker {
             orderedWindowIDs.append(window.windowID)
             entriesByWindowID[window.windowID] = PendingDrag(
                 windowID: window.windowID,
-                originalFrame: window.frame,
-                moveOnlySampleCount: 0
+                originalFrame: window.frame
             )
         }
 
@@ -110,12 +111,12 @@ final class DragInteractionTracker {
         state = .idle
     }
 
-    func maybeActivateDrag(
+    func evaluatePendingDragCheckpoint(
         currentPoint: CGPoint,
         latestWindowsByID: [CGWindowID: WindowRef]
-    ) -> DragState? {
+    ) -> PendingDragCheckpointResult {
         guard case var .pending(pendingState) = state else {
-            return nil
+            return .pendingCleared
         }
 
         var activeWindowIDs: [CGWindowID] = []
@@ -123,7 +124,7 @@ final class DragInteractionTracker {
 
         for windowID in pendingState.orderedWindowIDs {
             guard
-                var pendingDrag = pendingState.entriesByWindowID[windowID],
+                let pendingDrag = pendingState.entriesByWindowID[windowID],
                 let latestWindow = latestWindowsByID[windowID]
             else {
                 pendingState.entriesByWindowID.removeValue(forKey: windowID)
@@ -138,20 +139,10 @@ final class DragInteractionTracker {
                         originalFrame: pendingDrag.originalFrame
                     )
                 )
-                return nil
+                return .resizeActivated
             }
 
             guard hasWindowTranslated(original: pendingDrag.originalFrame, current: latestWindow.frame) else {
-                pendingDrag.moveOnlySampleCount = 0
-                pendingState.entriesByWindowID[windowID] = pendingDrag
-                activeWindowIDs.append(windowID)
-                continue
-            }
-
-            let nextSampleCount = pendingDrag.moveOnlySampleCount + 1
-            if nextSampleCount < requiredMoveOnlySamples {
-                pendingDrag.moveOnlySampleCount = nextSampleCount
-                pendingState.entriesByWindowID[windowID] = pendingDrag
                 activeWindowIDs.append(windowID)
                 continue
             }
@@ -164,16 +155,17 @@ final class DragInteractionTracker {
                 hoverSlotIndex: nil
             )
             state = .dragging(newState)
-            return newState
+            return .dragActivated(newState)
         }
 
         pendingState.orderedWindowIDs = activeWindowIDs
         if pendingState.orderedWindowIDs.isEmpty {
             state = .idle
+            return .pendingCleared
         } else {
             state = .pending(pendingState)
+            return .noWindowGeometryChange
         }
-        return nil
     }
 
     func updateDrag(point: CGPoint, hoverSlotIndex: Int?) -> DragState? {

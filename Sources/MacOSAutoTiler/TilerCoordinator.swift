@@ -29,6 +29,7 @@ final class TilerCoordinator {
     private var lastLoggedHoverIndex: Int?
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
+    private var pendingDragCheckpoint: PendingDragCheckpoint?
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
@@ -40,6 +41,7 @@ final class TilerCoordinator {
     private let spaceProbeInterval: TimeInterval = 0.06
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
+    private let pendingDragCheckpointDistance: CGFloat = 24
     private let spaceSwitchCooldown: TimeInterval = 0.3
     private let interactionWaitNanoseconds: UInt64 = 120_000_000
     private let frameEpsilon: CGFloat = 1.0
@@ -58,6 +60,11 @@ final class TilerCoordinator {
         let point: CGPoint
         let draggedWindowID: CGWindowID
         let hoverSlotIndex: Int?
+    }
+
+    private struct PendingDragCheckpoint {
+        var lastPoint: CGPoint
+        var cumulativeDistance: CGFloat
     }
 
     private enum QueuedReflowRequest {
@@ -256,6 +263,7 @@ final class TilerCoordinator {
 
         cachedWindows = windows
         dragTracker.beginPendingDrag(windows: candidates)
+        pendingDragCheckpoint = PendingDragCheckpoint(lastPoint: point, cumulativeDistance: 0)
         let candidateIDs = candidates.map { String($0.windowID) }.joined(separator: ",")
         Diagnostics.log(
             "Pending drag captured candidates=[\(candidateIDs)] count=\(candidates.count)",
@@ -341,6 +349,11 @@ final class TilerCoordinator {
     private func maybeActivateDrag(at point: CGPoint) {
         let pendingWindowIDs = dragTracker.pendingWindowIDs
         guard !pendingWindowIDs.isEmpty else {
+            pendingDragCheckpoint = nil
+            return
+        }
+
+        guard hasPassedPendingDragCheckpoint(at: point) else {
             return
         }
 
@@ -368,21 +381,39 @@ final class TilerCoordinator {
         let latestByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
         if pendingWindowIDs.allSatisfy({ latestByID[$0] == nil }) {
             dragTracker.clearPendingDrag()
+            pendingDragCheckpoint = nil
             return
         }
 
-        let activatedDrag = dragTracker.maybeActivateDrag(
+        let checkpointResult = dragTracker.evaluatePendingDragCheckpoint(
             currentPoint: point,
             latestWindowsByID: latestByID
         )
-        if dragTracker.isResizing {
+
+        switch checkpointResult {
+        case .resizeActivated:
+            pendingDragCheckpoint = nil
             updateActiveResizePreview(at: point)
+            return
+        case .dragActivated:
+            pendingDragCheckpoint = nil
+            break
+        case .noWindowGeometryChange:
+            dragTracker.clearPendingDrag()
+            pendingDragCheckpoint = nil
+            Diagnostics.log(
+                "Pending drag checkpoint reached but no window geometry change; suppressing this drag sequence",
+                level: .debug
+            )
+            return
+        case .pendingCleared:
+            pendingDragCheckpoint = nil
             return
         }
 
         guard
-            let activatedDrag,
-            let latestWindow = latestByID[activatedDrag.draggedWindowID]
+            let draggedWindowID = dragTracker.draggedWindowID,
+            let latestWindow = latestByID[draggedWindowID]
         else {
             return
         }
@@ -1083,6 +1114,7 @@ final class TilerCoordinator {
         clearOverlayState()
         cachedWindows = nil
         cachedTiledWindows = nil
+        pendingDragCheckpoint = nil
     }
 
     private func logApplyResult(_ failures: [CGWindowID]) {
@@ -1128,6 +1160,20 @@ final class TilerCoordinator {
             return false
         }
         return true
+    }
+
+    private func hasPassedPendingDragCheckpoint(at point: CGPoint) -> Bool {
+        guard var checkpoint = pendingDragCheckpoint else {
+            return true
+        }
+
+        let deltaX = point.x - checkpoint.lastPoint.x
+        let deltaY = point.y - checkpoint.lastPoint.y
+        checkpoint.cumulativeDistance += hypot(deltaX, deltaY)
+        checkpoint.lastPoint = point
+        pendingDragCheckpoint = checkpoint
+
+        return checkpoint.cumulativeDistance >= pendingDragCheckpointDistance
     }
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {

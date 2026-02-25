@@ -26,7 +26,6 @@ struct DragState {
 struct PendingDrag {
     let windowID: CGWindowID
     let originalFrame: CGRect
-    var moveOnlySampleCount: Int
 }
 
 struct DisplayLayoutPlan {

@@ -30,6 +30,7 @@ final class TilerCoordinator {
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
     private var pendingDragCheckpoint: PendingDragCheckpoint?
+    private var resizePreviewProjection: ResizePreviewProjection?
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
     private var userTiledWindowIDs = Set<CGWindowID>()
@@ -42,6 +43,8 @@ final class TilerCoordinator {
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let pendingDragCheckpointDistance: CGFloat = 24
+    private let resizeProjectionEdgeDetectionThreshold: CGFloat = 2
+    private let minimumProjectedWindowExtent: CGFloat = 80
     private let spaceSwitchCooldown: TimeInterval = 0.3
     private let interactionWaitNanoseconds: UInt64 = 120_000_000
     private let frameEpsilon: CGFloat = 1.0
@@ -65,6 +68,24 @@ final class TilerCoordinator {
     private struct PendingDragCheckpoint {
         var lastPoint: CGPoint
         var cumulativeDistance: CGFloat
+    }
+
+    private struct ResizeProjectionEdges {
+        var moveMinX: Bool
+        var moveMaxX: Bool
+        var moveMinY: Bool
+        var moveMaxY: Bool
+
+        var isEmpty: Bool {
+            !moveMinX && !moveMaxX && !moveMinY && !moveMaxY
+        }
+    }
+
+    private struct ResizePreviewProjection {
+        let windowID: CGWindowID
+        let activationPoint: CGPoint
+        let activationFrame: CGRect
+        let edges: ResizeProjectionEdges
     }
 
     private enum QueuedReflowRequest {
@@ -393,14 +414,17 @@ final class TilerCoordinator {
         switch checkpointResult {
         case .resizeActivated:
             pendingDragCheckpoint = nil
+            configureResizePreviewProjection(at: point, latestWindowsByID: latestByID)
             updateActiveResizePreview(at: point)
             return
         case .dragActivated:
             pendingDragCheckpoint = nil
+            resizePreviewProjection = nil
             break
         case .noWindowGeometryChange:
             dragTracker.clearPendingDrag()
             pendingDragCheckpoint = nil
+            resizePreviewProjection = nil
             Diagnostics.log(
                 "Pending drag checkpoint reached but no window geometry change; suppressing this drag sequence",
                 level: .debug
@@ -408,6 +432,7 @@ final class TilerCoordinator {
             return
         case .pendingCleared:
             pendingDragCheckpoint = nil
+            resizePreviewProjection = nil
             return
         }
 
@@ -429,6 +454,7 @@ final class TilerCoordinator {
 
     private func updateActiveResizePreview(at point: CGPoint) {
         guard let resizingWindowID = dragTracker.resizingWindowID else {
+            resizePreviewProjection = nil
             return
         }
 
@@ -436,16 +462,26 @@ final class TilerCoordinator {
         if var cached = cachedWindows,
             let index = cached.firstIndex(where: { $0.windowID == resizingWindowID })
         {
-            let updatedFrames = discovery.fetchWindowFrames(for: [resizingWindowID])
-            if let newFrame = updatedFrames[resizingWindowID] {
-                let old = cached[index]
+            let old = cached[index]
+            let projected = projectedResizeFrame(windowID: resizingWindowID, at: point)
+            let resolvedFrame: CGRect?
+            if let projected {
+                resolvedFrame = projected
+            } else {
+                let updatedFrames = discovery.fetchWindowFrames(for: [resizingWindowID])
+                resolvedFrame = updatedFrames[resizingWindowID]
+            }
+
+            if let newFrame = resolvedFrame {
                 cached[index] = WindowRef(
                     windowID: old.windowID, pid: old.pid,
-                    displayID: DisplayService.displayID(for: newFrame) ?? old.displayID,
+                    displayID: old.displayID,
                     frame: newFrame,
                     title: old.title, appName: old.appName, bundleID: old.bundleID,
                     spaceID: old.spaceID
                 )
+            } else {
+                cached[index] = old
             }
             cachedWindows = cached
             windows = cached
@@ -1115,6 +1151,7 @@ final class TilerCoordinator {
         cachedWindows = nil
         cachedTiledWindows = nil
         pendingDragCheckpoint = nil
+        resizePreviewProjection = nil
     }
 
     private func logApplyResult(_ failures: [CGWindowID]) {
@@ -1174,6 +1211,115 @@ final class TilerCoordinator {
         pendingDragCheckpoint = checkpoint
 
         return checkpoint.cumulativeDistance >= pendingDragCheckpointDistance
+    }
+
+    private func configureResizePreviewProjection(at point: CGPoint, latestWindowsByID: [CGWindowID: WindowRef]) {
+        guard
+            let resizeState = dragTracker.resizeState,
+            let latestWindow = latestWindowsByID[resizeState.windowID]
+        else {
+            resizePreviewProjection = nil
+            return
+        }
+
+        let edges = detectResizeProjectionEdges(
+            originalFrame: resizeState.originalFrame,
+            currentFrame: latestWindow.frame
+        )
+
+        guard !edges.isEmpty else {
+            resizePreviewProjection = nil
+            return
+        }
+
+        resizePreviewProjection = ResizePreviewProjection(
+            windowID: latestWindow.windowID,
+            activationPoint: point,
+            activationFrame: latestWindow.frame,
+            edges: edges
+        )
+    }
+
+    private func detectResizeProjectionEdges(originalFrame: CGRect, currentFrame: CGRect) -> ResizeProjectionEdges {
+        let minXDelta = abs(currentFrame.minX - originalFrame.minX)
+        let maxXDelta = abs(currentFrame.maxX - originalFrame.maxX)
+        let minYDelta = abs(currentFrame.minY - originalFrame.minY)
+        let maxYDelta = abs(currentFrame.maxY - originalFrame.maxY)
+
+        var edges = ResizeProjectionEdges(
+            moveMinX: minXDelta >= resizeProjectionEdgeDetectionThreshold,
+            moveMaxX: maxXDelta >= resizeProjectionEdgeDetectionThreshold,
+            moveMinY: minYDelta >= resizeProjectionEdgeDetectionThreshold,
+            moveMaxY: maxYDelta >= resizeProjectionEdgeDetectionThreshold
+        )
+
+        if edges.moveMinX && edges.moveMaxX {
+            if minXDelta > maxXDelta {
+                edges.moveMaxX = false
+            } else {
+                edges.moveMinX = false
+            }
+        }
+
+        if edges.moveMinY && edges.moveMaxY {
+            if minYDelta > maxYDelta {
+                edges.moveMaxY = false
+            } else {
+                edges.moveMinY = false
+            }
+        }
+
+        return edges
+    }
+
+    private func projectedResizeFrame(windowID: CGWindowID, at point: CGPoint) -> CGRect? {
+        guard let projection = resizePreviewProjection, projection.windowID == windowID else {
+            return nil
+        }
+
+        let deltaX = point.x - projection.activationPoint.x
+        let deltaY = point.y - projection.activationPoint.y
+
+        var minX = projection.activationFrame.minX
+        var maxX = projection.activationFrame.maxX
+        var minY = projection.activationFrame.minY
+        var maxY = projection.activationFrame.maxY
+
+        if projection.edges.moveMinX {
+            minX += deltaX
+        }
+        if projection.edges.moveMaxX {
+            maxX += deltaX
+        }
+        if projection.edges.moveMinY {
+            minY += deltaY
+        }
+        if projection.edges.moveMaxY {
+            maxY += deltaY
+        }
+
+        if maxX - minX < minimumProjectedWindowExtent {
+            if projection.edges.moveMinX && !projection.edges.moveMaxX {
+                minX = maxX - minimumProjectedWindowExtent
+            } else {
+                maxX = minX + minimumProjectedWindowExtent
+            }
+        }
+
+        if maxY - minY < minimumProjectedWindowExtent {
+            if projection.edges.moveMinY && !projection.edges.moveMaxY {
+                minY = maxY - minimumProjectedWindowExtent
+            } else {
+                maxY = minY + minimumProjectedWindowExtent
+            }
+        }
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY
+        )
     }
 
     private func windowsAtInteractionPoint(_ point: CGPoint, windows: [WindowRef]) -> [WindowRef] {

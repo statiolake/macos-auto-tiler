@@ -23,7 +23,7 @@ final class WindowGeometryApplier {
             level: .debug
         )
         return queue.sync {
-            actuator.apply(targetFrames: targetFrames, windows: windowsByID)
+            actuator.apply(reason: reason, targetFrames: targetFrames, windows: windowsByID)
         }
     }
 }

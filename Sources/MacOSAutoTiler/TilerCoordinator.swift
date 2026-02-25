@@ -16,6 +16,9 @@ final class TilerCoordinator {
     private lazy var semanticsClassifier = WindowSemanticsClassifier(resolver: axWindowResolver)
     private let typeRegistry = WindowTypeRegistry()
     private let spaceProbeQueue = DispatchQueue(label: "com.statiolake.macosautotiler.spaceprobe", qos: .utility)
+    private let displaySpaceStateLock = NSLock()
+    private var displayGenerationByID: [CGDirectDisplayID: UInt64] = [:]
+    private var lastKnownSpaceByDisplayID: [CGDirectDisplayID: Int] = [:]
 
     private lazy var rulesPanelController = WindowRulesPanelController(
         registry: typeRegistry,
@@ -213,13 +216,14 @@ final class TilerCoordinator {
             Diagnostics.log("Coordinator started successfully", level: .info)
         }
 
+        setupActiveSpaceObserver()
+        refreshDisplaySpaceState(reason: "startup")
+        startLifecycleMonitor()
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
             self.requestFullReflow(reason: "startup")
         }
-
-        setupActiveSpaceObserver()
-        startLifecycleMonitor()
     }
 
     func stop() {
@@ -234,6 +238,10 @@ final class TilerCoordinator {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
         }
+        displaySpaceStateLock.lock()
+        displayGenerationByID.removeAll()
+        lastKnownSpaceByDisplayID.removeAll()
+        displaySpaceStateLock.unlock()
         resetInteractionState()
         Diagnostics.log("Coordinator stopped", level: .info)
     }
@@ -812,9 +820,18 @@ final class TilerCoordinator {
     }
 
     private func performFullReflow(reason: String) -> Bool {
+        let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
         let floatingState = captureFloatingStateSnapshot()
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
-        let context = buildReflowContext(floatingState: floatingState)
+        guard
+            let context = buildReflowContext(
+                floatingState: floatingState,
+                reason: reason
+            )
+        else {
+            Diagnostics.log("Reflow (\(reason)) canceled: unresolved window-space mapping", level: .warn)
+            return false
+        }
         let windows = context.windows
         let tiled = context.tiledWindows
         let plans = layoutPlanner.buildReflowPlans(from: tiled)
@@ -829,6 +846,14 @@ final class TilerCoordinator {
         var totalTargets = 0
         var totalFailures: [CGWindowID] = []
         for plan in plans {
+            guard displayGenerationsUnchanged(
+                for: Set([plan.displayID]),
+                expectedByDisplay: expectedDisplayGenerationByID,
+                reason: "\(reason)/display=\(plan.displayID)"
+            ) else {
+                continue
+            }
+
             let targets = targetFramesNeedingApply(
                 targetFrames: plan.targetFrames,
                 windowsByID: plan.windowsByID
@@ -872,11 +897,21 @@ final class TilerCoordinator {
         draggedWindowID: CGWindowID,
         hoverSlotIndex: Int?
     ) -> Bool {
+        let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
         let floatingState = captureFloatingStateSnapshot()
-        let context = buildReflowContext(
-            floatingState: floatingState,
-            including: [draggedWindowID]
-        )
+        guard
+            let context = buildReflowContext(
+                floatingState: floatingState,
+                including: [draggedWindowID],
+                reason: "drop/window=\(draggedWindowID)"
+            )
+        else {
+            Diagnostics.log(
+                "Drop reflow canceled windowID=\(draggedWindowID): unresolved window-space mapping",
+                level: .warn
+            )
+            return false
+        }
         let windows = context.windows
         let tiled = context.tiledWindows
 
@@ -943,6 +978,18 @@ final class TilerCoordinator {
             return false
         }
 
+        let involvedDisplayIDs = displayIDsForTargetFrames(
+            targetFrames,
+            windowsByID: drop.windowsByID
+        )
+        guard displayGenerationsUnchanged(
+            for: involvedDisplayIDs,
+            expectedByDisplay: expectedDisplayGenerationByID,
+            reason: "drop/window=\(draggedWindowID)"
+        ) else {
+            return false
+        }
+
         Diagnostics.log(
             "Applying layout from drop windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(targetFrames.count)",
             level: .info
@@ -959,9 +1006,16 @@ final class TilerCoordinator {
 
     private func buildReflowContext(
         floatingState: FloatingStateSnapshot,
-        including includedWindowIDs: Set<CGWindowID> = []
-    ) -> ReflowContext {
-        let windows = discovery.fetchVisibleWindows()
+        including includedWindowIDs: Set<CGWindowID> = [],
+        reason: String
+    ) -> ReflowContext? {
+        guard let windows = discovery.fetchVisibleWindowsReflowSafe() else {
+            Diagnostics.log(
+                "Reflow context rejected reason=\(reason): incomplete space mapping",
+                level: .warn
+            )
+            return nil
+        }
         let liveWindowIDs = Set(windows.map(\.windowID))
         DispatchQueue.main.async { [weak self] in
             self?.pruneFloatingState(to: liveWindowIDs)
@@ -1072,6 +1126,106 @@ final class TilerCoordinator {
         semanticsClassifier.prune(to: liveIDs)
     }
 
+    private func refreshDisplaySpaceState(reason: String) {
+        let activeDisplayIDs = Set(DisplayService.activeDisplayIDs())
+        guard !activeDisplayIDs.isEmpty else {
+            return
+        }
+        let currentSpaceByDisplayID = CGSSpaceService.shared.currentSpaceByDisplayID(displayIDs: activeDisplayIDs)
+
+        displaySpaceStateLock.lock()
+        defer { displaySpaceStateLock.unlock() }
+
+        let staleDisplayIDs = Set(displayGenerationByID.keys).subtracting(activeDisplayIDs)
+        for displayID in staleDisplayIDs {
+            displayGenerationByID.removeValue(forKey: displayID)
+            lastKnownSpaceByDisplayID.removeValue(forKey: displayID)
+        }
+
+        var changed: [String] = []
+        for displayID in activeDisplayIDs.sorted() {
+            if displayGenerationByID[displayID] == nil {
+                displayGenerationByID[displayID] = 0
+            }
+
+            guard let nextSpaceID = currentSpaceByDisplayID[displayID] else {
+                continue
+            }
+
+            let previousSpaceID = lastKnownSpaceByDisplayID[displayID]
+            lastKnownSpaceByDisplayID[displayID] = nextSpaceID
+            guard let previousSpaceID, previousSpaceID != nextSpaceID else {
+                continue
+            }
+
+            let nextGeneration = (displayGenerationByID[displayID] ?? 0) &+ 1
+            displayGenerationByID[displayID] = nextGeneration
+            changed.append("display=\(displayID) \(previousSpaceID)->\(nextSpaceID) gen=\(nextGeneration)")
+        }
+
+        if !changed.isEmpty {
+            Diagnostics.log(
+                "Display space generation advanced reason=\(reason) \(changed.joined(separator: ", "))",
+                level: .debug
+            )
+            return
+        }
+
+        if currentSpaceByDisplayID.count < activeDisplayIDs.count {
+            Diagnostics.log(
+                "Display space generation refresh partial reason=\(reason) resolved=\(currentSpaceByDisplayID.count)/\(activeDisplayIDs.count)",
+                level: .debug
+            )
+        }
+    }
+
+    private func captureDisplayGenerationSnapshot(for displayIDs: Set<CGDirectDisplayID>) -> [CGDirectDisplayID: UInt64] {
+        guard !displayIDs.isEmpty else {
+            return [:]
+        }
+
+        displaySpaceStateLock.lock()
+        defer { displaySpaceStateLock.unlock() }
+
+        var snapshot: [CGDirectDisplayID: UInt64] = [:]
+        snapshot.reserveCapacity(displayIDs.count)
+        for displayID in displayIDs {
+            snapshot[displayID] = displayGenerationByID[displayID] ?? 0
+        }
+        return snapshot
+    }
+
+    private func displayGenerationsUnchanged(
+        for displayIDs: Set<CGDirectDisplayID>,
+        expectedByDisplay: [CGDirectDisplayID: UInt64],
+        reason: String
+    ) -> Bool {
+        guard !displayIDs.isEmpty else {
+            return true
+        }
+
+        displaySpaceStateLock.lock()
+        var mismatches: [String] = []
+        mismatches.reserveCapacity(displayIDs.count)
+        for displayID in displayIDs.sorted() {
+            let expected = expectedByDisplay[displayID] ?? 0
+            let current = displayGenerationByID[displayID] ?? 0
+            if expected != current {
+                mismatches.append("display=\(displayID) expected=\(expected) current=\(current)")
+            }
+        }
+        displaySpaceStateLock.unlock()
+
+        guard mismatches.isEmpty else {
+            Diagnostics.log(
+                "Reflow canceled reason=\(reason) due to display space generation mismatch [\(mismatches.joined(separator: ", "))]",
+                level: .warn
+            )
+            return false
+        }
+        return true
+    }
+
     private func setupActiveSpaceObserver() {
         guard activeSpaceObserver == nil else {
             return
@@ -1084,6 +1238,7 @@ final class TilerCoordinator {
         ) { [weak self] _ in
             guard let self else { return }
             Diagnostics.log("Active space changed", level: .debug)
+            self.refreshDisplaySpaceState(reason: "active-space-notification")
             self.requestFullReflow(reason: "space-change")
         }
     }
@@ -1118,6 +1273,21 @@ final class TilerCoordinator {
             Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
             requestFullReflow(reason: "lifecycle:\(reason)")
         }
+    }
+
+    private func displayIDsForTargetFrames(
+        _ targetFrames: [CGWindowID: CGRect],
+        windowsByID: [CGWindowID: WindowRef]
+    ) -> Set<CGDirectDisplayID> {
+        var displayIDs = Set<CGDirectDisplayID>()
+        displayIDs.reserveCapacity(targetFrames.count)
+        for windowID in targetFrames.keys {
+            guard let displayID = windowsByID[windowID]?.displayID else {
+                continue
+            }
+            displayIDs.insert(displayID)
+        }
+        return displayIDs
     }
 
     private func targetFramesNeedingApply(

@@ -97,7 +97,7 @@ enum DisplayService {
         return NSScreen.screens.first?.frame ?? .zero
     }
 
-    private static func activeDisplayIDs() -> [CGDirectDisplayID] {
+    static func activeDisplayIDs() -> [CGDirectDisplayID] {
         var count: UInt32 = 0
         let countResult = CGGetActiveDisplayList(0, nil, &count)
         guard countResult == .success, count > 0 else {

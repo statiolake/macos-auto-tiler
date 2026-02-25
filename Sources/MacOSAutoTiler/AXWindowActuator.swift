@@ -6,13 +6,15 @@ final class AXWindowActuator {
     private let resolver: AXWindowResolver
     private let applyOriginThreshold: CGFloat = 1.0
     private let applySizeThreshold: CGFloat = 1.0
+    private let frameMismatchOriginThreshold: CGFloat = 120.0
+    private let frameMismatchSizeThreshold: CGFloat = 80.0
     private let axEnhancedUserInterfaceAttribute: CFString = "AXEnhancedUserInterface" as CFString
 
     init(resolver: AXWindowResolver = AXWindowResolver()) {
         self.resolver = resolver
     }
 
-    func apply(targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
+    func apply(reason: String, targetFrames: [CGWindowID: CGRect], windows: [CGWindowID: WindowRef]) -> [CGWindowID] {
         let sortedIDs = targetFrames.keys.sorted()
         Diagnostics.log("AX apply start for \(sortedIDs.count) windows", level: .debug)
         var failures: [CGWindowID] = []
@@ -46,6 +48,15 @@ final class AXWindowActuator {
             }
             logResolvedTarget(window: window, target: target, resolvedAX: resolvedAX)
             resolved.append((windowID: windowID, resolvedAX: resolvedAX, target: target, window: window))
+        }
+
+        if let mismatch = firstCriticalFrameMismatch(in: resolved) {
+            Diagnostics.log(
+                "AX apply canceled reason=\(reason): CG/AX frame mismatch \(windowSummary(mismatch.window)) cgFrame=\(mismatch.cgFrame) axFrame=\(mismatch.axFrame) dx=\(mismatch.dx) dy=\(mismatch.dy) dw=\(mismatch.dw) dh=\(mismatch.dh) thresholds=(origin:\(frameMismatchOriginThreshold),size:\(frameMismatchSizeThreshold))",
+                level: .warn
+            )
+            let aborted = Set(sortedIDs).union(failures)
+            return aborted.sorted()
         }
 
         for entry in resolved {
@@ -235,5 +246,48 @@ final class AXWindowActuator {
             "AX resolved exact \(windowSummary(window)) resolvedWindowID=\(resolvedAX.windowID) role=\(resolvedAX.role) subrole=\(resolvedAX.subrole) canSetPos=\(resolvedAX.canSetPosition) canSetSize=\(resolvedAX.canSetSize) cgFrame=\(window.frame) axFrame=\(String(describing: resolvedAX.frame)) target=\(target)",
             level: .debug
         )
+    }
+
+    private struct FrameMismatch {
+        let window: WindowRef
+        let cgFrame: CGRect
+        let axFrame: CGRect
+        let dx: CGFloat
+        let dy: CGFloat
+        let dw: CGFloat
+        let dh: CGFloat
+    }
+
+    private func firstCriticalFrameMismatch(
+        in resolved: [(windowID: CGWindowID, resolvedAX: AXWindowResolver.ResolvedWindow, target: CGRect, window: WindowRef)]
+    ) -> FrameMismatch? {
+        for entry in resolved {
+            guard let axFrame = entry.resolvedAX.frame else {
+                continue
+            }
+            let cgFrame = entry.window.frame
+            let dx = abs(cgFrame.origin.x - axFrame.origin.x)
+            let dy = abs(cgFrame.origin.y - axFrame.origin.y)
+            let dw = abs(cgFrame.size.width - axFrame.size.width)
+            let dh = abs(cgFrame.size.height - axFrame.size.height)
+            guard
+                dx > frameMismatchOriginThreshold
+                    || dy > frameMismatchOriginThreshold
+                    || dw > frameMismatchSizeThreshold
+                    || dh > frameMismatchSizeThreshold
+            else {
+                continue
+            }
+            return FrameMismatch(
+                window: entry.window,
+                cgFrame: cgFrame,
+                axFrame: axFrame,
+                dx: dx,
+                dy: dy,
+                dw: dw,
+                dh: dh
+            )
+        }
+        return nil
     }
 }

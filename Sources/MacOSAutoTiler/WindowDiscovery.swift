@@ -23,11 +23,23 @@ final class WindowDiscovery {
     }
 
     func fetchVisibleWindows() -> [WindowRef] {
+        fetchVisibleWindowsInternal().windows
+    }
+
+    func fetchVisibleWindowsReflowSafe() -> [WindowRef]? {
+        let result = fetchVisibleWindowsInternal()
+        guard !result.hasIncompleteSpaceData else {
+            return nil
+        }
+        return result.windows
+    }
+
+    private func fetchVisibleWindowsInternal() -> (windows: [WindowRef], hasIncompleteSpaceData: Bool) {
         guard
             let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]]
         else {
-            return []
+            return (windows: [], hasIncompleteSpaceData: false)
         }
 
         let selfPID = getpid()
@@ -57,6 +69,7 @@ final class WindowDiscovery {
             }
         }
         let currentSpaceByDisplayID = cgsSpaceService.currentSpaceByDisplayID(displayIDs: displayIDs)
+        let hasMissingCurrentDisplaySpace = !displayIDs.isEmpty && currentSpaceByDisplayID.count < displayIDs.count
         let visibleSpaceIDs = Set(currentSpaceByDisplayID.values)
 
         var windows: [WindowRef] = []
@@ -65,7 +78,6 @@ final class WindowDiscovery {
         var droppedMissingDisplay = 0
         var droppedMissingSpace = 0
         var droppedOffVisibleSpaces = 0
-        var inferredSpaceFromDisplay = 0
 
         for info in raw {
             guard
@@ -102,21 +114,12 @@ final class WindowDiscovery {
                 droppedMissingDisplay += 1
                 continue
             }
-            let resolvedSpaceID: Int
-            if let spaceID = spaceByWindowID[windowID] {
-                resolvedSpaceID = spaceID
-                if !visibleSpaceIDs.isEmpty, !visibleSpaceIDs.contains(spaceID) {
-                    droppedOffVisibleSpaces += 1
-                    continue
-                }
-            } else if let displaySpaceID = currentSpaceByDisplayID[displayID] {
-                // Prefer keeping currently visible windows managed even when per-window
-                // CGS lookup is transiently unavailable.
-                resolvedSpaceID = displaySpaceID
+            guard let resolvedSpaceID = spaceByWindowID[windowID] else {
                 droppedMissingSpace += 1
-                inferredSpaceFromDisplay += 1
-            } else {
-                droppedMissingSpace += 1
+                continue
+            }
+            if !visibleSpaceIDs.isEmpty, !visibleSpaceIDs.contains(resolvedSpaceID) {
+                droppedOffVisibleSpaces += 1
                 continue
             }
 
@@ -134,15 +137,18 @@ final class WindowDiscovery {
             )
         }
 
-        if droppedMissingDisplay > 0 || droppedMissingSpace > 0 || droppedOffVisibleSpaces > 0 || inferredSpaceFromDisplay > 0 {
+        if droppedMissingDisplay > 0 || droppedMissingSpace > 0 || droppedOffVisibleSpaces > 0 || hasMissingCurrentDisplaySpace {
             Diagnostics.log(
-                "CGS space filter dropped windows missingDisplay=\(droppedMissingDisplay) missingSpace=\(droppedMissingSpace) inferredSpace=\(inferredSpaceFromDisplay) offVisibleSpaces=\(droppedOffVisibleSpaces)",
+                "CGS space filter dropped windows missingDisplay=\(droppedMissingDisplay) missingSpace=\(droppedMissingSpace) offVisibleSpaces=\(droppedOffVisibleSpaces) missingCurrentDisplaySpace=\(hasMissingCurrentDisplaySpace)",
                 level: .debug
             )
         }
 
         logDiscoveryIfChanged(windows)
-        return windows
+        return (
+            windows: windows,
+            hasIncompleteSpaceData: hasMissingCurrentDisplaySpace || droppedMissingSpace > 0
+        )
     }
 
     func fetchWindow(windowID: CGWindowID) -> WindowRef? {

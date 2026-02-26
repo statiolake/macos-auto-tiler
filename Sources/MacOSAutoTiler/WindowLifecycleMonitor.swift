@@ -25,14 +25,11 @@ final class WindowLifecycleMonitor {
 
     private let watchedAXNotifications: [CFString] = [
         kAXWindowCreatedNotification as CFString,
-        kAXFocusedWindowChangedNotification as CFString,
         kAXMainWindowChangedNotification as CFString,
         kAXUIElementDestroyedNotification as CFString,
         kAXWindowMiniaturizedNotification as CFString,
         kAXWindowDeminiaturizedNotification as CFString,
     ]
-    private let createdAXNotificationName = kAXWindowCreatedNotification as String
-    private let destroyedAXNotificationName = kAXUIElementDestroyedNotification as String
     private let slowAXRegistrationThresholdMS = 200
     private let slowAXNotificationAddThresholdMS = 500
 
@@ -446,15 +443,11 @@ final class WindowLifecycleMonitor {
     }
 
     private func handleAXEvent(notification: String) {
-        if notification == destroyedAXNotificationName || notification == createdAXNotificationName {
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: TimingConstants.shortSettleDelayNanoseconds)
-                guard let self else { return }
-                self.enqueueChange(reason: "ax:\(notification)")
-            }
-            return
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: TimingConstants.shortSettleDelayNanoseconds)
+            guard let self else { return }
+            self.enqueueChange(reason: "ax:\(notification)")
         }
-        enqueueChange(reason: "ax:\(notification)")
     }
 
     private func describePID(_ pid: pid_t) -> String {

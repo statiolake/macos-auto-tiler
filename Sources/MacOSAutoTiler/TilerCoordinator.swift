@@ -47,7 +47,7 @@ final class TilerCoordinator {
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let pendingDragCheckpointDistance: CGFloat = 24
-    private let pendingDragPostThresholdDelay: TimeInterval = 0.035
+    private let pendingDragPostThresholdDelay: TimeInterval = TimingConstants.shortSettleDelay
     private let resizeProjectionEdgeDetectionThreshold: CGFloat = 2
     private let minimumProjectedWindowExtent: CGFloat = 80
     private let spaceSwitchCooldown: TimeInterval = 0.3

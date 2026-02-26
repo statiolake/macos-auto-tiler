@@ -33,6 +33,7 @@ final class TilerCoordinator {
     private var cachedWindows: [WindowRef]?
     private var cachedTiledWindows: [WindowRef]?
     private var pendingDragCheckpoint: PendingDragCheckpoint?
+    private var pendingDragDeferredProbeWorkItem: DispatchWorkItem?
     private var resizePreviewProjection: ResizePreviewProjection?
 
     private var userFloatingWindowIDs = Set<CGWindowID>()
@@ -46,6 +47,7 @@ final class TilerCoordinator {
     private let maxSpaceTransitionWait: TimeInterval = 1.5
     private let windowHitSlop: CGFloat = 24
     private let pendingDragCheckpointDistance: CGFloat = 24
+    private let pendingDragPostThresholdDelay: TimeInterval = 0.035
     private let resizeProjectionEdgeDetectionThreshold: CGFloat = 2
     private let minimumProjectedWindowExtent: CGFloat = 80
     private let spaceSwitchCooldown: TimeInterval = 0.3
@@ -61,6 +63,8 @@ final class TilerCoordinator {
     private struct PendingDragCheckpoint {
         var lastPoint: CGPoint
         var cumulativeDistance: CGFloat
+        var readyAt: Date?
+        let startedAt: Date
     }
 
     private struct ResizeProjectionEdges {
@@ -190,7 +194,12 @@ final class TilerCoordinator {
 
         cachedWindows = windows
         dragTracker.beginPendingDrag(windows: candidates)
-        pendingDragCheckpoint = PendingDragCheckpoint(lastPoint: point, cumulativeDistance: 0)
+        pendingDragCheckpoint = PendingDragCheckpoint(
+            lastPoint: point,
+            cumulativeDistance: 0,
+            readyAt: nil,
+            startedAt: Date()
+        )
         let candidateIDs = candidates.map { String($0.windowID) }.joined(separator: ",")
         Diagnostics.log(
             "Pending drag captured candidates=[\(candidateIDs)] count=\(candidates.count)",
@@ -278,6 +287,7 @@ final class TilerCoordinator {
         let pendingWindowIDs = dragTracker.pendingWindowIDs
         guard !pendingWindowIDs.isEmpty else {
             pendingDragCheckpoint = nil
+            cancelDeferredPendingDragProbe()
             return
         }
 
@@ -288,6 +298,8 @@ final class TilerCoordinator {
         guard var windows = cachedWindows else {
             return
         }
+        let beforeFramesByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0.frame) })
+        let checkpointSnapshot = pendingDragCheckpoint
 
         // Update only pending windows' frames (skip space/app lookups)
         let updatedFrames = discovery.fetchWindowFrames(for: Set(pendingWindowIDs))
@@ -314,20 +326,60 @@ final class TilerCoordinator {
             currentPoint: point,
             latestWindowsByID: latestByID
         )
+        let resultDescription: String = {
+            switch checkpointResult {
+            case .resizeActivated:
+                return "resizeActivated"
+            case .dragActivated:
+                return "dragActivated"
+            case .noWindowGeometryChange:
+                return "noWindowGeometryChange"
+            case .pendingCleared:
+                return "pendingCleared"
+            }
+        }()
+        let cumulativeDistance = checkpointSnapshot?.cumulativeDistance ?? 0
+        let elapsedMS: Int = {
+            guard let startedAt = checkpointSnapshot?.startedAt else {
+                return 0
+            }
+            return Int(Date().timeIntervalSince(startedAt) * 1000)
+        }()
+        let details = pendingWindowIDs.map { windowID -> String in
+            let fetched = updatedFrames[windowID] != nil
+            guard
+                let oldFrame = beforeFramesByID[windowID],
+                let newFrame = latestByID[windowID]?.frame
+            else {
+                return "id=\(windowID) fetched=\(fetched) old=\(String(describing: beforeFramesByID[windowID])) new=\(String(describing: latestByID[windowID]?.frame))"
+            }
+            let dx = abs(newFrame.origin.x - oldFrame.origin.x)
+            let dy = abs(newFrame.origin.y - oldFrame.origin.y)
+            let dw = abs(newFrame.size.width - oldFrame.size.width)
+            let dh = abs(newFrame.size.height - oldFrame.size.height)
+            return "id=\(windowID) fetched=\(fetched) dx=\(dx) dy=\(dy) dw=\(dw) dh=\(dh)"
+        }.joined(separator: " | ")
+        Diagnostics.log(
+            "Pending drag probe distance=\(cumulativeDistance) elapsedMs=\(elapsedMS) result=\(resultDescription) details=[\(details)]",
+            level: .debug
+        )
 
         switch checkpointResult {
         case .resizeActivated:
             pendingDragCheckpoint = nil
+            cancelDeferredPendingDragProbe()
             configureResizePreviewProjection(at: point, latestWindowsByID: latestByID)
             updateActiveResizePreview(at: point)
             return
         case .dragActivated:
             pendingDragCheckpoint = nil
+            cancelDeferredPendingDragProbe()
             resizePreviewProjection = nil
             break
         case .noWindowGeometryChange:
             dragTracker.clearPendingDrag()
             pendingDragCheckpoint = nil
+            cancelDeferredPendingDragProbe()
             resizePreviewProjection = nil
             Diagnostics.log(
                 "Pending drag checkpoint reached but no window geometry change; suppressing this drag sequence",
@@ -336,6 +388,7 @@ final class TilerCoordinator {
             return
         case .pendingCleared:
             pendingDragCheckpoint = nil
+            cancelDeferredPendingDragProbe()
             resizePreviewProjection = nil
             return
         }
@@ -1206,6 +1259,7 @@ final class TilerCoordinator {
 
     private func resetInteractionState() {
         dragTracker.clearAll()
+        cancelDeferredPendingDragProbe()
         clearOverlayState()
         cachedWindows = nil
         cachedTiledWindows = nil
@@ -1267,9 +1321,42 @@ final class TilerCoordinator {
         let deltaY = point.y - checkpoint.lastPoint.y
         checkpoint.cumulativeDistance += hypot(deltaX, deltaY)
         checkpoint.lastPoint = point
-        pendingDragCheckpoint = checkpoint
+        if checkpoint.cumulativeDistance < pendingDragCheckpointDistance {
+            pendingDragCheckpoint = checkpoint
+            return false
+        }
 
-        return checkpoint.cumulativeDistance >= pendingDragCheckpointDistance
+        if let readyAt = checkpoint.readyAt {
+            pendingDragCheckpoint = checkpoint
+            return Date() >= readyAt
+        }
+
+        checkpoint.readyAt = Date().addingTimeInterval(pendingDragPostThresholdDelay)
+        pendingDragCheckpoint = checkpoint
+        scheduleDeferredPendingDragProbe()
+        return false
+    }
+
+    private func scheduleDeferredPendingDragProbe() {
+        guard pendingDragDeferredProbeWorkItem == nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingDragDeferredProbeWorkItem = nil
+            guard let checkpoint = self.pendingDragCheckpoint else {
+                return
+            }
+            self.maybeActivateDrag(at: checkpoint.lastPoint)
+        }
+        pendingDragDeferredProbeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + pendingDragPostThresholdDelay, execute: workItem)
+    }
+
+    private func cancelDeferredPendingDragProbe() {
+        pendingDragDeferredProbeWorkItem?.cancel()
+        pendingDragDeferredProbeWorkItem = nil
     }
 
     private func configureResizePreviewProjection(at point: CGPoint, latestWindowsByID: [CGWindowID: WindowRef]) {
@@ -1336,25 +1423,22 @@ final class TilerCoordinator {
             return nil
         }
 
-        let deltaX = point.x - projection.activationPoint.x
-        let deltaY = point.y - projection.activationPoint.y
-
         var minX = projection.activationFrame.minX
         var maxX = projection.activationFrame.maxX
         var minY = projection.activationFrame.minY
         var maxY = projection.activationFrame.maxY
 
         if projection.edges.moveMinX {
-            minX += deltaX
+            minX = point.x
         }
         if projection.edges.moveMaxX {
-            maxX += deltaX
+            maxX = point.x
         }
         if projection.edges.moveMinY {
-            minY += deltaY
+            minY = point.y
         }
         if projection.edges.moveMaxY {
-            maxY += deltaY
+            maxY = point.y
         }
 
         if maxX - minX < minimumProjectedWindowExtent {

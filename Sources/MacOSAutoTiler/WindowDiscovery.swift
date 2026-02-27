@@ -180,6 +180,32 @@ final class WindowDiscovery {
         return result
     }
 
+    func hasVisibleWindow(at point: CGPoint) -> Bool {
+        guard
+            let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]]
+        else {
+            return false
+        }
+
+        for info in raw {
+            guard
+                let layer = info[kCGWindowLayer as String] as? Int,
+                layer == 0,
+                let alpha = info[kCGWindowAlpha as String] as? Double,
+                alpha > 0.01,
+                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                let frame = CGRect(dictionaryRepresentation: boundsDict)
+            else {
+                continue
+            }
+            if frame.contains(point) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func logDiscoveryIfChanged(_ windows: [WindowRef]) {
         let signature = discoverySignature(for: windows)
 

@@ -105,6 +105,10 @@ final class EventTapController {
                 consumed = handler(.optionPressed, point)
             }
         case .scrollWheel:
+            let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+            if isContinuous {
+                return Unmanaged.passUnretained(event)
+            }
             let lineDeltaY = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
             let pointDeltaY = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
             let deltaY = lineDeltaY != 0 ? lineDeltaY : pointDeltaY

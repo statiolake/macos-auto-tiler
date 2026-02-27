@@ -1276,7 +1276,7 @@ final class TilerCoordinator {
     }
 
     private func handleScrollWheel(deltaY: Int64, at point: CGPoint) -> Bool {
-        guard DisplayService.isPointInDockRegion(point) else {
+        guard !discovery.hasVisibleWindow(at: point) else {
             return false
         }
 
@@ -1300,7 +1300,7 @@ final class TilerCoordinator {
         }
 
         Diagnostics.log(
-            "Dock scroll -> switch Space \(goLeft ? "left" : "right") (deltaY=\(deltaY))",
+            "Empty-area scroll -> switch Space \(goLeft ? "left" : "right") (deltaY=\(deltaY))",
             level: .info
         )
 

@@ -15,7 +15,6 @@ final class TilerCoordinator {
     private lazy var lifecycleMonitor = WindowLifecycleMonitor(discovery: discovery)
     private lazy var semanticsClassifier = WindowSemanticsClassifier(resolver: axWindowResolver)
     private let typeRegistry = WindowTypeRegistry()
-    private let spaceProbeQueue = DispatchQueue(label: "com.statiolake.macosautotiler.spaceprobe", qos: .utility)
     private let displaySpaceStateLock = NSLock()
     private var displayGenerationByID: [CGDirectDisplayID: UInt64] = [:]
     private var lastKnownSpaceByDisplayID: [CGDirectDisplayID: Int] = [:]
@@ -51,7 +50,6 @@ final class TilerCoordinator {
     private let resizeProjectionEdgeDetectionThreshold: CGFloat = 2
     private let minimumProjectedWindowExtent: CGFloat = 80
     private let spaceSwitchCooldown: TimeInterval = 0.3
-    private let interactionWaitNanoseconds: UInt64 = 120_000_000
     private let frameEpsilon: CGFloat = 1.0
 
     private struct FloatingStateSnapshot {
@@ -664,107 +662,61 @@ final class TilerCoordinator {
                 continue
             }
 
+            // Check if reflow conditions are met atomically.
+            let isIdle = await MainActor.run { [weak self] in
+                guard let self else { return false }
+                return !self.dragTracker.isDragging
+                    && !self.dragTracker.isResizing
+                    && self.dragTracker.pendingWindowIDs.isEmpty
+            }
+
+            let isStable = await isReflowStable()
+
+            if !isIdle || !isStable {
+                // Conditions not met - re-enqueue and retry.
+                await reflowState.enqueue(request)
+                continue
+            }
+
+            // Conditions met - perform reflow.
             switch request {
             case let .drop(drop):
-                await waitForInteractionIdle()
-                await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
-                await waitForInteractionIdle()
                 _ = performDropReflow(
                     point: drop.point,
                     draggedWindowID: drop.draggedWindowID,
                     hoverSlotIndex: drop.hoverSlotIndex
                 )
             case let .full(full):
-                await waitForReflowStabilization(trigger: reflowTriggerDescription(for: request))
-                if await shouldSkipFullReflow(reason: full.reason) {
-                    Diagnostics.log(
-                        "Skipping full reflow reason=\(full.reason)",
-                        level: .debug
-                    )
-                    continue
-                }
                 _ = performFullReflow(reason: full.reason)
             }
         }
     }
 
-    private func waitForInteractionIdle() async {
-        while true {
-            if Task.isCancelled {
-                return
+    private func isReflowStable() async -> Bool {
+        let deadline = Date().addingTimeInterval(maxSpaceTransitionWait)
+        var stableCount = 0
+        var lastSignature: UInt64?
+
+        while stableCount < stableSnapshotsRequired {
+            if Task.isCancelled || Date() > deadline {
+                Diagnostics.log("Reflow stability timeout", level: .warn)
+                return false
             }
-            if !(await isInteractionActive()) {
-                return
+
+            let windows = discovery.fetchVisibleWindows()
+            let signature = spaceSnapshotSignature(for: windows)
+
+            if let last = lastSignature, last == signature {
+                stableCount += 1
+            } else {
+                stableCount = 1
+                lastSignature = signature
             }
-            try? await Task.sleep(nanoseconds: interactionWaitNanoseconds)
-        }
-    }
 
-    private func isInteractionActive() async -> Bool {
-        await MainActor.run { [weak self] in
-            guard let self else { return false }
-            return self.dragTracker.isDragging
-                || self.dragTracker.isResizing
-                || !self.dragTracker.pendingWindowIDs.isEmpty
-        }
-    }
-
-    private func shouldSkipFullReflow(reason: String) async -> Bool {
-        let interactingNow = await isInteractionActive()
-        let pendingDropRequestNow = await reflowState.hasPendingDropRequests()
-        if interactingNow || pendingDropRequestNow {
-            Diagnostics.log(
-                "Skipping full reflow pre-check reason=\(reason) interaction=\(interactingNow) pendingDropRequest=\(pendingDropRequestNow)",
-                level: .debug
-            )
-            return true
+            try? await Task.sleep(nanoseconds: UInt64(spaceProbeInterval * 1_000_000_000))
         }
 
-        // Give same-turn drop enqueue a chance before applying full reflow.
-        await Task.yield()
-
-        let interactingAfterYield = await isInteractionActive()
-        let pendingDropRequestAfterYield = await reflowState.hasPendingDropRequests()
-        if interactingAfterYield || pendingDropRequestAfterYield {
-            Diagnostics.log(
-                "Skipping full reflow post-yield reason=\(reason) interaction=\(interactingAfterYield) pendingDropRequest=\(pendingDropRequestAfterYield)",
-                level: .debug
-            )
-            return true
-        }
-
-        return false
-    }
-
-    private func waitForReflowStabilization(trigger: String) async {
-        let stabilizer = WindowSnapshotStabilizer(
-            stableSnapshotsRequired: stableSnapshotsRequired,
-            probeInterval: spaceProbeInterval,
-            timeout: maxSpaceTransitionWait,
-            probeQueue: spaceProbeQueue,
-            snapshotProvider: { [weak self] in
-                guard let self else {
-                    return .init(signature: 0, windowCount: 0)
-                }
-                let windows = self.discovery.fetchVisibleWindows()
-                return .init(
-                    signature: self.spaceSnapshotSignature(for: windows),
-                    windowCount: windows.count
-                )
-            },
-            probeHandler: { generation, stableCount, required, windowCount in
-                Diagnostics.log(
-                    "Reflow probe generation=\(generation) trigger=\(trigger) stable=\(stableCount)/\(required) windows=\(windowCount)",
-                    level: .debug
-                )
-            }
-        )
-
-        let result = await stabilizer.waitForStabilize()
-        Diagnostics.log(
-            "Reflow stabilization settled generation=\(result.generation) trigger=\(trigger) reason=\(result.reason.rawValue)",
-            level: .debug
-        )
+        return true
     }
 
     private func reflowTriggerDescription(for request: QueuedReflowRequest) -> String {

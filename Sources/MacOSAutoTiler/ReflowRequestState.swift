@@ -44,16 +44,9 @@ actor ReflowRequestState {
             return .full(QueuedFullReflow(reason: latestFullReflowReason))
         }
 
-        private var hasDropRequests: Bool {
-            dropHeadIndex < dropQueue.count
-        }
-
-        var hasPendingDropRequests: Bool {
-            hasDropRequests
-        }
 
         private mutating func dequeueDrop() -> QueuedDropReflow? {
-            guard hasDropRequests else {
+            guard dropHeadIndex < dropQueue.count else {
                 dropQueue.removeAll(keepingCapacity: true)
                 dropHeadIndex = 0
                 return nil
@@ -96,9 +89,5 @@ actor ReflowRequestState {
         priorityQueue = PriorityQueue()
         waitingContinuation?.resume()
         waitingContinuation = nil
-    }
-
-    func hasPendingDropRequests() -> Bool {
-        priorityQueue.hasPendingDropRequests
     }
 }

@@ -973,9 +973,10 @@ final class TilerCoordinator {
             )
             return nil
         }
-        let liveWindowIDs = Set(windows.map(\.windowID))
         DispatchQueue.main.async { [weak self] in
-            self?.pruneFloatingState(to: liveWindowIDs)
+            guard let self else { return }
+            let allIDs = self.discovery.fetchAllWindowIDs()
+            self.pruneFloatingState(to: allIDs)
         }
 
         let floatingContext = makeFloatingContext(
@@ -1068,14 +1069,19 @@ final class TilerCoordinator {
     }
 
     private func pruneFloatingState(using windows: [WindowRef]) {
-        let liveIDs = Set(windows.map(\.windowID))
-        pruneFloatingState(to: liveIDs)
+        // floating state の prune は全 space のウィンドウを基準にする。
+        // visible windows (on-screen only) だと他 space や最小化ウィンドウが除外され、
+        // floating state が誤って削除される。
+        let allIDs = discovery.fetchAllWindowIDs()
+        pruneFloatingState(to: allIDs)
+        // semantics cache は visible windows のみで prune する（メモリ効率のため）
+        let visibleIDs = Set(windows.map(\.windowID))
+        semanticsClassifier.prune(to: visibleIDs)
     }
 
     private func pruneFloatingState(to liveIDs: Set<CGWindowID>) {
         userFloatingWindowIDs.formIntersection(liveIDs)
         userTiledWindowIDs.formIntersection(liveIDs)
-        semanticsClassifier.prune(to: liveIDs)
     }
 
     private func refreshDisplaySpaceState(reason: String) {

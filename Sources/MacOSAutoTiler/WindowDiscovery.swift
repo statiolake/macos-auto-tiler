@@ -155,6 +155,25 @@ final class WindowDiscovery {
         fetchVisibleWindows().first { $0.windowID == windowID }
     }
 
+    /// 全 space のウィンドウ ID を返す（floating state の prune に使用）
+    func fetchAllWindowIDs() -> Set<CGWindowID> {
+        guard
+            let raw = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]]
+        else {
+            return []
+        }
+        var result = Set<CGWindowID>()
+        result.reserveCapacity(raw.count)
+        for info in raw {
+            guard let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
+                continue
+            }
+            result.insert(CGWindowID(windowNumber))
+        }
+        return result
+    }
+
     func fetchWindowFrames(for windowIDs: Set<CGWindowID>) -> [CGWindowID: CGRect] {
         guard
             !windowIDs.isEmpty,

@@ -2,6 +2,8 @@ import AppKit
 import CoreGraphics
 
 enum DisplayService {
+    nonisolated(unsafe) static var additionalBottomInsetByDisplay: [CGDirectDisplayID: CGFloat] = [:]
+
     static func displayID(containing point: CGPoint) -> CGDirectDisplayID? {
         var displayID: CGDirectDisplayID = 0
         var count: UInt32 = 0
@@ -55,7 +57,8 @@ enum DisplayService {
         let visible = screen.visibleFrame
         let mainTopY = mainScreenFrame().maxY
         let quartzY = mainTopY - visible.maxY
-        return CGRect(x: visible.minX, y: quartzY, width: visible.width, height: visible.height)
+        let extraBottom = additionalBottomInsetByDisplay[displayID] ?? 0
+        return CGRect(x: visible.minX, y: quartzY, width: visible.width, height: visible.height - extraBottom)
     }
 
     static func isPointInDockRegion(_ point: CGPoint) -> Bool {

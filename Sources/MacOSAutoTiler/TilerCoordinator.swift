@@ -125,7 +125,7 @@ final class TilerCoordinator {
 
         let activeDisplayIDs = DisplayService.activeDisplayIDs()
         for displayID in activeDisplayIDs {
-            DisplayService.additionalBottomInsetByDisplay[displayID] = TabBarWindowController.barHeight
+            DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.barHeight
         }
         tabBar.delegate = self
         tabBar.setupWindows(for: activeDisplayIDs)
@@ -237,22 +237,35 @@ final class TilerCoordinator {
             return
         }
 
+        // タブバーへのドロップ検出（activePlan の有無に関わらず最優先でチェック）
+        if dragTracker.isDragging, let draggedWindowID = dragTracker.draggedWindowID {
+            if let hit = tabBar.groupID(at: point) {
+                let spaceID = currentSpaceID(for: hit.displayID)
+                clearOverlayState()
+                groupManager.moveWindow(draggedWindowID, toGroup: hit.groupID, on: hit.displayID, spaceID: spaceID)
+                refreshTabBars()
+                requestFullReflow(reason: "group-drop")
+                resetInteractionState()
+                return
+            }
+            if let displayID = tabBar.isPlusZone(at: point) {
+                let spaceID = currentSpaceID(for: displayID)
+                let name = "Group \(groupManager.groups(for: displayID, spaceID: spaceID).count + 1)"
+                let newGroup = groupManager.createGroup(for: displayID, spaceID: spaceID, name: name)
+                groupManager.moveWindow(draggedWindowID, toGroup: newGroup.id, on: displayID, spaceID: spaceID)
+                refreshTabBars()
+                requestFullReflow(reason: "group-drop-new")
+                resetInteractionState()
+                return
+            }
+        }
+
         guard activePlan != nil else {
             resetInteractionState()
             return
         }
 
         guard let dragState = dragTracker.finishDrag(point: point, fallbackHoverSlotIndex: nil) else {
-            resetInteractionState()
-            return
-        }
-
-        // タブバーへのドロップ検出
-        if let hit = tabBar.groupID(at: point) {
-            clearOverlayState()
-            groupManager.moveWindow(dragState.draggedWindowID, toGroup: hit.groupID, on: hit.displayID)
-            refreshTabBars()
-            requestFullReflow(reason: "group-drop")
             resetInteractionState()
             return
         }
@@ -566,6 +579,7 @@ final class TilerCoordinator {
 
         activePlan = plan
         lastLoggedHoverIndex = hoverIndex
+        tabBar.setDragging(true)
 
         let hoverText = hoverIndex.map(String.init) ?? "nil"
         Diagnostics.log(
@@ -971,9 +985,15 @@ final class TilerCoordinator {
         // グループ管理の同期
         let allLiveIDs = Set(windows.map(\.windowID))
         groupManager.pruneWindows(to: allLiveIDs)
-        for displayID in Set(windows.map(\.displayID)) {
-            let ids = windows.filter { $0.displayID == displayID }.map(\.windowID)
-            groupManager.registerNewWindows(ids, on: displayID)
+        // ディスプレイ×スペースの組み合わせごとにウィンドウを登録
+        let byDisplaySpace = Dictionary(grouping: windows) { "\($0.displayID):\($0.spaceID)" }
+        for displaySpaceWindows in byDisplaySpace.values {
+            guard let first = displaySpaceWindows.first else { continue }
+            groupManager.registerNewWindows(
+                displaySpaceWindows.map(\.windowID),
+                on: first.displayID,
+                spaceID: first.spaceID
+            )
         }
         DispatchQueue.main.async { [weak self] in self?.refreshTabBars() }
 
@@ -990,7 +1010,7 @@ final class TilerCoordinator {
         // アクティブグループ以外のウィンドウを除外
         let groupFiltered = allTiled.filter { w in
             if includedWindowIDs.contains(w.windowID) { return true }
-            return !groupManager.inactiveWindowIDs(for: w.displayID).contains(w.windowID)
+            return !groupManager.inactiveWindowIDs(for: w.displayID, spaceID: w.spaceID).contains(w.windowID)
         }
         return ReflowContext(windows: windows, tiledWindows: groupFiltered)
     }
@@ -1275,6 +1295,7 @@ final class TilerCoordinator {
         cachedTiledWindows = nil
         pendingDragCheckpoint = nil
         resizePreviewProjection = nil
+        tabBar.setDragging(false)
     }
 
     private func logApplyResult(_ failures: [CGWindowID]) {
@@ -1484,7 +1505,8 @@ final class TilerCoordinator {
     // MARK: - Group / Tab Bar helpers
 
     private func activeLayoutPlanner(for displayID: CGDirectDisplayID) -> LayoutPlanner {
-        guard let groupID = groupManager.activeGroup(for: displayID)?.id else {
+        let spaceID = currentSpaceID(for: displayID)
+        guard let groupID = groupManager.activeGroup(for: displayID, spaceID: spaceID)?.id else {
             return defaultLayoutPlanner
         }
         if let planner = layoutPlannerByGroupID[groupID] { return planner }
@@ -1493,11 +1515,18 @@ final class TilerCoordinator {
         return planner
     }
 
+    private func currentSpaceID(for displayID: CGDirectDisplayID) -> Int {
+        displaySpaceStateLock.lock()
+        defer { displaySpaceStateLock.unlock() }
+        return lastKnownSpaceByDisplayID[displayID] ?? 0
+    }
+
     private func refreshTabBars() {
         for displayID in DisplayService.activeDisplayIDs() {
+            let spaceID = currentSpaceID(for: displayID)
             tabBar.updateTabs(
-                groups: groupManager.groups(for: displayID),
-                activeGroupID: groupManager.activeGroup(for: displayID)?.id,
+                groups: groupManager.groups(for: displayID, spaceID: spaceID),
+                activeGroupID: groupManager.activeGroup(for: displayID, spaceID: spaceID)?.id,
                 for: displayID
             )
         }
@@ -1516,21 +1545,24 @@ final class TilerCoordinator {
 
 extension TilerCoordinator: TabBarWindowControllerDelegate {
     func tabBar(_ controller: TabBarWindowController, didSelectGroupID id: WindowGroupID, on displayID: CGDirectDisplayID) {
-        groupManager.activateGroup(id: id, for: displayID)
-        let activeWindowIDs = groupManager.activeGroup(for: displayID)?.windowIDs ?? []
+        let spaceID = currentSpaceID(for: displayID)
+        groupManager.activateGroup(id: id, for: displayID, spaceID: spaceID)
+        let activeWindowIDs = groupManager.activeGroup(for: displayID, spaceID: spaceID)?.windowIDs ?? []
         raiseGroupWindows(activeWindowIDs, from: discovery.fetchVisibleWindows())
         refreshTabBars()
         requestFullReflow(reason: "group-switch")
     }
 
     func tabBar(_ controller: TabBarWindowController, didRequestNewGroupOn displayID: CGDirectDisplayID) {
-        let name = "Group \(groupManager.groups(for: displayID).count + 1)"
-        groupManager.createGroup(for: displayID, name: name)
+        let spaceID = currentSpaceID(for: displayID)
+        let name = "Group \(groupManager.groups(for: displayID, spaceID: spaceID).count + 1)"
+        groupManager.createGroup(for: displayID, spaceID: spaceID, name: name)
         refreshTabBars()
     }
 
     func tabBar(_ controller: TabBarWindowController, didDropWindowID windowID: CGWindowID, ontoGroupID groupID: WindowGroupID, on displayID: CGDirectDisplayID) {
-        groupManager.moveWindow(windowID, toGroup: groupID, on: displayID)
+        let spaceID = currentSpaceID(for: displayID)
+        groupManager.moveWindow(windowID, toGroup: groupID, on: displayID, spaceID: spaceID)
         refreshTabBars()
         requestFullReflow(reason: "group-drop")
     }

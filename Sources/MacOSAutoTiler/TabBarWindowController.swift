@@ -30,7 +30,17 @@ final class TabBarWindowController {
         }
     }
 
-    /// Hit-test a Quartz-coordinate point against all tab bar windows.
+    func setDragging(_ isDragging: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            for view in self.viewsByDisplayID.values {
+                view.isDragging = isDragging
+                view.needsDisplay = true
+            }
+        }
+    }
+
+    /// Hit-test a Quartz-coordinate point. Returns groupID + displayID if a tab is hit.
     func groupID(at quartzPoint: CGPoint) -> (groupID: WindowGroupID, displayID: CGDirectDisplayID)? {
         let mainHeight = NSScreen.screens.first?.frame.height ?? 0
         let cocoaPoint = CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
@@ -39,13 +49,29 @@ final class TabBarWindowController {
             guard window.frame.contains(cocoaPoint) else { continue }
             let localX = cocoaPoint.x - window.frame.minX
             let localY = cocoaPoint.y - window.frame.minY
-            // Convert Cocoa window-local (Y-up) to flipped view coordinates (Y-down from top).
+            // TabBarView は isFlipped=true なので Y を反転
             let viewPoint = CGPoint(x: localX, y: TabBarWindowController.barHeight - localY)
             guard
                 let view = viewsByDisplayID[displayID],
                 let groupID = view.groupID(at: viewPoint)
             else { continue }
             return (groupID, displayID)
+        }
+        return nil
+    }
+
+    /// ドラッグ中に "+" ゾーンにいるか判定。ヒットしたディスプレイIDを返す。
+    func isPlusZone(at quartzPoint: CGPoint) -> CGDirectDisplayID? {
+        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
+        let cocoaPoint = CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
+
+        for (displayID, window) in windowsByDisplayID {
+            guard window.frame.contains(cocoaPoint) else { continue }
+            let localX = cocoaPoint.x - window.frame.minX
+            let localY = cocoaPoint.y - window.frame.minY
+            let viewPoint = CGPoint(x: localX, y: TabBarWindowController.barHeight - localY)
+            guard let view = viewsByDisplayID[displayID] else { continue }
+            if view.isPlusZone(at: viewPoint) { return displayID }
         }
         return nil
     }
@@ -62,9 +88,10 @@ final class TabBarWindowController {
         guard let screen = DisplayService.screen(for: displayID) else { return }
 
         let visibleFrame = screen.visibleFrame
+        // メニューバーのすぐ下 (Cocoa Y-up: visibleFrame.maxY が最上端)
         let barRect = CGRect(
             x: visibleFrame.minX,
-            y: visibleFrame.minY,
+            y: visibleFrame.maxY - TabBarWindowController.barHeight,
             width: visibleFrame.width,
             height: TabBarWindowController.barHeight
         )
@@ -102,52 +129,75 @@ final class TabBarWindowController {
 // MARK: - TabBarView
 
 final class TabBarView: NSView {
-    private static let tabWidth: CGFloat = 160
-    private static let plusWidth: CGFloat = 36
-    private static let tabHeight: CGFloat = 32
-    private static let cornerRadius: CGFloat = 8
-    private static let tabSpacing: CGFloat = 4
-    private static let verticalInset: CGFloat = 6
+    // Layout
+    private static let tabWidth: CGFloat = 140
+    private static let plusWidth: CGFloat = 40
+    private static let tabHeight: CGFloat = 30
+    private static let cornerRadius: CGFloat = 7
+    private static let spacing: CGFloat = 6
+    private static let verticalPad: CGFloat = 7
+    private static let hPad: CGFloat = 12
 
     var groups: [WindowGroup] = []
     var activeGroupID: WindowGroupID?
+    var isDragging: Bool = false
 
     var onSelectGroup: ((WindowGroupID) -> Void)?
     var onNewGroup: (() -> Void)?
 
     override var isFlipped: Bool { true }
 
+    // MARK: - Drawing
+
     override func draw(_ dirtyRect: NSRect) {
-        NSColor(white: 0.08, alpha: 0.92).setFill()
-        dirtyRect.fill()
+        // 背景は透明なので何も塗らない
+        let tabY = TabBarView.verticalPad
 
-        var tabX: CGFloat = TabBarView.tabSpacing
-        let tabY = TabBarView.verticalInset
-
+        var tabX: CGFloat = TabBarView.hPad
         for group in groups {
             let rect = CGRect(x: tabX, y: tabY, width: TabBarView.tabWidth, height: TabBarView.tabHeight)
             drawTab(group: group, in: rect)
-            tabX += TabBarView.tabWidth + TabBarView.tabSpacing
+            tabX += TabBarView.tabWidth + TabBarView.spacing
         }
 
-        let plusRect = CGRect(x: tabX, y: tabY, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
-        drawPlus(in: plusRect)
+        if isDragging {
+            let plusRect = CGRect(x: tabX, y: tabY, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
+            drawPlus(in: plusRect)
+        }
     }
 
     private func drawTab(group: WindowGroup, in rect: CGRect) {
+        let isActive = group.id == activeGroupID
+
+        // シャドウで「浮いてる感」を出す
+        NSGraphicsContext.current?.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 6
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.18)
+        shadow.shadowOffset = NSSize(width: 0, height: -2)
+        shadow.set()
+
         let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.cornerRadius, yRadius: TabBarView.cornerRadius)
-        if group.id == activeGroupID {
-            NSColor.systemBlue.setFill()
+        if isActive {
+            NSColor.controlAccentColor.setFill()
         } else {
-            NSColor(white: 1.0, alpha: 0.10).setFill()
+            // ライト/ダークモード自動対応
+            NSColor.windowBackgroundColor.withAlphaComponent(0.88).setFill()
         }
         path.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
 
+        // テキスト
+        let name = group.name
+        let count = group.windowIDs.count
+        let displayText = count > 0 ? "\(name)  \(count)" : name
+
+        let textColor: NSColor = isActive ? .white : .labelColor
         let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.white,
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium)
+            .foregroundColor: textColor,
+            .font: NSFont.systemFont(ofSize: 11, weight: isActive ? .semibold : .regular)
         ]
-        let str = group.name as NSString
+        let str = displayText as NSString
         let size = str.size(withAttributes: attrs)
         let textRect = CGRect(
             x: rect.midX - size.width / 2,
@@ -159,13 +209,21 @@ final class TabBarView: NSView {
     }
 
     private func drawPlus(in rect: CGRect) {
+        NSGraphicsContext.current?.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 5
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.15)
+        shadow.shadowOffset = NSSize(width: 0, height: -2)
+        shadow.set()
+
         let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.cornerRadius, yRadius: TabBarView.cornerRadius)
-        NSColor(white: 1.0, alpha: 0.10).setFill()
+        NSColor.windowBackgroundColor.withAlphaComponent(0.75).setFill()
         path.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
 
         let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.white,
-            .font: NSFont.systemFont(ofSize: 18, weight: .light)
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .font: NSFont.systemFont(ofSize: 17, weight: .thin)
         ]
         let str = "+" as NSString
         let size = str.size(withAttributes: attrs)
@@ -178,34 +236,38 @@ final class TabBarView: NSView {
         str.draw(in: textRect, withAttributes: attrs)
     }
 
+    // MARK: - Mouse
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if let id = tabGroupID(at: point) {
             onSelectGroup?(id)
-        } else if isPlusHit(at: point) {
+        } else if isDragging, isPlusZone(at: point) {
             onNewGroup?()
         }
     }
 
-    /// Hit-test a point already in this view's coordinate system.
+    // MARK: - Hit testing
+
     func groupID(at point: CGPoint) -> WindowGroupID? {
         tabGroupID(at: point)
     }
 
+    func isPlusZone(at point: CGPoint) -> Bool {
+        guard isDragging else { return false }
+        let tabX = CGFloat(groups.count) * (TabBarView.tabWidth + TabBarView.spacing) + TabBarView.hPad
+        let plusRect = CGRect(x: tabX, y: TabBarView.verticalPad, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
+        return plusRect.contains(point)
+    }
+
     private func tabGroupID(at point: CGPoint) -> WindowGroupID? {
-        var tabX: CGFloat = TabBarView.tabSpacing
-        let tabY = TabBarView.verticalInset
+        var tabX: CGFloat = TabBarView.hPad
+        let tabY = TabBarView.verticalPad
         for group in groups {
             let rect = CGRect(x: tabX, y: tabY, width: TabBarView.tabWidth, height: TabBarView.tabHeight)
             if rect.contains(point) { return group.id }
-            tabX += TabBarView.tabWidth + TabBarView.tabSpacing
+            tabX += TabBarView.tabWidth + TabBarView.spacing
         }
         return nil
-    }
-
-    private func isPlusHit(at point: CGPoint) -> Bool {
-        let tabX = CGFloat(groups.count) * (TabBarView.tabWidth + TabBarView.tabSpacing) + TabBarView.tabSpacing
-        let plusRect = CGRect(x: tabX, y: TabBarView.verticalInset, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
-        return plusRect.contains(point)
     }
 }

@@ -3,7 +3,8 @@ import Foundation
 
 final class WindowGroupManager {
     private let lock = NSLock()
-    private var storeByDisplayID: [String: WindowGroupStore] = [:]
+    /// キー = "\(displayID):\(spaceID)"
+    private var storeByKey: [String: WindowGroupStore] = [:]
     private let persistURL: URL
 
     init() {
@@ -25,13 +26,13 @@ final class WindowGroupManager {
             let decoded = try? JSONDecoder().decode([String: WindowGroupStore].self, from: data)
         else { return }
         lock.lock()
-        storeByDisplayID = decoded
+        storeByKey = decoded
         lock.unlock()
     }
 
     private func save() {
         lock.lock()
-        let snapshot = storeByDisplayID
+        let snapshot = storeByKey
         lock.unlock()
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? data.write(to: persistURL)
@@ -43,27 +44,27 @@ final class WindowGroupManager {
 
     // MARK: - Queries
 
-    func activeGroup(for displayID: CGDirectDisplayID) -> WindowGroup? {
+    func activeGroup(for displayID: CGDirectDisplayID, spaceID: Int) -> WindowGroup? {
         lock.lock()
         defer { lock.unlock() }
         guard
-            let store = storeByDisplayID[key(displayID)],
+            let store = storeByKey[key(displayID, spaceID)],
             let activeID = store.activeGroupID
         else { return nil }
         return store.groups.first { $0.id == activeID }
     }
 
-    func groups(for displayID: CGDirectDisplayID) -> [WindowGroup] {
+    func groups(for displayID: CGDirectDisplayID, spaceID: Int) -> [WindowGroup] {
         lock.lock()
         defer { lock.unlock() }
-        return storeByDisplayID[key(displayID)]?.groups ?? []
+        return storeByKey[key(displayID, spaceID)]?.groups ?? []
     }
 
-    func inactiveWindowIDs(for displayID: CGDirectDisplayID) -> Set<CGWindowID> {
+    func inactiveWindowIDs(for displayID: CGDirectDisplayID, spaceID: Int) -> Set<CGWindowID> {
         lock.lock()
         defer { lock.unlock() }
         guard
-            let store = storeByDisplayID[key(displayID)],
+            let store = storeByKey[key(displayID, spaceID)],
             let activeID = store.activeGroupID
         else { return [] }
         var result = Set<CGWindowID>()
@@ -76,23 +77,25 @@ final class WindowGroupManager {
     // MARK: - Mutations
 
     @discardableResult
-    func createGroup(for displayID: CGDirectDisplayID, name: String) -> WindowGroup {
+    func createGroup(for displayID: CGDirectDisplayID, spaceID: Int, name: String) -> WindowGroup {
         let group = WindowGroup(name: name)
         lock.lock()
-        var store = storeByDisplayID[key(displayID)] ?? WindowGroupStore(groups: [], activeGroupID: nil)
+        let k = key(displayID, spaceID)
+        var store = storeByKey[k] ?? WindowGroupStore(groups: [], activeGroupID: nil)
         store.groups.append(group)
         store.activeGroupID = group.id
-        storeByDisplayID[key(displayID)] = store
+        storeByKey[k] = store
         lock.unlock()
         saveAsync()
         return group
     }
 
-    func activateGroup(id: WindowGroupID, for displayID: CGDirectDisplayID) {
+    func activateGroup(id: WindowGroupID, for displayID: CGDirectDisplayID, spaceID: Int) {
         lock.lock()
-        var store = storeByDisplayID[key(displayID)] ?? WindowGroupStore(groups: [], activeGroupID: nil)
+        let k = key(displayID, spaceID)
+        var store = storeByKey[k] ?? WindowGroupStore(groups: [], activeGroupID: nil)
         store.activeGroupID = id
-        storeByDisplayID[key(displayID)] = store
+        storeByKey[k] = store
         lock.unlock()
         saveAsync()
     }
@@ -101,10 +104,12 @@ final class WindowGroupManager {
     func moveWindow(
         _ windowID: CGWindowID,
         toGroup groupID: WindowGroupID,
-        on displayID: CGDirectDisplayID
+        on displayID: CGDirectDisplayID,
+        spaceID: Int
     ) -> (from: WindowGroupID?, to: WindowGroupID)? {
         lock.lock()
-        var store = storeByDisplayID[key(displayID)] ?? WindowGroupStore(groups: [], activeGroupID: nil)
+        let k = key(displayID, spaceID)
+        var store = storeByKey[k] ?? WindowGroupStore(groups: [], activeGroupID: nil)
         var fromGroupID: WindowGroupID?
         for i in store.groups.indices {
             if store.groups[i].windowIDs.contains(windowID) {
@@ -115,15 +120,17 @@ final class WindowGroupManager {
         if let idx = store.groups.firstIndex(where: { $0.id == groupID }) {
             store.groups[idx].windowIDs.insert(windowID)
         }
-        storeByDisplayID[key(displayID)] = store
+        cleanupEmptyGroups(in: &store)
+        storeByKey[k] = store
         lock.unlock()
         saveAsync()
         return (fromGroupID, groupID)
     }
 
-    func registerNewWindows(_ windowIDs: [CGWindowID], on displayID: CGDirectDisplayID) {
+    func registerNewWindows(_ windowIDs: [CGWindowID], on displayID: CGDirectDisplayID, spaceID: Int) {
         lock.lock()
-        var store = storeByDisplayID[key(displayID)] ?? WindowGroupStore(groups: [], activeGroupID: nil)
+        let k = key(displayID, spaceID)
+        var store = storeByKey[k] ?? WindowGroupStore(groups: [], activeGroupID: nil)
         if store.groups.isEmpty {
             let defaultGroup = WindowGroup(name: "Default")
             store.groups.append(defaultGroup)
@@ -140,17 +147,18 @@ final class WindowGroupManager {
         for windowID in windowIDs where !allRegistered.contains(windowID) {
             store.groups[idx].windowIDs.insert(windowID)
         }
-        storeByDisplayID[key(displayID)] = store
+        storeByKey[k] = store
         lock.unlock()
         saveAsync()
     }
 
     func pruneWindows(to liveIDs: Set<CGWindowID>) {
         lock.lock()
-        for key in storeByDisplayID.keys {
-            for i in storeByDisplayID[key]!.groups.indices {
-                storeByDisplayID[key]!.groups[i].windowIDs.formIntersection(liveIDs)
+        for k in storeByKey.keys {
+            for i in storeByKey[k]!.groups.indices {
+                storeByKey[k]!.groups[i].windowIDs.formIntersection(liveIDs)
             }
+            cleanupEmptyGroups(in: &storeByKey[k]!)
         }
         lock.unlock()
         saveAsync()
@@ -158,7 +166,18 @@ final class WindowGroupManager {
 
     // MARK: - Helpers
 
-    private func key(_ displayID: CGDirectDisplayID) -> String {
-        String(displayID)
+    /// 空になったグループを削除。アクティブグループが消えた場合は先頭へ切り替える。
+    private func cleanupEmptyGroups(in store: inout WindowGroupStore) {
+        let before = store.groups.count
+        store.groups.removeAll { $0.windowIDs.isEmpty }
+        guard store.groups.count < before else { return }
+        if let activeID = store.activeGroupID,
+           !store.groups.contains(where: { $0.id == activeID }) {
+            store.activeGroupID = store.groups.first?.id
+        }
+    }
+
+    private func key(_ displayID: CGDirectDisplayID, _ spaceID: Int) -> String {
+        "\(displayID):\(spaceID)"
     }
 }

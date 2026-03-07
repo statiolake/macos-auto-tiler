@@ -45,28 +45,14 @@ struct DisplayLayoutPlan {
     let displayID: CGDirectDisplayID
     let spaceID: Int
     let slots: [Slot]
-    let slotToWindowID: [Int: CGWindowID]
-    let windowToSlotIndex: [CGWindowID: Int]
+    let orderedWindowIDs: [CGWindowID]   // slots[i].rect が orderedWindowIDs[i] に対応
     let windowsByID: [CGWindowID: WindowRef]
 
     var targetFrames: [CGWindowID: CGRect] {
-        var result: [CGWindowID: CGRect] = [:]
-        result.reserveCapacity(slotToWindowID.count)
-        for (slotIndex, windowID) in slotToWindowID {
-            guard slotIndex >= 0, slotIndex < slots.count else {
-                continue
-            }
-            result[windowID] = slots[slotIndex].rect
-        }
-        return result
+        Dictionary(uniqueKeysWithValues: zip(orderedWindowIDs, slots).map { ($0, $1.rect) })
     }
-}
 
-struct DropResolution {
-    let displayID: CGDirectDisplayID
-    let sourceSlotIndex: Int?
-    let destinationSlotIndex: Int
-    let shouldApply: Bool
-    let targetFrames: [CGWindowID: CGRect]
-    let windowsByID: [CGWindowID: WindowRef]
+    func slotIndex(of windowID: CGWindowID) -> Int? {
+        orderedWindowIDs.firstIndex(of: windowID)
+    }
 }

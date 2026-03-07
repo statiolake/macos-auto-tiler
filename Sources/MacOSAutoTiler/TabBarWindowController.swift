@@ -2,18 +2,22 @@ import AppKit
 import CoreGraphics
 
 protocol TabBarWindowControllerDelegate: AnyObject {
-    func tabBar(_ controller: TabBarWindowController, didSelectGroupID id: WindowGroupID, on displayID: CGDirectDisplayID)
-    func tabBar(_ controller: TabBarWindowController, didRequestNewGroupOn displayID: CGDirectDisplayID)
-    func tabBar(_ controller: TabBarWindowController, didDropWindowID windowID: CGWindowID, ontoGroupID groupID: WindowGroupID, on displayID: CGDirectDisplayID)
+    func tabBar(_ controller: TabBarWindowController, didSelectSetID id: WindowSetID, on displayID: CGDirectDisplayID)
+    func tabBar(_ controller: TabBarWindowController, didRequestNewSetOn displayID: CGDirectDisplayID)
+    func tabBar(_ controller: TabBarWindowController, didDropWindowID windowID: CGWindowID, ontoSetID setID: WindowSetID, on displayID: CGDirectDisplayID)
 }
 
 final class TabBarWindowController {
-    static let barHeight: CGFloat = 44
+    static let barHeight: CGFloat = 36
+    private static let hMargin: CGFloat = 12
 
     weak var delegate: TabBarWindowControllerDelegate?
 
     private var windowsByDisplayID: [CGDirectDisplayID: NSWindow] = [:]
     private var viewsByDisplayID: [CGDirectDisplayID: TabBarView] = [:]
+    private var visibleByDisplayID: [CGDirectDisplayID: Bool] = [:]
+    private var animatingByDisplayID: [CGDirectDisplayID: Bool] = [:]
+    private var isDragging = false
 
     func setupWindows(for displayIDs: [CGDirectDisplayID]) {
         for displayID in displayIDs where windowsByDisplayID[displayID] == nil {
@@ -21,54 +25,57 @@ final class TabBarWindowController {
         }
     }
 
-    func updateTabs(groups: [WindowGroup], activeGroupID: WindowGroupID?, for displayID: CGDirectDisplayID) {
+    func updateTabs(sets: [WindowSet], activeSetID: WindowSetID?, windowTitles: [CGWindowID: String], for displayID: CGDirectDisplayID) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, let view = self.viewsByDisplayID[displayID] else { return }
-            view.groups = groups
-            view.activeGroupID = activeGroupID
+            guard let self else { return }
+            if self.viewsByDisplayID[displayID] == nil {
+                self.createWindow(for: displayID)
+            }
+            guard let view = self.viewsByDisplayID[displayID] else { return }
+            view.windowSets = sets
+            view.activeSetID = activeSetID
+            view.windowTitlesByID = windowTitles
             view.needsDisplay = true
+            self.animateVisibilityIfNeeded(for: displayID)
         }
     }
 
     func setDragging(_ isDragging: Bool) {
+        self.isDragging = isDragging
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            for view in self.viewsByDisplayID.values {
+            for (displayID, view) in self.viewsByDisplayID {
                 view.isDragging = isDragging
                 view.needsDisplay = true
+                self.animateVisibilityIfNeeded(for: displayID)
             }
         }
     }
 
-    /// Hit-test a Quartz-coordinate point. Returns groupID + displayID if a tab is hit.
-    func groupID(at quartzPoint: CGPoint) -> (groupID: WindowGroupID, displayID: CGDirectDisplayID)? {
-        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-        let cocoaPoint = CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
-
-        for (displayID, window) in windowsByDisplayID {
-            guard window.frame.contains(cocoaPoint) else { continue }
-            let localX = cocoaPoint.x - window.frame.minX
-            let localY = cocoaPoint.y - window.frame.minY
-            // TabBarView は isFlipped=true なので Y を反転
+    func setID(at quartzPoint: CGPoint) -> (setID: WindowSetID, displayID: CGDirectDisplayID)? {
+        let cocoaPoint = cocoaPoint(fromQuartzPoint: quartzPoint)
+        for displayID in windowsByDisplayID.keys {
+            guard visibleByDisplayID[displayID] == true,
+                  let rect = shownFrame(for: displayID),
+                  rect.contains(cocoaPoint) else { continue }
+            let localX = cocoaPoint.x - rect.minX
+            let localY = cocoaPoint.y - rect.minY
             let viewPoint = CGPoint(x: localX, y: TabBarWindowController.barHeight - localY)
-            guard
-                let view = viewsByDisplayID[displayID],
-                let groupID = view.groupID(at: viewPoint)
-            else { continue }
-            return (groupID, displayID)
+            guard let view = viewsByDisplayID[displayID],
+                  let setID = view.setID(at: viewPoint) else { continue }
+            return (setID, displayID)
         }
         return nil
     }
 
-    /// ドラッグ中に "+" ゾーンにいるか判定。ヒットしたディスプレイIDを返す。
     func isPlusZone(at quartzPoint: CGPoint) -> CGDirectDisplayID? {
-        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-        let cocoaPoint = CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
-
-        for (displayID, window) in windowsByDisplayID {
-            guard window.frame.contains(cocoaPoint) else { continue }
-            let localX = cocoaPoint.x - window.frame.minX
-            let localY = cocoaPoint.y - window.frame.minY
+        let cocoaPoint = cocoaPoint(fromQuartzPoint: quartzPoint)
+        for displayID in windowsByDisplayID.keys {
+            guard visibleByDisplayID[displayID] == true,
+                  let rect = shownFrame(for: displayID),
+                  rect.contains(cocoaPoint) else { continue }
+            let localX = cocoaPoint.x - rect.minX
+            let localY = cocoaPoint.y - rect.minY
             let viewPoint = CGPoint(x: localX, y: TabBarWindowController.barHeight - localY)
             guard let view = viewsByDisplayID[displayID] else { continue }
             if view.isPlusZone(at: viewPoint) { return displayID }
@@ -77,86 +84,164 @@ final class TabBarWindowController {
     }
 
     func isPointInTabBar(_ quartzPoint: CGPoint) -> Bool {
-        let mainHeight = NSScreen.screens.first?.frame.height ?? 0
-        let cocoaPoint = CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
-        return windowsByDisplayID.values.contains { $0.frame.contains(cocoaPoint) }
+        let cocoaPoint = cocoaPoint(fromQuartzPoint: quartzPoint)
+        return windowsByDisplayID.keys.contains {
+            visibleByDisplayID[$0] == true &&
+            shownFrame(for: $0)?.contains(cocoaPoint) == true
+        }
     }
 
-    // MARK: - Private
+    private func animateVisibilityIfNeeded(for displayID: CGDirectDisplayID) {
+        guard let view = viewsByDisplayID[displayID],
+              let window = windowsByDisplayID[displayID],
+              let shown = shownFrame(for: displayID) else { return }
+
+        let shouldShow = view.windowSets.count > 1 || isDragging
+        let wasShown = visibleByDisplayID[displayID] ?? false
+        guard shouldShow != wasShown else {
+            if animatingByDisplayID[displayID] == true {
+                return
+            }
+            if !window.frame.equalTo(shown) {
+                window.setFrame(shown, display: true)
+            }
+            if shouldShow {
+                window.alphaValue = 1
+                window.orderFrontRegardless()
+            } else {
+                window.alphaValue = 0
+                window.orderOut(nil)
+            }
+            return
+        }
+        visibleByDisplayID[displayID] = shouldShow
+
+        if !window.frame.equalTo(shown) {
+            window.setFrame(shown, display: true)
+        }
+
+        if shouldShow {
+            window.alphaValue = 0
+            window.orderFrontRegardless()
+        }
+
+        animatingByDisplayID[displayID] = true
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = shouldShow ? 0.18 : 0.14
+            context.timingFunction = CAMediaTimingFunction(name: shouldShow ? .easeOut : .easeIn)
+            window.animator().alphaValue = shouldShow ? 1 : 0
+        }, completionHandler: { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.animatingByDisplayID[displayID] = false
+            guard self.visibleByDisplayID[displayID] == shouldShow else {
+                self.animateVisibilityIfNeeded(for: displayID)
+                return
+            }
+            if shouldShow {
+                window.alphaValue = 1
+            } else {
+                window.alphaValue = 0
+                window.orderOut(nil)
+            }
+        })
+    }
+
+    private func shownFrame(for displayID: CGDirectDisplayID) -> CGRect? {
+        guard let screen = DisplayService.screen(for: displayID) else { return nil }
+        let sf = screen.frame
+        let vf = screen.visibleFrame
+        let m = TabBarWindowController.hMargin
+        let h = TabBarWindowController.barHeight
+        let width = max(1, sf.width - m * 2)
+        return CGRect(x: sf.minX + m, y: vf.maxY - h, width: width, height: h)
+    }
+
+    private func cocoaPoint(fromQuartzPoint quartzPoint: CGPoint) -> CGPoint {
+        let mainHeight = CGDisplayBounds(CGMainDisplayID()).height
+        return CGPoint(x: quartzPoint.x, y: mainHeight - quartzPoint.y)
+    }
 
     private func createWindow(for displayID: CGDirectDisplayID) {
-        guard let screen = DisplayService.screen(for: displayID) else { return }
+        guard let shown = shownFrame(for: displayID) else { return }
 
-        let visibleFrame = screen.visibleFrame
-        // メニューバーのすぐ下 (Cocoa Y-up: visibleFrame.maxY が最上端)
-        let barRect = CGRect(
-            x: visibleFrame.minX,
-            y: visibleFrame.maxY - TabBarWindowController.barHeight,
-            width: visibleFrame.width,
-            height: TabBarWindowController.barHeight
-        )
-
-        let window = NSWindow(
-            contentRect: barRect,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
+        let window = NSWindow(contentRect: shown, styleMask: [.borderless], backing: .buffered, defer: false)
         window.backgroundColor = .clear
         window.isOpaque = false
-        window.hasShadow = false
+        window.hasShadow = true
+        window.animationBehavior = .none
         window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) - 1)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
 
-        let view = TabBarView(frame: CGRect(origin: .zero, size: barRect.size))
-        view.onSelectGroup = { [weak self, displayID] groupID in
-            guard let self else { return }
-            self.delegate?.tabBar(self, didSelectGroupID: groupID, on: displayID)
-        }
-        view.onNewGroup = { [weak self, displayID] in
-            guard let self else { return }
-            self.delegate?.tabBar(self, didRequestNewGroupOn: displayID)
-        }
+        let chromeView = NSVisualEffectView(frame: CGRect(origin: .zero, size: shown.size))
+        chromeView.material = .sidebar
+        chromeView.blendingMode = .behindWindow
+        chromeView.state = .active
+        chromeView.autoresizingMask = [.width, .height]
+        chromeView.wantsLayer = true
+        chromeView.layer?.cornerRadius = 10
+        chromeView.layer?.masksToBounds = true
+        window.contentView = chromeView
 
-        window.contentView = view
-        window.orderFrontRegardless()
+        let tabView = TabBarView(frame: CGRect(origin: .zero, size: shown.size))
+        tabView.autoresizingMask = [.width, .height]
+        tabView.onSelectSet = { [weak self, displayID] setID in
+            guard let self else { return }
+            self.delegate?.tabBar(self, didSelectSetID: setID, on: displayID)
+        }
+        tabView.onNewSet = { [weak self, displayID] in
+            guard let self else { return }
+            self.delegate?.tabBar(self, didRequestNewSetOn: displayID)
+        }
+        chromeView.addSubview(tabView)
 
         windowsByDisplayID[displayID] = window
-        viewsByDisplayID[displayID] = view
+        viewsByDisplayID[displayID] = tabView
+        visibleByDisplayID[displayID] = false
+        animatingByDisplayID[displayID] = false
+
+        window.alphaValue = 0
+        window.orderOut(nil)
     }
 }
 
 // MARK: - TabBarView
 
 final class TabBarView: NSView {
-    // Layout
-    private static let tabWidth: CGFloat = 140
-    private static let plusWidth: CGFloat = 40
-    private static let tabHeight: CGFloat = 30
-    private static let cornerRadius: CGFloat = 7
+    private static let tabWidth: CGFloat = 160
+    private static let plusWidth: CGFloat = 32
+    private static let tabHeight: CGFloat = 24
+    private static let tabCorner: CGFloat = 6
     private static let spacing: CGFloat = 6
-    private static let verticalPad: CGFloat = 7
-    private static let hPad: CGFloat = 12
+    private static let hPad: CGFloat = 10
+    private static let tabTopY: CGFloat = (36 - 24) / 2  // = 6
 
-    var groups: [WindowGroup] = []
-    var activeGroupID: WindowGroupID?
+    var windowSets: [WindowSet] = []
+    var activeSetID: WindowSetID?
     var isDragging: Bool = false
+    var windowTitlesByID: [CGWindowID: String] = [:]
 
-    var onSelectGroup: ((WindowGroupID) -> Void)?
-    var onNewGroup: (() -> Void)?
+    var onSelectSet: ((WindowSetID) -> Void)?
+    var onNewSet: (() -> Void)?
 
     override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.isOpaque = false
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 
     // MARK: - Drawing
 
     override func draw(_ dirtyRect: NSRect) {
-        // 背景は透明なので何も塗らない
-        let tabY = TabBarView.verticalPad
+        let tabY = TabBarView.tabTopY
+        var tabX = TabBarView.hPad
 
-        var tabX: CGFloat = TabBarView.hPad
-        for group in groups {
+        for set in windowSets {
             let rect = CGRect(x: tabX, y: tabY, width: TabBarView.tabWidth, height: TabBarView.tabHeight)
-            drawTab(group: group, in: rect)
+            drawTab(set: set, in: rect)
             tabX += TabBarView.tabWidth + TabBarView.spacing
         }
 
@@ -166,106 +251,99 @@ final class TabBarView: NSView {
         }
     }
 
-    private func drawTab(group: WindowGroup, in rect: CGRect) {
-        let isActive = group.id == activeGroupID
+    private func drawTab(set: WindowSet, in rect: CGRect) {
+        let isActive = set.id == activeSetID
+        let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.tabCorner,
+                                yRadius: TabBarView.tabCorner)
 
-        // シャドウで「浮いてる感」を出す
-        NSGraphicsContext.current?.saveGraphicsState()
-        let shadow = NSShadow()
-        shadow.shadowBlurRadius = 6
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.18)
-        shadow.shadowOffset = NSSize(width: 0, height: -2)
-        shadow.set()
-
-        let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.cornerRadius, yRadius: TabBarView.cornerRadius)
         if isActive {
-            NSColor.controlAccentColor.setFill()
+            NSColor(white: 1, alpha: 0.28).setFill()
         } else {
-            // ライト/ダークモード自動対応
-            NSColor.windowBackgroundColor.withAlphaComponent(0.88).setFill()
+            NSColor(white: 1, alpha: 0.10).setFill()
         }
         path.fill()
-        NSGraphicsContext.current?.restoreGraphicsState()
 
-        // テキスト
-        let name = group.name
-        let count = group.windowIDs.count
-        let displayText = count > 0 ? "\(name)  \(count)" : name
+        NSColor(white: 1, alpha: isActive ? 0.45 : 0.20).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
 
-        let textColor: NSColor = isActive ? .white : .labelColor
+        let label: String = {
+            let names = set.orderedWindowIDs.compactMap { id -> String? in
+                guard let t = windowTitlesByID[id] else { return nil }
+                let trimmed = t.trimmingCharacters(in: .whitespaces)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            return names.isEmpty ? "Set" : names.joined(separator: " | ")
+        }()
+
+        let font = NSFont.systemFont(ofSize: 11, weight: isActive ? .medium : .regular)
         let attrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: textColor,
-            .font: NSFont.systemFont(ofSize: 11, weight: isActive ? .semibold : .regular)
+            .foregroundColor: NSColor.labelColor,
+            .font: font
         ]
-        let str = displayText as NSString
-        let size = str.size(withAttributes: attrs)
-        let textRect = CGRect(
-            x: rect.midX - size.width / 2,
-            y: rect.midY - size.height / 2,
-            width: size.width,
-            height: size.height
+
+        let inset: CGFloat = 7
+        let maxW = rect.width - inset * 2
+        let attrStr = NSAttributedString(string: label, attributes: attrs)
+        let measured = attrStr.boundingRect(
+            with: CGSize(width: maxW, height: .greatestFiniteMagnitude),
+            options: .usesLineFragmentOrigin
         )
-        str.draw(in: textRect, withAttributes: attrs)
+        let textTopY = floor(rect.midY - measured.height / 2)
+        let textRect = CGRect(x: rect.minX + inset, y: textTopY, width: maxW, height: measured.height)
+        attrStr.draw(with: textRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
     private func drawPlus(in rect: CGRect) {
-        NSGraphicsContext.current?.saveGraphicsState()
-        let shadow = NSShadow()
-        shadow.shadowBlurRadius = 5
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.15)
-        shadow.shadowOffset = NSSize(width: 0, height: -2)
-        shadow.set()
-
-        let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.cornerRadius, yRadius: TabBarView.cornerRadius)
-        NSColor.windowBackgroundColor.withAlphaComponent(0.75).setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: TabBarView.tabCorner,
+                                yRadius: TabBarView.tabCorner)
+        NSColor(white: 1, alpha: 0.10).setFill()
         path.fill()
-        NSGraphicsContext.current?.restoreGraphicsState()
+        NSColor(white: 1, alpha: 0.22).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
 
+        let font = NSFont.systemFont(ofSize: 14, weight: .thin)
         let attrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: NSColor.secondaryLabelColor,
-            .font: NSFont.systemFont(ofSize: 17, weight: .thin)
+            .font: font
         ]
         let str = "+" as NSString
-        let size = str.size(withAttributes: attrs)
-        let textRect = CGRect(
-            x: rect.midX - size.width / 2,
-            y: rect.midY - size.height / 2,
-            width: size.width,
-            height: size.height
-        )
-        str.draw(in: textRect, withAttributes: attrs)
+        let sz = str.size(withAttributes: attrs)
+        let y = floor(rect.midY - (font.ascender + font.capHeight) / 2)
+        str.draw(at: CGPoint(x: rect.midX - sz.width / 2, y: y), withAttributes: attrs)
     }
 
     // MARK: - Mouse
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if let id = tabGroupID(at: point) {
-            onSelectGroup?(id)
+        if let id = hitSetID(at: point) {
+            onSelectSet?(id)
         } else if isDragging, isPlusZone(at: point) {
-            onNewGroup?()
+            onNewSet?()
         }
     }
 
-    // MARK: - Hit testing
+    // MARK: - Hit testing（isFlipped=true 座標系）
 
-    func groupID(at point: CGPoint) -> WindowGroupID? {
-        tabGroupID(at: point)
+    func setID(at point: CGPoint) -> WindowSetID? {
+        hitSetID(at: point)
     }
 
     func isPlusZone(at point: CGPoint) -> Bool {
         guard isDragging else { return false }
-        let tabX = CGFloat(groups.count) * (TabBarView.tabWidth + TabBarView.spacing) + TabBarView.hPad
-        let plusRect = CGRect(x: tabX, y: TabBarView.verticalPad, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
-        return plusRect.contains(point)
+        let tabX = CGFloat(windowSets.count) * (TabBarView.tabWidth + TabBarView.spacing) + TabBarView.hPad
+        let r = CGRect(x: tabX, y: TabBarView.tabTopY, width: TabBarView.plusWidth, height: TabBarView.tabHeight)
+        return r.contains(point)
     }
 
-    private func tabGroupID(at point: CGPoint) -> WindowGroupID? {
-        var tabX: CGFloat = TabBarView.hPad
-        let tabY = TabBarView.verticalPad
-        for group in groups {
-            let rect = CGRect(x: tabX, y: tabY, width: TabBarView.tabWidth, height: TabBarView.tabHeight)
-            if rect.contains(point) { return group.id }
+    private func hitSetID(at point: CGPoint) -> WindowSetID? {
+        var tabX = TabBarView.hPad
+        for set in windowSets {
+            let r = CGRect(x: tabX, y: TabBarView.tabTopY,
+                           width: TabBarView.tabWidth, height: TabBarView.tabHeight)
+            if r.contains(point) { return set.id }
             tabX += TabBarView.tabWidth + TabBarView.spacing
         }
         return nil

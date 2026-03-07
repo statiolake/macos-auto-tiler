@@ -7,9 +7,9 @@ final class TilerCoordinator {
     private lazy var discovery = WindowDiscovery(ruleStore: ruleStore)
     private let defaultLayoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
-    private let groupManager = WindowGroupManager()
+    private let windowSetManager = WindowSetManager()
     private let tabBar = TabBarWindowController()
-    private var layoutPlannerByGroupID: [WindowGroupID: LayoutPlanner] = [:]
+    private var layoutPlannerBySetID: [WindowSetID: LayoutPlanner] = [:]
     private let eventTap = EventTapController()
     private lazy var geometryApplier = WindowGeometryApplier(
         actuator: AXWindowActuator(resolver: axWindowResolver)
@@ -33,7 +33,6 @@ final class TilerCoordinator {
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
     private var cachedWindows: [WindowRef]?
-    private var cachedTiledWindows: [WindowRef]?
     private var pendingDragCheckpoint: PendingDragCheckpoint?
     private var pendingDragDeferredProbeWorkItem: DispatchWorkItem?
     private var resizePreviewProjection: ResizePreviewProjection?
@@ -93,11 +92,6 @@ final class TilerCoordinator {
         let semanticsClassifier: WindowSemanticsClassifier
     }
 
-    private struct ReflowContext {
-        let windows: [WindowRef]
-        let tiledWindows: [WindowRef]
-    }
-
     func start() {
         Diagnostics.log("Coordinator start requested", level: .info)
         startReflowWorkerIfNeeded()
@@ -124,9 +118,7 @@ final class TilerCoordinator {
         startLifecycleMonitor()
 
         let activeDisplayIDs = DisplayService.activeDisplayIDs()
-        for displayID in activeDisplayIDs {
-            DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.barHeight
-        }
+        // inset は refreshTabBars でセット数に応じて動的に設定されるため初期値は 0
         tabBar.delegate = self
         tabBar.setupWindows(for: activeDisplayIDs)
         refreshTabBars()
@@ -232,29 +224,27 @@ final class TilerCoordinator {
 
     private func handleMouseUp(at point: CGPoint) {
         if let resizeState = dragTracker.finishResize() {
-            finishResizeSession(resizeState: resizeState, point: point)
             resetInteractionState()
+            finishResizeSession(resizeState: resizeState, point: point)
             return
         }
 
         // タブバーへのドロップ検出（activePlan の有無に関わらず最優先でチェック）
         if dragTracker.isDragging, let draggedWindowID = dragTracker.draggedWindowID {
-            if let hit = tabBar.groupID(at: point) {
+            if let hit = tabBar.setID(at: point) {
                 let spaceID = currentSpaceID(for: hit.displayID)
-                clearOverlayState()
-                groupManager.moveWindow(draggedWindowID, toGroup: hit.groupID, on: hit.displayID, spaceID: spaceID)
+                windowSetManager.moveWindowToSet(draggedWindowID, toSetID: hit.setID, on: hit.displayID, spaceID: spaceID)
                 refreshTabBars()
-                requestFullReflow(reason: "group-drop")
+                requestFullReflow(reason: "set-drop")
                 resetInteractionState()
                 return
             }
             if let displayID = tabBar.isPlusZone(at: point) {
                 let spaceID = currentSpaceID(for: displayID)
-                let name = "Group \(groupManager.groups(for: displayID, spaceID: spaceID).count + 1)"
-                let newGroup = groupManager.createGroup(for: displayID, spaceID: spaceID, name: name)
-                groupManager.moveWindow(draggedWindowID, toGroup: newGroup.id, on: displayID, spaceID: spaceID)
+                let newSet = windowSetManager.createSet(for: displayID, spaceID: spaceID)
+                windowSetManager.moveWindowToSet(draggedWindowID, toSetID: newSet.id, on: displayID, spaceID: spaceID)
                 refreshTabBars()
-                requestFullReflow(reason: "group-drop-new")
+                requestFullReflow(reason: "set-drop-new")
                 resetInteractionState()
                 return
             }
@@ -270,7 +260,7 @@ final class TilerCoordinator {
             return
         }
 
-        clearOverlayState()
+        resetInteractionState()
         enqueueReflowRequest(
             .drop(
                 QueuedDropReflow(
@@ -305,12 +295,12 @@ final class TilerCoordinator {
             userFloatingWindowIDs.remove(draggedWindowID)
             userTiledWindowIDs.insert(draggedWindowID)
             Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> tiled", level: .info)
-            activateDragSession(draggedWindow: draggedWindow, point: point, windows: windows)
+            activateDragSession(draggedWindowID: draggedWindowID, point: point, windows: windows)
         } else {
             userTiledWindowIDs.remove(draggedWindowID)
             userFloatingWindowIDs.insert(draggedWindowID)
             Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> floating", level: .info)
-            clearOverlayState()
+            resetInteractionState()
             requestFullReflow(reason: "floating-toggle")
         }
     }
@@ -435,11 +425,11 @@ final class TilerCoordinator {
         let floatingContext = liveFloatingContext()
         if isFloatingWindow(latestWindow, context: floatingContext) {
             Diagnostics.log("Dragging floating windowID=\(latestWindow.windowID) (tiler preview disabled)", level: .debug)
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
-        activateDragSession(draggedWindow: latestWindow, point: point, windows: windows)
+        activateDragSession(draggedWindowID: draggedWindowID, point: point, windows: windows)
     }
 
     private func updateActiveResizePreview(at point: CGPoint) {
@@ -476,34 +466,50 @@ final class TilerCoordinator {
         }
 
         guard let resizingWindow = windows.first(where: { $0.windowID == resizingWindowID }) else {
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
         let floatingContext = liveFloatingContext()
         if isFloatingWindow(resizingWindow, context: floatingContext) {
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
-        let tiled = tiledWindows(from: windows, floatingContext: floatingContext)
         guard let displayID = DisplayService.displayID(containing: point) else {
-            clearOverlayState()
+            resetInteractionState()
             return
         }
+
+        let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+        let spaceID = currentSpaceID(for: displayID)
+        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+            .filter { id in
+                guard let w = windowsByID[id] else { return false }
+                return !isFloatingWindow(w, context: floatingContext)
+            }
+        guard !orderedIDs.isEmpty else {
+            resetInteractionState()
+            return
+        }
+
         let resizePlanner = activeLayoutPlanner(for: displayID)
         resizePlanner.syncRatiosFromObservedWindows(
-            tiled,
+            orderedWindowIDs: orderedIDs,
+            windowsByID: windowsByID,
             resizingWindowID: resizingWindowID,
-            originalResizingFrame: dragTracker.resizeState?.originalFrame
+            originalResizingFrame: dragTracker.resizeState?.originalFrame,
+            displayID: displayID,
+            spaceID: spaceID
         )
 
-        let plans = resizePlanner.buildReflowPlans(from: tiled)
-        guard
-            let plan = plans.first(where: { $0.displayID == displayID && $0.spaceID == resizingWindow.spaceID })
-                ?? plans.first(where: { $0.displayID == displayID })
-        else {
-            clearOverlayState()
+        guard let plan = resizePlanner.buildPlan(
+            orderedWindowIDs: orderedIDs,
+            windowsByID: windowsByID,
+            displayID: displayID,
+            spaceID: spaceID
+        ) else {
+            resetInteractionState()
             return
         }
 
@@ -517,8 +523,6 @@ final class TilerCoordinator {
     }
 
     private func finishResizeSession(resizeState: DragInteractionTracker.ResizeState, point: CGPoint) {
-        clearOverlayState()
-
         let windows = fetchVisibleWindows()
         guard let resizedWindow = windows.first(where: { $0.windowID == resizeState.windowID }) else {
             return
@@ -528,12 +532,23 @@ final class TilerCoordinator {
             return
         }
 
-        let tiled = tiledWindows(from: windows, floatingContext: floatingContext)
-        let resizePlanner = activeLayoutPlanner(for: resizedWindow.displayID)
+        let displayID = resizedWindow.displayID
+        let spaceID = currentSpaceID(for: displayID)
+        let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+            .filter { id in
+                guard let w = windowsByID[id] else { return false }
+                return !isFloatingWindow(w, context: floatingContext)
+            }
+
+        let resizePlanner = activeLayoutPlanner(for: displayID)
         resizePlanner.syncRatiosFromObservedWindows(
-            tiled,
+            orderedWindowIDs: orderedIDs,
+            windowsByID: windowsByID,
             resizingWindowID: resizeState.windowID,
-            originalResizingFrame: resizeState.originalFrame
+            originalResizingFrame: resizeState.originalFrame,
+            displayID: displayID,
+            spaceID: spaceID
         )
 
         Diagnostics.log(
@@ -543,47 +558,55 @@ final class TilerCoordinator {
         requestFullReflow(reason: "resize-end")
     }
 
-    private func activateDragSession(draggedWindow: WindowRef, point: CGPoint, windows: [WindowRef]? = nil) {
-        let allWindows = windows ?? fetchVisibleWindows()
+    /// ドラッグセッション開始: フレーム取得なし、O(N) リスト検索のみ
+    private func activateDragSession(draggedWindowID: CGWindowID, point: CGPoint, windows: [WindowRef]) {
+        let displayID = DisplayService.displayID(containing: point)
+            ?? windows.first(where: { $0.windowID == draggedWindowID })?.displayID
+        guard let displayID else { return }
+        let spaceID = currentSpaceID(for: displayID)
+
         let floatingContext = liveFloatingContext()
-        let tiled = tiledWindows(
-            from: allWindows,
-            including: [draggedWindow.windowID],
-            floatingContext: floatingContext
+        let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+
+        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+            .filter { id in
+                guard let w = windowsByID[id] else { return false }
+                return !isFloatingWindow(w, context: floatingContext)
+            }
+
+        guard orderedIDs.contains(draggedWindowID) else {
+            Diagnostics.log("Drag windowID=\(draggedWindowID) not in active set; skipping overlay", level: .debug)
+            return
+        }
+
+        let planner = activeLayoutPlanner(for: displayID)
+        let slots = planner.buildSlots(count: orderedIDs.count, displayID: displayID, spaceID: spaceID)
+        guard !slots.isEmpty else { return }
+
+        let plan = DisplayLayoutPlan(
+            displayID: displayID,
+            spaceID: spaceID,
+            slots: slots,
+            orderedWindowIDs: orderedIDs,
+            windowsByID: windowsByID
         )
 
-        cachedWindows = allWindows
-        cachedTiledWindows = tiled
-
-        let dragDisplayID = DisplayService.displayID(containing: point) ?? draggedWindow.displayID
-        let dragPlanner = activeLayoutPlanner(for: dragDisplayID)
-        guard
-            let plan = dragPlanner.buildDragPreviewPlan(
-                at: point,
-                windows: tiled,
-                draggedWindowID: draggedWindow.windowID,
-                preferredSpaceID: draggedWindow.spaceID
-            )
-        else {
-            Diagnostics.log("No windows found for drag session at point=\(point)", level: .warn)
-            clearOverlayState()
-            return
-        }
-
-        let hoverIndex = dragPlanner.slotIndex(at: point, in: plan)
+        let hoverIndex = planner.slotIndex(at: point, in: plan)
         guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
             Diagnostics.log("Failed to update drag state during activation", level: .warn)
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
+        cachedWindows = windows
         activePlan = plan
         lastLoggedHoverIndex = hoverIndex
         tabBar.setDragging(true)
 
         let hoverText = hoverIndex.map(String.init) ?? "nil"
+        let draggedAppName = windowsByID[draggedWindowID]?.appName ?? "?"
         Diagnostics.log(
-            "Drag begin windowID=\(draggedWindow.windowID) app=\(draggedWindow.appName) title=\"\(draggedWindow.title)\" display=\(plan.displayID) slots=\(plan.slots.count) hover=\(hoverText)",
+            "Drag begin windowID=\(draggedWindowID) app=\(draggedAppName) display=\(plan.displayID) slots=\(plan.slots.count) hover=\(hoverText)",
             level: .info
         )
         renderOverlay(dragState: dragState, plan: plan)
@@ -605,7 +628,7 @@ final class TilerCoordinator {
 
         let floatingContext = liveFloatingContext()
         if isFloatingWindow(draggedWindow, context: floatingContext) {
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
@@ -616,23 +639,28 @@ final class TilerCoordinator {
         if let existing = activePlan, currentDisplayID == existing.displayID {
             previewPlan = existing
         } else {
-            let tiled = cachedTiledWindows
-                ?? tiledWindows(
-                    from: windows,
-                    including: [draggedWindowID],
-                    floatingContext: floatingContext
-                )
+            // ディスプレイ変更: 新ディスプレイのセットで plan を再構築
             let updateDisplayID = currentDisplayID ?? draggedWindow.displayID
+            let spaceID = currentSpaceID(for: updateDisplayID)
+            let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+            let orderedIDs = windowSetManager.orderedWindowIDs(on: updateDisplayID, spaceID: spaceID)
+                .filter { id in
+                    guard let w = windowsByID[id] else { return false }
+                    return !isFloatingWindow(w, context: floatingContext)
+                }
+            // ドラッグ中のウィンドウが新ディスプレイのセットにない場合は末尾に仮追加
+            let previewIDs: [CGWindowID] = orderedIDs.contains(draggedWindowID)
+                ? orderedIDs
+                : orderedIDs + [draggedWindowID]
+
             let updatePlanner = activeLayoutPlanner(for: updateDisplayID)
-            guard
-                let newPlan = updatePlanner.buildDragPreviewPlan(
-                    at: point,
-                    windows: tiled,
-                    draggedWindowID: draggedWindowID,
-                    preferredSpaceID: draggedWindow.spaceID
-                )
-            else {
-                clearOverlayState()
+            guard let newPlan = updatePlanner.buildPlan(
+                orderedWindowIDs: previewIDs,
+                windowsByID: windowsByID,
+                displayID: updateDisplayID,
+                spaceID: spaceID
+            ) else {
+                resetInteractionState()
                 return
             }
             previewPlan = newPlan
@@ -641,7 +669,7 @@ final class TilerCoordinator {
         let activeDragPlanner = activeLayoutPlanner(for: previewPlan.displayID)
         let hoverIndex = activeDragPlanner.slotIndex(at: point, in: previewPlan)
         guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
-            clearOverlayState()
+            resetInteractionState()
             return
         }
 
@@ -775,27 +803,47 @@ final class TilerCoordinator {
 
     private func performFullReflow(reason: String) -> Bool {
         let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
-        let floatingState = captureFloatingStateSnapshot()
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
-        guard
-            let context = buildReflowContext(
-                floatingState: floatingState,
-                reason: reason
-            )
-        else {
+
+        guard let windows = discovery.fetchVisibleWindowsReflowSafe() else {
             Diagnostics.log("Reflow (\(reason)) canceled: unresolved window-space mapping", level: .warn)
             return false
         }
-        let windows = context.windows
-        let tiled = context.tiledWindows
-        let plansByDisplay = Dictionary(grouping: tiled, by: \.displayID)
-        var plans: [DisplayLayoutPlan] = []
-        for (displayID, displayWindows) in plansByDisplay {
-            plans += activeLayoutPlanner(for: displayID).buildReflowPlans(from: displayWindows)
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let allIDs = self.discovery.fetchAllWindowIDs()
+            self.pruneFloatingState(to: allIDs)
         }
+
+        syncWindowSets(with: windows)
+
+        let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+        let floatingState = captureFloatingStateSnapshot()
+        let floatingContext = makeFloatingContext(from: floatingState, semanticsClassifier: semanticsClassifier)
+
+        var plans: [DisplayLayoutPlan] = []
+        for displayID in DisplayService.activeDisplayIDs() {
+            let spaceID = currentSpaceID(for: displayID)
+            let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+                .filter { id in
+                    guard let w = windowsByID[id] else { return false }
+                    return !isFloatingWindow(w, context: floatingContext)
+                }
+            guard !orderedIDs.isEmpty else { continue }
+            if let plan = activeLayoutPlanner(for: displayID).buildPlan(
+                orderedWindowIDs: orderedIDs,
+                windowsByID: windowsByID,
+                displayID: displayID,
+                spaceID: spaceID
+            ) {
+                plans.append(plan)
+            }
+        }
+
         guard !plans.isEmpty else {
             Diagnostics.log(
-                "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count), floating=\(windows.count - tiled.count))",
+                "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count))",
                 level: .debug
             )
             return false
@@ -855,164 +903,35 @@ final class TilerCoordinator {
         draggedWindowID: CGWindowID,
         hoverSlotIndex: Int?
     ) -> Bool {
-        let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
-        let floatingState = captureFloatingStateSnapshot()
-        guard
-            let context = buildReflowContext(
-                floatingState: floatingState,
-                including: [draggedWindowID],
-                reason: "drop/window=\(draggedWindowID)"
-            )
-        else {
-            Diagnostics.log(
-                "Drop reflow canceled windowID=\(draggedWindowID): unresolved window-space mapping",
-                level: .warn
-            )
-            return false
+        let windows = discovery.fetchVisibleWindows()
+        let draggedWindow = windows.first { $0.windowID == draggedWindowID }
+        let dropDisplayID = DisplayService.displayID(containing: point) ?? draggedWindow?.displayID
+        guard let dropDisplayID else {
+            return performFullReflow(reason: "drop-fallback:no-display")
         }
-        let windows = context.windows
-        let tiled = context.tiledWindows
+        let dropSpaceID = currentSpaceID(for: dropDisplayID)
 
-        guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
-            Diagnostics.log("Drop fallback: dragged window missing windowID=\(draggedWindowID)", level: .warn)
-            return performFullReflow(reason: "drop-fallback:missing-window")
+        // cross-display drop: 旧ディスプレイのセットから削除し、新ディスプレイの active set に追加
+        if let draggedWindow, draggedWindow.displayID != dropDisplayID {
+            windowSetManager.removeWindowFromAllSets(draggedWindowID)
+            windowSetManager.registerNewWindows([draggedWindowID], on: dropDisplayID, spaceID: dropSpaceID)
+        }
+        if let slot = hoverSlotIndex {
+            windowSetManager.moveWindowToSlot(draggedWindowID, slot: slot, on: dropDisplayID, spaceID: dropSpaceID)
         }
 
-        let dropDisplayID = DisplayService.displayID(containing: point) ?? draggedWindow.displayID
-        let dropPlanner = activeLayoutPlanner(for: dropDisplayID)
-        guard
-            let previewPlan = dropPlanner.buildDragPreviewPlan(
-                at: point,
-                windows: tiled,
-                draggedWindowID: draggedWindowID,
-                preferredSpaceID: draggedWindow.spaceID
-            )
-        else {
-            Diagnostics.log("Drop fallback: failed to build preview plan windowID=\(draggedWindowID)", level: .warn)
-            return performFullReflow(reason: "drop-fallback:preview-plan")
-        }
-
-        let destinationIndex = dropPlanner.slotIndex(at: point, in: previewPlan) ?? hoverSlotIndex
-        guard let destinationIndex else {
-            Diagnostics.log("Drop fallback: no destination slot windowID=\(draggedWindowID)", level: .warn)
-            return performFullReflow(reason: "drop-fallback:destination")
-        }
-
-        let dragState = DragState(
-            draggedWindowID: draggedWindowID,
-            startPoint: point,
-            currentPoint: point,
-            originalFrame: draggedWindow.frame,
-            hoverSlotIndex: hoverSlotIndex
-        )
-
-        guard
-            let drop = dropPlanner.resolveDrop(
-                previewPlan: previewPlan,
-                dragState: dragState,
-                destinationIndex: destinationIndex,
-                allWindows: tiled
-            )
-        else {
-            Diagnostics.log("Drop fallback: resolve failed windowID=\(draggedWindowID)", level: .warn)
-            return performFullReflow(reason: "drop-fallback:resolve")
-        }
-
-        if !drop.shouldApply {
-            Diagnostics.log(
-                "Drop requested with unchanged destination windowID=\(draggedWindowID) destination=\(drop.destinationSlotIndex); applying full layout anyway",
-                level: .debug
-            )
-        }
-
-        let sourceSlotText = drop.sourceSlotIndex.map(String.init) ?? "nil"
-        let targetFrames = targetFramesNeedingApply(
-            targetFrames: drop.targetFrames,
-            windowsByID: drop.windowsByID
-        )
-        guard !targetFrames.isEmpty else {
-            Diagnostics.log(
-                "Drop no-op windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
-                level: .debug
-            )
-            return false
-        }
-
-        let involvedDisplayIDs = displayIDsForTargetFrames(
-            targetFrames,
-            windowsByID: drop.windowsByID
-        )
-        guard displayGenerationsUnchanged(
-            for: involvedDisplayIDs,
-            expectedByDisplay: expectedDisplayGenerationByID,
-            reason: "drop/window=\(draggedWindowID)"
-        ) else {
-            return false
-        }
-
-        Diagnostics.log(
-            "Applying layout from drop windowID=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex) movedWindows=\(targetFrames.count)",
-            level: .info
-        )
-
-        let failures = geometryApplier.applySync(
-            reason: "drop/window=\(draggedWindowID) display=\(drop.displayID) source=\(sourceSlotText) destination=\(drop.destinationSlotIndex)",
-            targetFrames: targetFrames,
-            windowsByID: drop.windowsByID
-        )
-        logApplyResult(failures)
-        return !targetFrames.isEmpty
+        return performFullReflow(reason: "drop")
     }
 
-    private func buildReflowContext(
-        floatingState: FloatingStateSnapshot,
-        including includedWindowIDs: Set<CGWindowID> = [],
-        reason: String
-    ) -> ReflowContext? {
-        guard let windows = discovery.fetchVisibleWindowsReflowSafe() else {
-            Diagnostics.log(
-                "Reflow context rejected reason=\(reason): incomplete space mapping",
-                level: .warn
-            )
-            return nil
-        }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let allIDs = self.discovery.fetchAllWindowIDs()
-            self.pruneFloatingState(to: allIDs)
-        }
-
-        // グループ管理の同期
-        let allLiveIDs = Set(windows.map(\.windowID))
-        groupManager.pruneWindows(to: allLiveIDs)
-        // ディスプレイ×スペースの組み合わせごとにウィンドウを登録
+    /// ウィンドウセットをライブウィンドウと同期（prune + 新規登録 + タブバー更新）
+    private func syncWindowSets(with windows: [WindowRef]) {
+        windowSetManager.pruneWindows(to: Set(windows.map(\.windowID)))
         let byDisplaySpace = Dictionary(grouping: windows) { "\($0.displayID):\($0.spaceID)" }
-        for displaySpaceWindows in byDisplaySpace.values {
-            guard let first = displaySpaceWindows.first else { continue }
-            groupManager.registerNewWindows(
-                displaySpaceWindows.map(\.windowID),
-                on: first.displayID,
-                spaceID: first.spaceID
-            )
+        for group in byDisplaySpace.values {
+            guard let first = group.first else { continue }
+            windowSetManager.registerNewWindows(group.map(\.windowID), on: first.displayID, spaceID: first.spaceID)
         }
-        DispatchQueue.main.async { [weak self] in self?.refreshTabBars() }
-
-        let floatingContext = makeFloatingContext(
-            from: floatingState,
-            semanticsClassifier: semanticsClassifier
-        )
-        let allTiled = tiledWindows(
-            from: windows,
-            including: includedWindowIDs,
-            floatingContext: floatingContext
-        )
-
-        // アクティブグループ以外のウィンドウを除外
-        let groupFiltered = allTiled.filter { w in
-            if includedWindowIDs.contains(w.windowID) { return true }
-            return !groupManager.inactiveWindowIDs(for: w.displayID, spaceID: w.spaceID).contains(w.windowID)
-        }
-        return ReflowContext(windows: windows, tiledWindows: groupFiltered)
+        DispatchQueue.main.async { [weak self, windows] in self?.refreshTabBars(using: windows) }
     }
 
     private func fetchVisibleWindows() -> [WindowRef] {
@@ -1094,11 +1013,8 @@ final class TilerCoordinator {
 
     private func pruneFloatingState(using windows: [WindowRef]) {
         // floating state の prune は全 space のウィンドウを基準にする。
-        // visible windows (on-screen only) だと他 space や最小化ウィンドウが除外され、
-        // floating state が誤って削除される。
         let allIDs = discovery.fetchAllWindowIDs()
         pruneFloatingState(to: allIDs)
-        // semantics cache は visible windows のみで prune する（メモリ効率のため）
         let visibleIDs = Set(windows.map(\.windowID))
         semanticsClassifier.prune(to: visibleIDs)
     }
@@ -1254,21 +1170,6 @@ final class TilerCoordinator {
         }
     }
 
-    private func displayIDsForTargetFrames(
-        _ targetFrames: [CGWindowID: CGRect],
-        windowsByID: [CGWindowID: WindowRef]
-    ) -> Set<CGDirectDisplayID> {
-        var displayIDs = Set<CGDirectDisplayID>()
-        displayIDs.reserveCapacity(targetFrames.count)
-        for windowID in targetFrames.keys {
-            guard let displayID = windowsByID[windowID]?.displayID else {
-                continue
-            }
-            displayIDs.insert(displayID)
-        }
-        return displayIDs
-    }
-
     private func targetFramesNeedingApply(
         targetFrames: [CGWindowID: CGRect],
         windowsByID: [CGWindowID: WindowRef]
@@ -1292,7 +1193,6 @@ final class TilerCoordinator {
         cancelDeferredPendingDragProbe()
         clearOverlayState()
         cachedWindows = nil
-        cachedTiledWindows = nil
         pendingDragCheckpoint = nil
         resizePreviewProjection = nil
         tabBar.setDragging(false)
@@ -1502,16 +1402,16 @@ final class TilerCoordinator {
         }
     }
 
-    // MARK: - Group / Tab Bar helpers
+    // MARK: - Set / Tab Bar helpers
 
     private func activeLayoutPlanner(for displayID: CGDirectDisplayID) -> LayoutPlanner {
         let spaceID = currentSpaceID(for: displayID)
-        guard let groupID = groupManager.activeGroup(for: displayID, spaceID: spaceID)?.id else {
+        guard let setID = windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id else {
             return defaultLayoutPlanner
         }
-        if let planner = layoutPlannerByGroupID[groupID] { return planner }
+        if let planner = layoutPlannerBySetID[setID] { return planner }
         let planner = LayoutPlanner()
-        layoutPlannerByGroupID[groupID] = planner
+        layoutPlannerBySetID[setID] = planner
         return planner
     }
 
@@ -1521,21 +1421,40 @@ final class TilerCoordinator {
         return lastKnownSpaceByDisplayID[displayID] ?? 0
     }
 
-    private func refreshTabBars() {
+    private func refreshTabBars(using windows: [WindowRef]? = nil) {
+        let sourceWindows = windows ?? discovery.fetchVisibleWindows()
+        let titlesByID = Dictionary(
+            sourceWindows.map { ($0.windowID, $0.appName) },
+            uniquingKeysWith: { first, _ in first }
+        )
         for displayID in DisplayService.activeDisplayIDs() {
             let spaceID = currentSpaceID(for: displayID)
+            let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
+            // 複数セット時のみタイリング領域を縮小（タブバーが常時表示になるため）
+            // 単一セット時はタブバーが非表示なので inset 不要
+            DisplayService.additionalTopInsetByDisplay[displayID] = sets.count > 1 ? TabBarWindowController.barHeight : 0
             tabBar.updateTabs(
-                groups: groupManager.groups(for: displayID, spaceID: spaceID),
-                activeGroupID: groupManager.activeGroup(for: displayID, spaceID: spaceID)?.id,
+                sets: sets,
+                activeSetID: windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id,
+                windowTitles: titlesByID,
                 for: displayID
             )
         }
     }
 
     private func raiseGroupWindows(_ windowIDs: Set<CGWindowID>, from allWindows: [WindowRef]) {
-        for window in allWindows where windowIDs.contains(window.windowID) {
+        let targets = allWindows.filter { windowIDs.contains($0.windowID) }
+        // ユニークなPIDのアプリをアクティベート
+        let pids = Set(targets.map(\.pid))
+        for pid in pids {
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                app.activate(options: [])
+            }
+        }
+        // AXRaise で各ウィンドウを最前面に
+        for window in targets {
             if let resolved = axWindowResolver.window(pid: window.pid, windowID: window.windowID) {
-                AXUIElementPerformAction(resolved.element, "AXRaise" as CFString)
+                AXUIElementPerformAction(resolved.element, kAXRaiseAction as CFString)
             }
         }
     }
@@ -1544,26 +1463,26 @@ final class TilerCoordinator {
 // MARK: - TabBarWindowControllerDelegate
 
 extension TilerCoordinator: TabBarWindowControllerDelegate {
-    func tabBar(_ controller: TabBarWindowController, didSelectGroupID id: WindowGroupID, on displayID: CGDirectDisplayID) {
+    func tabBar(_ controller: TabBarWindowController, didSelectSetID id: WindowSetID, on displayID: CGDirectDisplayID) {
         let spaceID = currentSpaceID(for: displayID)
-        groupManager.activateGroup(id: id, for: displayID, spaceID: spaceID)
-        let activeWindowIDs = groupManager.activeGroup(for: displayID, spaceID: spaceID)?.windowIDs ?? []
-        raiseGroupWindows(activeWindowIDs, from: discovery.fetchVisibleWindows())
-        refreshTabBars()
-        requestFullReflow(reason: "group-switch")
+        windowSetManager.activateSet(id: id, for: displayID, spaceID: spaceID)
+        let allWindows = discovery.fetchVisibleWindows()
+        let activeWindowIDs = Set(windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.orderedWindowIDs ?? [])
+        raiseGroupWindows(activeWindowIDs, from: allWindows)
+        refreshTabBars(using: allWindows)
+        requestFullReflow(reason: "set-switch")
     }
 
-    func tabBar(_ controller: TabBarWindowController, didRequestNewGroupOn displayID: CGDirectDisplayID) {
+    func tabBar(_ controller: TabBarWindowController, didRequestNewSetOn displayID: CGDirectDisplayID) {
         let spaceID = currentSpaceID(for: displayID)
-        let name = "Group \(groupManager.groups(for: displayID, spaceID: spaceID).count + 1)"
-        groupManager.createGroup(for: displayID, spaceID: spaceID, name: name)
+        windowSetManager.createSet(for: displayID, spaceID: spaceID)
         refreshTabBars()
     }
 
-    func tabBar(_ controller: TabBarWindowController, didDropWindowID windowID: CGWindowID, ontoGroupID groupID: WindowGroupID, on displayID: CGDirectDisplayID) {
+    func tabBar(_ controller: TabBarWindowController, didDropWindowID windowID: CGWindowID, ontoSetID setID: WindowSetID, on displayID: CGDirectDisplayID) {
         let spaceID = currentSpaceID(for: displayID)
-        groupManager.moveWindow(windowID, toGroup: groupID, on: displayID, spaceID: spaceID)
+        windowSetManager.moveWindowToSet(windowID, toSetID: setID, on: displayID, spaceID: spaceID)
         refreshTabBars()
-        requestFullReflow(reason: "group-drop")
+        requestFullReflow(reason: "set-drop")
     }
 }

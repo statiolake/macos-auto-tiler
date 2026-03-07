@@ -580,6 +580,17 @@ final class TilerCoordinator {
         }
 
         let planner = activeLayoutPlanner(for: displayID)
+        DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.barHeight
+        tabBar.setDragging(true)
+        reflowRemainingWindowsForDragStart(
+            draggedWindowID: draggedWindowID,
+            orderedIDs: orderedIDs,
+            windowsByID: windowsByID,
+            displayID: displayID,
+            spaceID: spaceID,
+            planner: planner
+        )
+
         let slots = planner.buildSlots(count: orderedIDs.count, displayID: displayID, spaceID: spaceID)
         guard !slots.isEmpty else { return }
 
@@ -601,7 +612,6 @@ final class TilerCoordinator {
         cachedWindows = windows
         activePlan = plan
         lastLoggedHoverIndex = hoverIndex
-        tabBar.setDragging(true)
 
         let hoverText = hoverIndex.map(String.init) ?? "nil"
         let draggedAppName = windowsByID[draggedWindowID]?.appName ?? "?"
@@ -610,6 +620,38 @@ final class TilerCoordinator {
             level: .info
         )
         renderOverlay(dragState: dragState, plan: plan)
+    }
+
+    private func reflowRemainingWindowsForDragStart(
+        draggedWindowID: CGWindowID,
+        orderedIDs: [CGWindowID],
+        windowsByID: [CGWindowID: WindowRef],
+        displayID: CGDirectDisplayID,
+        spaceID: Int,
+        planner: LayoutPlanner
+    ) {
+        let remainingIDs = orderedIDs.filter { $0 != draggedWindowID }
+        guard !remainingIDs.isEmpty else { return }
+
+        guard let plan = planner.buildPlan(
+            orderedWindowIDs: remainingIDs,
+            windowsByID: windowsByID,
+            displayID: displayID,
+            spaceID: spaceID
+        ) else { return }
+
+        let targets = targetFramesNeedingApply(
+            targetFrames: plan.targetFrames,
+            windowsByID: plan.windowsByID
+        )
+        guard !targets.isEmpty else { return }
+
+        let failures = geometryApplier.applySync(
+            reason: "drag-begin/display=\(displayID)",
+            targetFrames: targets,
+            windowsByID: plan.windowsByID
+        )
+        logApplyResult(failures)
     }
 
     private func updateActiveDrag(at point: CGPoint) {

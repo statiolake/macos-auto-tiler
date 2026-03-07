@@ -646,7 +646,7 @@ final class TilerCoordinator {
             return
         }
 
-        DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.barHeight
+        DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.reservedTopInset
         tabBar.setDragging(true)
         if let remainingPlan = buildDisplayPlan(
             on: displayID,
@@ -1498,7 +1498,7 @@ final class TilerCoordinator {
             let spaceID = currentSpaceID(for: displayID)
             let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
             DisplayService.additionalTopInsetByDisplay[displayID] =
-                shouldReserveTabBarSpace(forSetCount: sets.count) ? TabBarWindowController.barHeight : 0
+                shouldReserveTabBarSpace(forSetCount: sets.count) ? TabBarWindowController.reservedTopInset : 0
             tabBar.updateTabs(
                 sets: sets,
                 activeSetID: windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id,

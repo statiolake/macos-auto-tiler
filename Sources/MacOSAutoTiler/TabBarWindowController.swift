@@ -9,7 +9,9 @@ protocol TabBarWindowControllerDelegate: AnyObject {
 
 final class TabBarWindowController {
     static let barHeight: CGFloat = 36
-    private static let hMargin: CGFloat = 12
+    static let topGap: CGFloat = 8
+    static let reservedTopInset: CGFloat = barHeight + topGap
+    private static let hMargin: CGFloat = 20
 
     weak var delegate: TabBarWindowControllerDelegate?
 
@@ -153,7 +155,12 @@ final class TabBarWindowController {
         let m = TabBarWindowController.hMargin
         let h = TabBarWindowController.barHeight
         let width = max(1, sf.width - m * 2)
-        return CGRect(x: sf.minX + m, y: vf.maxY - h, width: width, height: h)
+        return CGRect(
+            x: sf.minX + m,
+            y: vf.maxY - h - TabBarWindowController.topGap,
+            width: width,
+            height: h
+        )
     }
 
     private func cocoaPoint(fromQuartzPoint quartzPoint: CGPoint) -> CGPoint {

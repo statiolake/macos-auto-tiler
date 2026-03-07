@@ -1138,6 +1138,7 @@ final class TilerCoordinator {
             guard let self else { return }
             Diagnostics.log("Active space changed", level: .debug)
             self.refreshDisplaySpaceState(reason: "active-space-notification")
+            self.refreshTabBars()
             self.requestFullReflow(reason: "space-change")
         }
     }
@@ -1431,9 +1432,8 @@ final class TilerCoordinator {
         for displayID in DisplayService.activeDisplayIDs() {
             let spaceID = currentSpaceID(for: displayID)
             let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
-            // 複数セット時のみタイリング領域を縮小（タブバーが常時表示になるため）
-            // 単一セット時はタブバーが非表示なので inset 不要
-            DisplayService.additionalTopInsetByDisplay[displayID] = sets.count > 1 ? TabBarWindowController.barHeight : 0
+            DisplayService.additionalTopInsetByDisplay[displayID] =
+                shouldReserveTabBarSpace(forSetCount: sets.count) ? TabBarWindowController.barHeight : 0
             tabBar.updateTabs(
                 sets: sets,
                 activeSetID: windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id,
@@ -1441,6 +1441,10 @@ final class TilerCoordinator {
                 for: displayID
             )
         }
+    }
+
+    private func shouldReserveTabBarSpace(forSetCount setCount: Int) -> Bool {
+        setCount > 1 || dragTracker.isDragging
     }
 
     private func raiseGroupWindows(_ windowIDs: Set<CGWindowID>, from allWindows: [WindowRef]) {

@@ -234,18 +234,18 @@ final class TilerCoordinator {
             if let hit = tabBar.setID(at: point) {
                 let spaceID = currentSpaceID(for: hit.displayID)
                 windowSetManager.moveWindowToSet(draggedWindowID, toSetID: hit.setID, on: hit.displayID, spaceID: spaceID)
+                resetInteractionState()
                 refreshTabBars()
                 requestFullReflow(reason: "set-drop")
-                resetInteractionState()
                 return
             }
             if let displayID = tabBar.isPlusZone(at: point) {
                 let spaceID = currentSpaceID(for: displayID)
                 let newSet = windowSetManager.createSet(for: displayID, spaceID: spaceID)
                 windowSetManager.moveWindowToSet(draggedWindowID, toSetID: newSet.id, on: displayID, spaceID: spaceID)
+                resetInteractionState()
                 refreshTabBars()
                 requestFullReflow(reason: "set-drop-new")
-                resetInteractionState()
                 return
             }
         }

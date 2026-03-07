@@ -483,11 +483,12 @@ final class TilerCoordinator {
 
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
         let spaceID = currentSpaceID(for: displayID)
-        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
-            .filter { id in
-                guard let w = windowsByID[id] else { return false }
-                return !isFloatingWindow(w, context: floatingContext)
-            }
+        let orderedIDs = tiledOrderedWindowIDs(
+            on: displayID,
+            spaceID: spaceID,
+            windowsByID: windowsByID,
+            floatingContext: floatingContext
+        )
         guard !orderedIDs.isEmpty else {
             resetInteractionState()
             return
@@ -535,11 +536,12 @@ final class TilerCoordinator {
         let displayID = resizedWindow.displayID
         let spaceID = currentSpaceID(for: displayID)
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
-        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
-            .filter { id in
-                guard let w = windowsByID[id] else { return false }
-                return !isFloatingWindow(w, context: floatingContext)
-            }
+        let orderedIDs = tiledOrderedWindowIDs(
+            on: displayID,
+            spaceID: spaceID,
+            windowsByID: windowsByID,
+            floatingContext: floatingContext
+        )
 
         let resizePlanner = activeLayoutPlanner(for: displayID)
         resizePlanner.syncRatiosFromObservedWindows(
@@ -558,6 +560,71 @@ final class TilerCoordinator {
         requestFullReflow(reason: "resize-end")
     }
 
+    private func tiledOrderedWindowIDs(
+        on displayID: CGDirectDisplayID,
+        spaceID: Int,
+        windowsByID: [CGWindowID: WindowRef],
+        floatingContext: FloatingEvaluationContext,
+        excluding excludedWindowIDs: Set<CGWindowID> = [],
+        appending appendedWindowID: CGWindowID? = nil
+    ) -> [CGWindowID] {
+        var orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+            .filter { id in
+                guard let window = windowsByID[id] else { return false }
+                guard !excludedWindowIDs.contains(id) else { return false }
+                return !isFloatingWindow(window, context: floatingContext)
+            }
+        if let appendedWindowID,
+           !excludedWindowIDs.contains(appendedWindowID),
+           windowsByID[appendedWindowID] != nil,
+           !orderedIDs.contains(appendedWindowID) {
+            orderedIDs.append(appendedWindowID)
+        }
+        return orderedIDs
+    }
+
+    private func buildDisplayPlan(
+        on displayID: CGDirectDisplayID,
+        spaceID: Int,
+        windowsByID: [CGWindowID: WindowRef],
+        floatingContext: FloatingEvaluationContext,
+        excluding excludedWindowIDs: Set<CGWindowID> = [],
+        appending appendedWindowID: CGWindowID? = nil
+    ) -> DisplayLayoutPlan? {
+        let orderedIDs = tiledOrderedWindowIDs(
+            on: displayID,
+            spaceID: spaceID,
+            windowsByID: windowsByID,
+            floatingContext: floatingContext,
+            excluding: excludedWindowIDs,
+            appending: appendedWindowID
+        )
+        guard !orderedIDs.isEmpty else { return nil }
+        return activeLayoutPlanner(for: displayID).buildPlan(
+            orderedWindowIDs: orderedIDs,
+            windowsByID: windowsByID,
+            displayID: displayID,
+            spaceID: spaceID
+        )
+    }
+
+    @discardableResult
+    private func applyDisplayPlan(_ plan: DisplayLayoutPlan, reason: String) -> Bool {
+        let targets = targetFramesNeedingApply(
+            targetFrames: plan.targetFrames,
+            windowsByID: plan.windowsByID
+        )
+        guard !targets.isEmpty else { return false }
+
+        let failures = geometryApplier.applySync(
+            reason: reason,
+            targetFrames: targets,
+            windowsByID: plan.windowsByID
+        )
+        logApplyResult(failures)
+        return true
+    }
+
     /// ドラッグセッション開始: フレーム取得なし、O(N) リスト検索のみ
     private func activateDragSession(draggedWindowID: CGWindowID, point: CGPoint, windows: [WindowRef]) {
         let displayID = DisplayService.displayID(containing: point)
@@ -567,30 +634,34 @@ final class TilerCoordinator {
 
         let floatingContext = liveFloatingContext()
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
-
-        let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
-            .filter { id in
-                guard let w = windowsByID[id] else { return false }
-                return !isFloatingWindow(w, context: floatingContext)
-            }
+        let orderedIDs = tiledOrderedWindowIDs(
+            on: displayID,
+            spaceID: spaceID,
+            windowsByID: windowsByID,
+            floatingContext: floatingContext
+        )
 
         guard orderedIDs.contains(draggedWindowID) else {
             Diagnostics.log("Drag windowID=\(draggedWindowID) not in active set; skipping overlay", level: .debug)
             return
         }
 
-        let planner = activeLayoutPlanner(for: displayID)
         DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.barHeight
         tabBar.setDragging(true)
-        reflowRemainingWindowsForDragStart(
-            draggedWindowID: draggedWindowID,
-            orderedIDs: orderedIDs,
-            windowsByID: windowsByID,
-            displayID: displayID,
+        if let remainingPlan = buildDisplayPlan(
+            on: displayID,
             spaceID: spaceID,
-            planner: planner
-        )
+            windowsByID: windowsByID,
+            floatingContext: floatingContext,
+            excluding: [draggedWindowID]
+        ) {
+            applyDisplayPlan(
+                remainingPlan,
+                reason: "drag-begin/display=\(displayID)"
+            )
+        }
 
+        let planner = activeLayoutPlanner(for: displayID)
         let slots = planner.buildSlots(count: orderedIDs.count, displayID: displayID, spaceID: spaceID)
         guard !slots.isEmpty else { return }
 
@@ -620,38 +691,6 @@ final class TilerCoordinator {
             level: .info
         )
         renderOverlay(dragState: dragState, plan: plan)
-    }
-
-    private func reflowRemainingWindowsForDragStart(
-        draggedWindowID: CGWindowID,
-        orderedIDs: [CGWindowID],
-        windowsByID: [CGWindowID: WindowRef],
-        displayID: CGDirectDisplayID,
-        spaceID: Int,
-        planner: LayoutPlanner
-    ) {
-        let remainingIDs = orderedIDs.filter { $0 != draggedWindowID }
-        guard !remainingIDs.isEmpty else { return }
-
-        guard let plan = planner.buildPlan(
-            orderedWindowIDs: remainingIDs,
-            windowsByID: windowsByID,
-            displayID: displayID,
-            spaceID: spaceID
-        ) else { return }
-
-        let targets = targetFramesNeedingApply(
-            targetFrames: plan.targetFrames,
-            windowsByID: plan.windowsByID
-        )
-        guard !targets.isEmpty else { return }
-
-        let failures = geometryApplier.applySync(
-            reason: "drag-begin/display=\(displayID)",
-            targetFrames: targets,
-            windowsByID: plan.windowsByID
-        )
-        logApplyResult(failures)
     }
 
     private func updateActiveDrag(at point: CGPoint) {
@@ -685,22 +724,12 @@ final class TilerCoordinator {
             let updateDisplayID = currentDisplayID ?? draggedWindow.displayID
             let spaceID = currentSpaceID(for: updateDisplayID)
             let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
-            let orderedIDs = windowSetManager.orderedWindowIDs(on: updateDisplayID, spaceID: spaceID)
-                .filter { id in
-                    guard let w = windowsByID[id] else { return false }
-                    return !isFloatingWindow(w, context: floatingContext)
-                }
-            // ドラッグ中のウィンドウが新ディスプレイのセットにない場合は末尾に仮追加
-            let previewIDs: [CGWindowID] = orderedIDs.contains(draggedWindowID)
-                ? orderedIDs
-                : orderedIDs + [draggedWindowID]
-
-            let updatePlanner = activeLayoutPlanner(for: updateDisplayID)
-            guard let newPlan = updatePlanner.buildPlan(
-                orderedWindowIDs: previewIDs,
+            guard let newPlan = buildDisplayPlan(
+                on: updateDisplayID,
+                spaceID: spaceID,
                 windowsByID: windowsByID,
-                displayID: updateDisplayID,
-                spaceID: spaceID
+                floatingContext: floatingContext,
+                appending: draggedWindowID
             ) else {
                 resetInteractionState()
                 return
@@ -867,17 +896,11 @@ final class TilerCoordinator {
         var plans: [DisplayLayoutPlan] = []
         for displayID in DisplayService.activeDisplayIDs() {
             let spaceID = currentSpaceID(for: displayID)
-            let orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
-                .filter { id in
-                    guard let w = windowsByID[id] else { return false }
-                    return !isFloatingWindow(w, context: floatingContext)
-                }
-            guard !orderedIDs.isEmpty else { continue }
-            if let plan = activeLayoutPlanner(for: displayID).buildPlan(
-                orderedWindowIDs: orderedIDs,
+            if let plan = buildDisplayPlan(
+                on: displayID,
+                spaceID: spaceID,
                 windowsByID: windowsByID,
-                displayID: displayID,
-                spaceID: spaceID
+                floatingContext: floatingContext
             ) {
                 plans.append(plan)
             }

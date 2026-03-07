@@ -155,13 +155,15 @@ final class WindowSetManager {
         lock.unlock()
     }
 
-    func pruneWindows(to liveIDs: Set<CGWindowID>) {
+    func pruneWindows(to liveIDs: Set<CGWindowID>, on displayID: CGDirectDisplayID, spaceID: Int) {
         lock.lock()
-        for k in storeByKey.keys {
-            for i in storeByKey[k]!.sets.indices {
-                storeByKey[k]!.sets[i].orderedWindowIDs.removeAll { !liveIDs.contains($0) }
+        let k = key(displayID, spaceID)
+        if var store = storeByKey[k] {
+            for i in store.sets.indices {
+                store.sets[i].orderedWindowIDs.removeAll { !liveIDs.contains($0) }
             }
-            cleanupEmptySets(in: &storeByKey[k]!)
+            cleanupEmptySets(in: &store)
+            storeByKey[k] = store
         }
         lock.unlock()
     }

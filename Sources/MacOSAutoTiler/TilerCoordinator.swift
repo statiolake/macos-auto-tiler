@@ -925,11 +925,12 @@ final class TilerCoordinator {
 
     /// ウィンドウセットをライブウィンドウと同期（prune + 新規登録 + タブバー更新）
     private func syncWindowSets(with windows: [WindowRef]) {
-        windowSetManager.pruneWindows(to: Set(windows.map(\.windowID)))
         let byDisplaySpace = Dictionary(grouping: windows) { "\($0.displayID):\($0.spaceID)" }
         for group in byDisplaySpace.values {
             guard let first = group.first else { continue }
-            windowSetManager.registerNewWindows(group.map(\.windowID), on: first.displayID, spaceID: first.spaceID)
+            let liveIDs = Set(group.map(\.windowID))
+            windowSetManager.pruneWindows(to: liveIDs, on: first.displayID, spaceID: first.spaceID)
+            windowSetManager.registerNewWindows(Array(liveIDs), on: first.displayID, spaceID: first.spaceID)
         }
         DispatchQueue.main.async { [weak self, windows] in self?.refreshTabBars(using: windows) }
     }

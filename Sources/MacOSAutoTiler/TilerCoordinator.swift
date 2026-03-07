@@ -100,6 +100,9 @@ final class TilerCoordinator {
             if case let .scrollWheel(deltaY) = eventType {
                 return self?.handleScrollWheel(deltaY: deltaY, at: point) ?? false
             }
+            if case .optionTabPressed = eventType {
+                return self?.handle(eventType, point: point) ?? false
+            }
             DispatchQueue.main.async {
                 self?.handle(eventType, point: point)
             }
@@ -163,20 +166,28 @@ final class TilerCoordinator {
         )
     }
 
-    private func handle(_ eventType: MouseEventType, point: CGPoint) {
+    @discardableResult
+    private func handle(_ eventType: MouseEventType, point: CGPoint) -> Bool {
         switch eventType {
         case .down:
             handleMouseDown(at: point)
+            return false
         case .dragged:
             handleMouseDragged(at: point)
+            return false
         case .up:
             handleMouseUp(at: point)
+            return false
         case .secondaryDown:
             handleSecondaryMouseDown(at: point)
+            return false
         case .optionPressed:
             handleOptionKeyPress(at: point)
+            return false
+        case let .optionTabPressed(reverse):
+            return handleOptionTabPress(at: point, reverse: reverse)
         case .scrollWheel:
-            break // handled synchronously in start() closure
+            return false // handled synchronously in start() closure
         }
     }
 
@@ -278,6 +289,36 @@ final class TilerCoordinator {
 
     private func handleOptionKeyPress(at point: CGPoint) {
         toggleFloatingForActiveDrag(at: point)
+    }
+
+    private func handleOptionTabPress(at point: CGPoint, reverse: Bool) -> Bool {
+        guard !dragTracker.isDragging, !dragTracker.isResizing else {
+            return false
+        }
+
+        let activeDisplayIDs = DisplayService.activeDisplayIDs()
+        guard !activeDisplayIDs.isEmpty else {
+            return false
+        }
+
+        let displayID = DisplayService.displayID(containing: point) ?? activeDisplayIDs[0]
+        let spaceID = currentSpaceID(for: displayID)
+        let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
+        guard sets.count > 1 else {
+            return false
+        }
+
+        let activeSetID = windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id
+        let activeIndex = sets.firstIndex { $0.id == activeSetID } ?? 0
+        let nextIndex: Int
+        if reverse {
+            nextIndex = (activeIndex - 1 + sets.count) % sets.count
+        } else {
+            nextIndex = (activeIndex + 1) % sets.count
+        }
+
+        activateWindowSet(sets[nextIndex].id, on: displayID)
+        return true
     }
 
     private func toggleFloatingForActiveDrag(at point: CGPoint) {
@@ -1512,6 +1553,16 @@ final class TilerCoordinator {
         setCount > 1 || dragTracker.isDragging
     }
 
+    private func activateWindowSet(_ id: WindowSetID, on displayID: CGDirectDisplayID) {
+        let spaceID = currentSpaceID(for: displayID)
+        windowSetManager.activateSet(id: id, for: displayID, spaceID: spaceID)
+        let allWindows = discovery.fetchVisibleWindows()
+        let activeWindowIDs = Set(windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.orderedWindowIDs ?? [])
+        raiseGroupWindows(activeWindowIDs, from: allWindows)
+        refreshTabBars(using: allWindows)
+        requestFullReflow(reason: "set-switch")
+    }
+
     private func raiseGroupWindows(_ windowIDs: Set<CGWindowID>, from allWindows: [WindowRef]) {
         let targets = allWindows.filter { windowIDs.contains($0.windowID) }
         // ユニークなPIDのアプリをアクティベート
@@ -1534,13 +1585,7 @@ final class TilerCoordinator {
 
 extension TilerCoordinator: TabBarWindowControllerDelegate {
     func tabBar(_ controller: TabBarWindowController, didSelectSetID id: WindowSetID, on displayID: CGDirectDisplayID) {
-        let spaceID = currentSpaceID(for: displayID)
-        windowSetManager.activateSet(id: id, for: displayID, spaceID: spaceID)
-        let allWindows = discovery.fetchVisibleWindows()
-        let activeWindowIDs = Set(windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.orderedWindowIDs ?? [])
-        raiseGroupWindows(activeWindowIDs, from: allWindows)
-        refreshTabBars(using: allWindows)
-        requestFullReflow(reason: "set-switch")
+        activateWindowSet(id, on: displayID)
     }
 
     func tabBar(_ controller: TabBarWindowController, didRequestNewSetOn displayID: CGDirectDisplayID) {

@@ -7,10 +7,12 @@ enum MouseEventType {
     case up
     case secondaryDown
     case optionPressed
+    case optionTabPressed(reverse: Bool)
     case scrollWheel(deltaY: Int64)
 }
 
 final class EventTapController {
+    private static let tabKeyCode: CGKeyCode = 48
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var handler: ((MouseEventType, CGPoint) -> Bool)?
@@ -26,6 +28,7 @@ final class EventTapController {
             (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
             (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
             (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) |
+            (CGEventMask(1) << CGEventType.keyDown.rawValue) |
             (CGEventMask(1) << CGEventType.flagsChanged.rawValue) |
             (CGEventMask(1) << CGEventType.scrollWheel.rawValue)
 
@@ -97,6 +100,10 @@ final class EventTapController {
             consumed = handler(.up, point)
         case .rightMouseDown:
             consumed = handler(.secondaryDown, point)
+        case .keyDown:
+            if let shortcutEvent = shortcutEvent(for: event) {
+                consumed = handler(shortcutEvent, point)
+            }
         case .flagsChanged:
             let flags = event.flags
             let becameOptionOnly = isOptionOnlyPressTransition(from: lastFlags, to: flags)
@@ -121,6 +128,31 @@ final class EventTapController {
         }
 
         return consumed ? nil : Unmanaged.passUnretained(event)
+    }
+
+    private func shortcutEvent(for event: CGEvent) -> MouseEventType? {
+        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        guard keyCode == Self.tabKeyCode else {
+            return nil
+        }
+
+        let flags = event.flags
+        guard flags.contains(.maskAlternate) else {
+            return nil
+        }
+
+        let disallowed: CGEventFlags = [
+            .maskControl,
+            .maskCommand,
+            .maskAlphaShift,
+            .maskSecondaryFn,
+            .maskHelp,
+        ]
+        guard flags.intersection(disallowed).isEmpty else {
+            return nil
+        }
+
+        return .optionTabPressed(reverse: flags.contains(.maskShift))
     }
 
     private func isOptionOnlyPressTransition(from previous: CGEventFlags, to current: CGEventFlags) -> Bool {

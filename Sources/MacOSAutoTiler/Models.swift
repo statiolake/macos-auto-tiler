@@ -9,8 +9,9 @@ struct WindowRef {
     let appName: String
     let bundleID: String?
     let spaceID: Int
+    let isTilable: Bool
 
-    func with(frame: CGRect, displayID: CGDirectDisplayID? = nil) -> WindowRef {
+    func with(frame: CGRect, displayID: CGDirectDisplayID? = nil, isTilable: Bool? = nil) -> WindowRef {
         WindowRef(
             windowID: windowID,
             pid: pid,
@@ -19,8 +20,13 @@ struct WindowRef {
             title: title,
             appName: appName,
             bundleID: bundleID,
-            spaceID: spaceID
+            spaceID: spaceID,
+            isTilable: isTilable ?? self.isTilable
         )
+    }
+
+    func with(isTilable: Bool) -> WindowRef {
+        with(frame: frame, isTilable: isTilable)
     }
 }
 

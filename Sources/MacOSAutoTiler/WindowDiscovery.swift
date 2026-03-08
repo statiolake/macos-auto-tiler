@@ -4,9 +4,10 @@ import Foundation
 
 final class WindowDiscovery {
     private struct OwnerProcessInfo {
-        let isManageable: Bool
+        let isEligible: Bool
         let appName: String
         let bundleID: String?
+        let isTilable: Bool
     }
 
     private let ruleStore: WindowRuleStore
@@ -104,7 +105,7 @@ final class WindowDiscovery {
                 ownerInfoByPID[pid] = computed
                 ownerInfo = computed
             }
-            guard ownerInfo.isManageable else {
+            guard ownerInfo.isEligible else {
                 continue
             }
 
@@ -132,7 +133,8 @@ final class WindowDiscovery {
                     title: title,
                     appName: ownerInfo.appName,
                     bundleID: ownerInfo.bundleID,
-                    spaceID: resolvedSpaceID
+                    spaceID: resolvedSpaceID,
+                    isTilable: ownerInfo.isTilable
                 )
             )
         }
@@ -254,9 +256,10 @@ final class WindowDiscovery {
         guard let app = NSRunningApplication(processIdentifier: pid) else {
             // Keep unknown processes eligible to avoid false negatives for legitimate apps.
             return OwnerProcessInfo(
-                isManageable: true,
+                isEligible: true,
                 appName: fallbackOwnerName ?? "Unknown",
-                bundleID: nil
+                bundleID: nil,
+                isTilable: false
             )
         }
 
@@ -265,24 +268,27 @@ final class WindowDiscovery {
 
         if ruleStore.isBundleExcluded(bundleID) {
             return OwnerProcessInfo(
-                isManageable: false,
+                isEligible: false,
                 appName: appName,
-                bundleID: bundleID
+                bundleID: bundleID,
+                isTilable: app.activationPolicy == .regular
             )
         }
 
         guard app.isFinishedLaunching else {
             return OwnerProcessInfo(
-                isManageable: false,
+                isEligible: false,
                 appName: appName,
-                bundleID: bundleID
+                bundleID: bundleID,
+                isTilable: app.activationPolicy == .regular
             )
         }
 
         return OwnerProcessInfo(
-            isManageable: app.activationPolicy == .regular,
+            isEligible: true,
             appName: appName,
-            bundleID: bundleID
+            bundleID: bundleID,
+            isTilable: app.activationPolicy == .regular
         )
     }
 }

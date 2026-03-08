@@ -8,6 +8,7 @@ final class TilerCoordinator {
     private let defaultLayoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
     private let windowSetManager = WindowSetManager()
+    private let windowFocusController = PrivateWindowFocusController()
     private let tabBar = TabBarWindowController()
     private var layoutPlannerBySetID: [WindowSetID: LayoutPlanner] = [:]
     private let eventTap = EventTapController()
@@ -37,8 +38,7 @@ final class TilerCoordinator {
     private var pendingDragDeferredProbeWorkItem: DispatchWorkItem?
     private var resizePreviewProjection: ResizePreviewProjection?
 
-    private var userFloatingWindowIDs = Set<CGWindowID>()
-    private var userTiledWindowIDs = Set<CGWindowID>()
+    private var explicitFloatingWindowIDs = Set<CGWindowID>()
     private var lastSpaceSwitchTime: Date = .distantPast
     private let reflowState = ReflowRequestState()
     private var reflowWorkerTask: Task<Void, Never>?
@@ -53,11 +53,11 @@ final class TilerCoordinator {
     private let minimumProjectedWindowExtent: CGFloat = 80
     private let spaceSwitchCooldown: TimeInterval = 0.3
     private let frameEpsilon: CGFloat = 1.0
+    private let windowRaiseDelay: TimeInterval = 0.01
+    private let setSwitchReasonPrefix = "set-switch/display="
 
     private struct FloatingStateSnapshot {
-        let userFloatingWindowIDs: Set<CGWindowID>
-        let userTiledWindowIDs: Set<CGWindowID>
-        let ruleSnapshot: WindowRuleSnapshot
+        let explicitFloatingWindowIDs: Set<CGWindowID>
     }
 
     private struct PendingDragCheckpoint {
@@ -86,10 +86,13 @@ final class TilerCoordinator {
     }
 
     private struct FloatingEvaluationContext {
-        let userFloatingWindowIDs: Set<CGWindowID>
-        let userTiledWindowIDs: Set<CGWindowID>
-        let ruleSnapshot: WindowRuleSnapshot
-        let semanticsClassifier: WindowSemanticsClassifier
+        let explicitFloatingWindowIDs: Set<CGWindowID>
+    }
+
+    private enum FloatingDisposition {
+        case tiled
+        case explicitFloating
+        case automaticFloating
     }
 
     func start() {
@@ -322,28 +325,70 @@ final class TilerCoordinator {
     }
 
     private func toggleFloatingForActiveDrag(at point: CGPoint) {
-        guard let draggedWindowID = dragTracker.draggedWindowID else {
-            return
-        }
-
         let windows = fetchVisibleWindows()
-        guard let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) else {
+        guard let targetWindow = floatingToggleTargetWindow(at: point, windows: windows) else {
             return
         }
 
         let floatingContext = liveFloatingContext()
-        if isFloatingWindow(draggedWindow, context: floatingContext) {
-            userFloatingWindowIDs.remove(draggedWindowID)
-            userTiledWindowIDs.insert(draggedWindowID)
-            Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> tiled", level: .info)
-            activateDragSession(draggedWindowID: draggedWindowID, point: point, windows: windows)
-        } else {
-            userTiledWindowIDs.remove(draggedWindowID)
-            userFloatingWindowIDs.insert(draggedWindowID)
-            Diagnostics.log("Floating toggle windowID=\(draggedWindowID) -> floating", level: .info)
+        switch floatingDisposition(of: targetWindow, context: floatingContext) {
+        case .explicitFloating:
+            explicitFloatingWindowIDs.remove(targetWindow.windowID)
+            Diagnostics.log("Floating toggle windowID=\(targetWindow.windowID) -> tiled", level: .info)
+            if continueDragAfterSinking(window: targetWindow, point: point, windows: windows) {
+                return
+            }
+            resetInteractionState()
+            requestFullReflow(reason: "floating-toggle")
+        case .automaticFloating:
+            Diagnostics.log(
+                "Floating toggle ignored for automatic floating windowID=\(targetWindow.windowID)",
+                level: .debug
+            )
+        case .tiled:
+            explicitFloatingWindowIDs.insert(targetWindow.windowID)
+            Diagnostics.log("Floating toggle windowID=\(targetWindow.windowID) -> floating", level: .info)
             resetInteractionState()
             requestFullReflow(reason: "floating-toggle")
         }
+    }
+
+    private func floatingToggleTargetWindow(at point: CGPoint, windows: [WindowRef]) -> WindowRef? {
+        if let draggedWindowID = dragTracker.draggedWindowID,
+           let draggedWindow = windows.first(where: { $0.windowID == draggedWindowID }) {
+            return draggedWindow
+        }
+
+        if let resizingWindowID = dragTracker.resizingWindowID,
+           let resizingWindow = windows.first(where: { $0.windowID == resizingWindowID }) {
+            return resizingWindow
+        }
+
+        for pendingWindowID in dragTracker.pendingWindowIDs {
+            if let pendingWindow = windows.first(where: { $0.windowID == pendingWindowID }) {
+                return pendingWindow
+            }
+        }
+
+        return windowsAtInteractionPoint(point, windows: windows).first
+    }
+
+    private func continueDragAfterSinking(window: WindowRef, point: CGPoint, windows: [WindowRef]) -> Bool {
+        let isInteractionInFlight =
+            dragTracker.draggedWindowID == window.windowID ||
+            dragTracker.resizingWindowID == window.windowID ||
+            dragTracker.pendingWindowIDs.contains(window.windowID)
+
+        guard isInteractionInFlight else {
+            return false
+        }
+
+        cancelDeferredPendingDragProbe()
+        pendingDragCheckpoint = nil
+        resizePreviewProjection = nil
+        dragTracker.beginDrag(windowID: window.windowID, point: point, originalFrame: window.frame)
+        activateDragSession(draggedWindowID: window.windowID, point: point, windows: windows)
+        return activePlan != nil
     }
 
     private func maybeActivateDrag(at point: CGPoint) {
@@ -465,8 +510,7 @@ final class TilerCoordinator {
 
         let floatingContext = liveFloatingContext()
         if isFloatingWindow(latestWindow, context: floatingContext) {
-            Diagnostics.log("Dragging floating windowID=\(latestWindow.windowID) (tiler preview disabled)", level: .debug)
-            resetInteractionState()
+            beginFloatingDragSession(window: latestWindow, windows: windows)
             return
         }
 
@@ -750,7 +794,7 @@ final class TilerCoordinator {
 
         let floatingContext = liveFloatingContext()
         if isFloatingWindow(draggedWindow, context: floatingContext) {
-            resetInteractionState()
+            clearOverlayState()
             return
         }
 
@@ -809,6 +853,13 @@ final class TilerCoordinator {
         if hoverChanged || displayChanged {
             renderOverlay(dragState: dragState, plan: previewPlan)
         }
+    }
+
+    private func beginFloatingDragSession(window: WindowRef, windows: [WindowRef]) {
+        cachedWindows = windows
+        clearOverlayState()
+        refreshTabBars(using: windows)
+        Diagnostics.log("Dragging floating windowID=\(window.windowID) (tiler preview disabled)", level: .debug)
     }
 
     private func renderOverlay(dragState: DragState, plan: DisplayLayoutPlan) {
@@ -888,7 +939,7 @@ final class TilerCoordinator {
                 return false
             }
 
-            let windows = discovery.fetchVisibleWindows()
+            let windows = fetchVisibleWindows()
             let signature = spaceSnapshotSignature(for: windows)
 
             if let last = lastSignature, last == signature {
@@ -917,10 +968,11 @@ final class TilerCoordinator {
         let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
 
-        guard let windows = discovery.fetchVisibleWindowsReflowSafe() else {
+        guard let discoveredWindows = discovery.fetchVisibleWindowsReflowSafe() else {
             Diagnostics.log("Reflow (\(reason)) canceled: unresolved window-space mapping", level: .warn)
             return false
         }
+        let windows = prepareWindowsForInteraction(discoveredWindows)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -932,7 +984,7 @@ final class TilerCoordinator {
 
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
         let floatingState = captureFloatingStateSnapshot()
-        let floatingContext = makeFloatingContext(from: floatingState, semanticsClassifier: semanticsClassifier)
+        let floatingContext = makeFloatingContext(from: floatingState)
 
         var plans: [DisplayLayoutPlan] = []
         for displayID in DisplayService.activeDisplayIDs() {
@@ -948,6 +1000,9 @@ final class TilerCoordinator {
         }
 
         guard !plans.isEmpty else {
+            if let displayID = setSwitchDisplayID(for: reason) {
+                raiseActiveSetWindows(on: displayID, from: windows)
+            }
             Diagnostics.log(
                 "Reflow (\(reason)) skipped: no tile candidates (visible=\(windows.count))",
                 level: .debug
@@ -1001,6 +1056,10 @@ final class TilerCoordinator {
         } else {
             Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
         }
+
+        if let displayID = setSwitchDisplayID(for: reason) {
+            raiseActiveSetWindows(on: displayID, from: windows)
+        }
         return totalTargets > 0
     }
 
@@ -1009,7 +1068,7 @@ final class TilerCoordinator {
         draggedWindowID: CGWindowID,
         hoverSlotIndex: Int?
     ) -> Bool {
-        let windows = discovery.fetchVisibleWindows()
+        let windows = fetchVisibleWindows()
         let draggedWindow = windows.first { $0.windowID == draggedWindowID }
         let dropDisplayID = DisplayService.displayID(containing: point) ?? draggedWindow?.displayID
         guard let dropDisplayID else {
@@ -1042,7 +1101,7 @@ final class TilerCoordinator {
     }
 
     private func fetchVisibleWindows() -> [WindowRef] {
-        let windows = discovery.fetchVisibleWindows()
+        let windows = prepareWindowsForInteraction(discovery.fetchVisibleWindows())
         pruneFloatingState(using: windows)
         for window in windows {
             let semantics = semanticsClassifier.semantics(for: window)
@@ -1055,23 +1114,29 @@ final class TilerCoordinator {
         return windows
     }
 
+    private func prepareWindowsForInteraction(_ windows: [WindowRef]) -> [WindowRef] {
+        let ruleSnapshot = ruleStore.snapshot()
+        return windows.map { window in
+            let semantics = semanticsClassifier.semantics(for: window)
+            let isAutomaticallyFloating =
+                !window.isTilable ||
+                ruleSnapshot.isBundleExcluded(window.bundleID) ||
+                ruleSnapshot.isAppForcedFloating(window.appName) ||
+                ruleSnapshot.isTypeForcedFloating(semantics.descriptor) ||
+                semantics.isSpecialFloating
+            return window.with(isTilable: !isAutomaticallyFloating)
+        }
+    }
+
     private func captureFloatingStateSnapshot() -> FloatingStateSnapshot {
         FloatingStateSnapshot(
-            userFloatingWindowIDs: userFloatingWindowIDs,
-            userTiledWindowIDs: userTiledWindowIDs,
-            ruleSnapshot: ruleStore.snapshot()
+            explicitFloatingWindowIDs: explicitFloatingWindowIDs
         )
     }
 
-    private func makeFloatingContext(
-        from snapshot: FloatingStateSnapshot,
-        semanticsClassifier: WindowSemanticsClassifier
-    ) -> FloatingEvaluationContext {
+    private func makeFloatingContext(from snapshot: FloatingStateSnapshot) -> FloatingEvaluationContext {
         FloatingEvaluationContext(
-            userFloatingWindowIDs: snapshot.userFloatingWindowIDs,
-            userTiledWindowIDs: snapshot.userTiledWindowIDs,
-            ruleSnapshot: snapshot.ruleSnapshot,
-            semanticsClassifier: semanticsClassifier
+            explicitFloatingWindowIDs: snapshot.explicitFloatingWindowIDs
         )
     }
 
@@ -1091,31 +1156,22 @@ final class TilerCoordinator {
 
     private func liveFloatingContext() -> FloatingEvaluationContext {
         FloatingEvaluationContext(
-            userFloatingWindowIDs: userFloatingWindowIDs,
-            userTiledWindowIDs: userTiledWindowIDs,
-            ruleSnapshot: ruleStore.snapshot(),
-            semanticsClassifier: semanticsClassifier
+            explicitFloatingWindowIDs: explicitFloatingWindowIDs
         )
     }
 
     private func isFloatingWindow(_ window: WindowRef, context: FloatingEvaluationContext) -> Bool {
-        if context.userFloatingWindowIDs.contains(window.windowID) {
-            return true
+        context.explicitFloatingWindowIDs.contains(window.windowID) || !window.isTilable
+    }
+
+    private func floatingDisposition(of window: WindowRef, context: FloatingEvaluationContext) -> FloatingDisposition {
+        if context.explicitFloatingWindowIDs.contains(window.windowID) {
+            return .explicitFloating
         }
-        if context.userTiledWindowIDs.contains(window.windowID) {
-            return false
+        if !window.isTilable {
+            return .automaticFloating
         }
-        if context.ruleSnapshot.isBundleExcluded(window.bundleID) {
-            return true
-        }
-        if context.ruleSnapshot.isAppForcedFloating(window.appName) {
-            return true
-        }
-        let semantics = context.semanticsClassifier.semantics(for: window)
-        if context.ruleSnapshot.isTypeForcedFloating(semantics.descriptor) {
-            return true
-        }
-        return semantics.isSpecialFloating
+        return .tiled
     }
 
     private func pruneFloatingState(using windows: [WindowRef]) {
@@ -1127,8 +1183,7 @@ final class TilerCoordinator {
     }
 
     private func pruneFloatingState(to liveIDs: Set<CGWindowID>) {
-        userFloatingWindowIDs.formIntersection(liveIDs)
-        userTiledWindowIDs.formIntersection(liveIDs)
+        explicitFloatingWindowIDs.formIntersection(liveIDs)
     }
 
     private func refreshDisplaySpaceState(reason: String) {
@@ -1530,7 +1585,7 @@ final class TilerCoordinator {
     }
 
     private func refreshTabBars(using windows: [WindowRef]? = nil) {
-        let sourceWindows = windows ?? discovery.fetchVisibleWindows()
+        let sourceWindows = windows ?? fetchVisibleWindows()
         let titlesByID = Dictionary(
             sourceWindows.map { ($0.windowID, $0.appName) },
             uniquingKeysWith: { first, _ in first }
@@ -1556,26 +1611,73 @@ final class TilerCoordinator {
     private func activateWindowSet(_ id: WindowSetID, on displayID: CGDirectDisplayID) {
         let spaceID = currentSpaceID(for: displayID)
         windowSetManager.activateSet(id: id, for: displayID, spaceID: spaceID)
-        let allWindows = discovery.fetchVisibleWindows()
-        let activeWindowIDs = Set(windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.orderedWindowIDs ?? [])
-        raiseGroupWindows(activeWindowIDs, from: allWindows)
+        let allWindows = fetchVisibleWindows()
         refreshTabBars(using: allWindows)
-        requestFullReflow(reason: "set-switch")
+        requestFullReflow(reason: setSwitchReason(for: displayID))
     }
 
-    private func raiseGroupWindows(_ windowIDs: Set<CGWindowID>, from allWindows: [WindowRef]) {
-        let targets = allWindows.filter { windowIDs.contains($0.windowID) }
-        // ユニークなPIDのアプリをアクティベート
-        let pids = Set(targets.map(\.pid))
-        for pid in pids {
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                app.activate(options: [])
-            }
+    private func setSwitchReason(for displayID: CGDirectDisplayID) -> String {
+        "\(setSwitchReasonPrefix)\(displayID)"
+    }
+
+    private func setSwitchDisplayID(for reason: String) -> CGDirectDisplayID? {
+        guard reason.hasPrefix(setSwitchReasonPrefix) else {
+            return nil
         }
-        // AXRaise で各ウィンドウを最前面に
-        for window in targets {
+        let rawValue = reason.dropFirst(setSwitchReasonPrefix.count)
+        guard let parsed = UInt32(rawValue) else {
+            return nil
+        }
+        return CGDirectDisplayID(parsed)
+    }
+
+    private func raiseActiveSetWindows(on displayID: CGDirectDisplayID, from allWindows: [WindowRef]) {
+        let spaceID = currentSpaceID(for: displayID)
+        let activeWindowIDs = windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.orderedWindowIDs ?? []
+        raiseGroupWindows(activeWindowIDs, from: allWindows)
+    }
+
+    private func raiseGroupWindows(_ windowIDs: [CGWindowID], from allWindows: [WindowRef]) {
+        let windowsByID = Dictionary(uniqueKeysWithValues: allWindows.map { ($0.windowID, $0) })
+        let floatingContext = liveFloatingContext()
+        let orderedTargets = windowIDs.compactMap { windowsByID[$0] }
+        let tiledTargets = orderedTargets.filter { !isFloatingWindow($0, context: floatingContext) }
+        let floatingTargets = orderedTargets.filter { isFloatingWindow($0, context: floatingContext) }
+        let targets = tiledTargets + floatingTargets
+
+        guard !targets.isEmpty else {
+            Diagnostics.log("Raise skipped: no matching windows in active set", level: .debug)
+            return
+        }
+
+        let orderedDescription = orderedTargets.map { window in
+            "id=\(window.windowID) app=\(window.appName) tilable=\(window.isTilable)"
+        }.joined(separator: " | ")
+        let raiseDescription = targets.map { window in
+            let kind = isFloatingWindow(window, context: floatingContext) ? "floating" : "tiled"
+            return "id=\(window.windowID) app=\(window.appName) kind=\(kind)"
+        }.joined(separator: " | ")
+        Diagnostics.log("Raise active set ordered=[\(orderedDescription)]", level: .debug)
+        Diagnostics.log("Raise execution order=[\(raiseDescription)]", level: .debug)
+
+        // AXRaise で各ウィンドウを前面順に並べる
+        for (index, window) in targets.enumerated() {
             if let resolved = axWindowResolver.window(pid: window.pid, windowID: window.windowID) {
-                AXUIElementPerformAction(resolved.element, kAXRaiseAction as CFString)
+                let isFloating = isFloatingWindow(window, context: floatingContext)
+                _ = windowFocusController.focus(
+                    windowID: window.windowID,
+                    pid: window.pid,
+                    axElement: resolved.element,
+                    isFloating: isFloating
+                )
+            } else {
+                Diagnostics.log(
+                    "AXRaise skipped unresolved windowID=\(window.windowID) app=\(window.appName) pid=\(window.pid)",
+                    level: .warn
+                )
+            }
+            if index < targets.count - 1 {
+                Thread.sleep(forTimeInterval: windowRaiseDelay)
             }
         }
     }

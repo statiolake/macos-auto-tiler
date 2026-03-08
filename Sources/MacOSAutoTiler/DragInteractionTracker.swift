@@ -178,6 +178,18 @@ final class DragInteractionTracker {
         return dragState
     }
 
+    func beginDrag(windowID: CGWindowID, point: CGPoint, originalFrame: CGRect) {
+        state = .dragging(
+            DragState(
+                draggedWindowID: windowID,
+                startPoint: point,
+                currentPoint: point,
+                originalFrame: originalFrame,
+                hoverSlotIndex: nil
+            )
+        )
+    }
+
     func finishDrag(point: CGPoint, fallbackHoverSlotIndex: Int?) -> DragState? {
         guard case var .dragging(dragState) = state else {
             return nil

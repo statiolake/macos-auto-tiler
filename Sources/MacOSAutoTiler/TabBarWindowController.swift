@@ -8,6 +8,14 @@ protocol TabBarWindowControllerDelegate: AnyObject {
 }
 
 final class TabBarWindowController {
+    struct Presentation {
+        let sets: [WindowSet]
+        let activeSetID: WindowSetID?
+        let windowTitles: [CGWindowID: String]
+        let isDragging: Bool
+        let shouldShow: Bool
+    }
+
     static let barHeight: CGFloat = 36
     static let topGap: CGFloat = 8
     static let reservedTopInset: CGFloat = barHeight + topGap
@@ -19,7 +27,6 @@ final class TabBarWindowController {
     private var viewsByDisplayID: [CGDirectDisplayID: TabBarView] = [:]
     private var visibleByDisplayID: [CGDirectDisplayID: Bool] = [:]
     private var animatingByDisplayID: [CGDirectDisplayID: Bool] = [:]
-    private var isDragging = false
 
     func setupWindows(for displayIDs: [CGDirectDisplayID]) {
         for displayID in displayIDs where windowsByDisplayID[displayID] == nil {
@@ -27,30 +34,19 @@ final class TabBarWindowController {
         }
     }
 
-    func updateTabs(sets: [WindowSet], activeSetID: WindowSetID?, windowTitles: [CGWindowID: String], for displayID: CGDirectDisplayID) {
+    func render(_ presentation: Presentation, for displayID: CGDirectDisplayID) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if self.viewsByDisplayID[displayID] == nil {
                 self.createWindow(for: displayID)
             }
             guard let view = self.viewsByDisplayID[displayID] else { return }
-            view.windowSets = sets
-            view.activeSetID = activeSetID
-            view.windowTitlesByID = windowTitles
+            view.windowSets = presentation.sets
+            view.activeSetID = presentation.activeSetID
+            view.windowTitlesByID = presentation.windowTitles
+            view.isDragging = presentation.isDragging
             view.needsDisplay = true
-            self.animateVisibilityIfNeeded(for: displayID)
-        }
-    }
-
-    func setDragging(_ isDragging: Bool) {
-        self.isDragging = isDragging
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            for (displayID, view) in self.viewsByDisplayID {
-                view.isDragging = isDragging
-                view.needsDisplay = true
-                self.animateVisibilityIfNeeded(for: displayID)
-            }
+            self.animateVisibilityIfNeeded(for: displayID, shouldShow: presentation.shouldShow)
         }
     }
 
@@ -93,12 +89,10 @@ final class TabBarWindowController {
         }
     }
 
-    private func animateVisibilityIfNeeded(for displayID: CGDirectDisplayID) {
-        guard let view = viewsByDisplayID[displayID],
-              let window = windowsByDisplayID[displayID],
+    private func animateVisibilityIfNeeded(for displayID: CGDirectDisplayID, shouldShow: Bool) {
+        guard let window = windowsByDisplayID[displayID],
               let shown = shownFrame(for: displayID) else { return }
 
-        let shouldShow = view.windowSets.count > 1 || isDragging
         let wasShown = visibleByDisplayID[displayID] ?? false
         guard shouldShow != wasShown else {
             if animatingByDisplayID[displayID] == true {
@@ -136,7 +130,8 @@ final class TabBarWindowController {
             guard let self, let window else { return }
             self.animatingByDisplayID[displayID] = false
             guard self.visibleByDisplayID[displayID] == shouldShow else {
-                self.animateVisibilityIfNeeded(for: displayID)
+                let targetVisibility = self.visibleByDisplayID[displayID] ?? false
+                self.animateVisibilityIfNeeded(for: displayID, shouldShow: targetVisibility)
                 return
             }
             if shouldShow {

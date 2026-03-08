@@ -90,6 +90,11 @@ final class TilerCoordinator {
         let explicitFloatingWindowIDs: Set<CGWindowID>
     }
 
+    private struct TabBarDisplayState {
+        let presentation: TabBarWindowController.Presentation
+        let reservedTopInset: CGFloat
+    }
+
     private enum FloatingDisposition {
         case tiled
         case explicitFloating
@@ -735,8 +740,7 @@ final class TilerCoordinator {
             return
         }
 
-        DisplayService.additionalTopInsetByDisplay[displayID] = TabBarWindowController.reservedTopInset
-        tabBar.setDragging(true)
+        refreshTabBars(using: windows)
         if let remainingPlan = buildDisplayPlan(
             on: displayID,
             spaceID: spaceID,
@@ -1371,7 +1375,7 @@ final class TilerCoordinator {
         cachedWindows = nil
         pendingDragCheckpoint = nil
         resizePreviewProjection = nil
-        tabBar.setDragging(false)
+        refreshTabBars()
     }
 
     private func logApplyResult(_ failures: [CGWindowID]) {
@@ -1597,6 +1601,31 @@ final class TilerCoordinator {
         return lastKnownSpaceByDisplayID[displayID] ?? 0
     }
 
+    private func isTabBarInteractionActive() -> Bool {
+        dragTracker.isDragging
+    }
+
+    private func tabBarDisplayState(
+        for displayID: CGDirectDisplayID,
+        titlesByID: [CGWindowID: String]
+    ) -> TabBarDisplayState {
+        let spaceID = currentSpaceID(for: displayID)
+        let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
+        let isDragging = isTabBarInteractionActive()
+        let shouldShowBar = sets.count > 1 || isDragging
+
+        return TabBarDisplayState(
+            presentation: TabBarWindowController.Presentation(
+                sets: sets,
+                activeSetID: windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id,
+                windowTitles: titlesByID,
+                isDragging: isDragging,
+                shouldShow: shouldShowBar
+            ),
+            reservedTopInset: shouldShowBar ? TabBarWindowController.reservedTopInset : 0
+        )
+    }
+
     private func refreshTabBars(using windows: [WindowRef]? = nil) {
         let sourceWindows = windows ?? fetchVisibleWindows()
         let titlesByID = Dictionary(
@@ -1604,21 +1633,10 @@ final class TilerCoordinator {
             uniquingKeysWith: { first, _ in first }
         )
         for displayID in DisplayService.activeDisplayIDs() {
-            let spaceID = currentSpaceID(for: displayID)
-            let sets = windowSetManager.sets(for: displayID, spaceID: spaceID)
-            DisplayService.additionalTopInsetByDisplay[displayID] =
-                shouldReserveTabBarSpace(forSetCount: sets.count) ? TabBarWindowController.reservedTopInset : 0
-            tabBar.updateTabs(
-                sets: sets,
-                activeSetID: windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id,
-                windowTitles: titlesByID,
-                for: displayID
-            )
+            let state = tabBarDisplayState(for: displayID, titlesByID: titlesByID)
+            DisplayService.additionalTopInsetByDisplay[displayID] = state.reservedTopInset
+            tabBar.render(state.presentation, for: displayID)
         }
-    }
-
-    private func shouldReserveTabBarSpace(forSetCount setCount: Int) -> Bool {
-        setCount > 1 || dragTracker.isDragging
     }
 
     private func activateWindowSet(_ id: WindowSetID, on displayID: CGDirectDisplayID) {

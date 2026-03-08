@@ -55,6 +55,7 @@ final class TilerCoordinator {
     private let frameEpsilon: CGFloat = 1.0
     private let windowRaiseDelay: TimeInterval = 0.01
     private let setSwitchReasonPrefix = "set-switch/display="
+    private let spaceChangeReason = "space-change"
 
     private struct FloatingStateSnapshot {
         let explicitFloatingWindowIDs: Set<CGWindowID>
@@ -906,7 +907,16 @@ final class TilerCoordinator {
                     && self.dragTracker.pendingWindowIDs.isEmpty
             }
 
-            let isStable = await isReflowStable()
+            let requiresStableSpaceSnapshot: Bool = {
+                switch request {
+                case let .full(full):
+                    return full.reason == spaceChangeReason
+                case .drop:
+                    return false
+                }
+            }()
+
+            let isStable = requiresStableSpaceSnapshot ? await isReflowStable() : true
 
             if !isIdle || !isStable {
                 // Conditions not met - re-enqueue and retry.

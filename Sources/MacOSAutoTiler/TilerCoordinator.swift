@@ -30,12 +30,14 @@ final class TilerCoordinator {
     }
 
     private var activeSpaceObserver: NSObjectProtocol?
+    private var appActivationObserver: NSObjectProtocol?
     private var activePlan: DisplayLayoutPlan?
     private var lastLoggedHoverIndex: Int?
     private var cachedWindows: [WindowRef]?
     private var pendingDragCheckpoint: PendingDragCheckpoint?
     private var pendingDragDeferredProbeWorkItem: DispatchWorkItem?
     private var resizePreviewProjection: ResizePreviewProjection?
+    private var lastSyncedFocusedWindowID: CGWindowID?
 
     private var explicitFloatingWindowIDs = Set<CGWindowID>()
     private var lastSpaceSwitchTime: Date = .distantPast
@@ -53,7 +55,6 @@ final class TilerCoordinator {
     private let spaceSwitchCooldown: TimeInterval = 0.3
     private let frameEpsilon: CGFloat = 1.0
     private let windowRaiseDelay: TimeInterval = 0.01
-    private let setSwitchReasonPrefix = "set-switch/display="
     private let spaceChangeReason = "space-change"
 
     private struct FloatingStateSnapshot {
@@ -125,6 +126,7 @@ final class TilerCoordinator {
         }
 
         setupActiveSpaceObserver()
+        setupAppActivationObserver()
         refreshDisplaySpaceState(reason: "startup")
         startLifecycleMonitor()
 
@@ -152,6 +154,10 @@ final class TilerCoordinator {
             NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
             self.activeSpaceObserver = nil
         }
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+            self.appActivationObserver = nil
+        }
         displaySpaceStateLock.lock()
         displayGenerationByID.removeAll()
         lastKnownSpaceByDisplayID.removeAll()
@@ -164,11 +170,12 @@ final class TilerCoordinator {
         rulesPanelController.present()
     }
 
-    func requestFullReflow(reason: String = "manual") {
+    func requestFullReflow(reason: String = "manual", followUp: FullReflowFollowUp? = nil) {
         enqueueReflowRequest(
             .full(
                 QueuedFullReflow(
-                    reason: reason
+                    reason: reason,
+                    followUp: followUp
                 )
             )
         )
@@ -979,7 +986,7 @@ final class TilerCoordinator {
                     hoverSlotIndex: drop.hoverSlotIndex
                 )
             case let .full(full):
-                _ = performFullReflow(reason: full.reason)
+                _ = performFullReflow(reason: full.reason, followUp: full.followUp)
             }
         }
     }
@@ -1020,7 +1027,7 @@ final class TilerCoordinator {
         }
     }
 
-    private func performFullReflow(reason: String) -> Bool {
+    private func performFullReflow(reason: String, followUp: FullReflowFollowUp?) -> Bool {
         let expectedDisplayGenerationByID = captureDisplayGenerationSnapshot(for: Set(DisplayService.activeDisplayIDs()))
         Diagnostics.log("Reflow job started (\(reason))", level: .debug)
 
@@ -1055,7 +1062,7 @@ final class TilerCoordinator {
         }
 
         guard !plans.isEmpty else {
-            if let displayID = setSwitchDisplayID(for: reason) {
+            if case let .raiseActiveSet(displayID)? = followUp {
                 raiseActiveSetWindows(on: displayID, from: windows)
             }
             Diagnostics.log(
@@ -1112,7 +1119,7 @@ final class TilerCoordinator {
             Diagnostics.log("Reflow (\(reason)) finished with failures: \(totalFailures)", level: .warn)
         }
 
-        if let displayID = setSwitchDisplayID(for: reason) {
+        if case let .raiseActiveSet(displayID)? = followUp {
             raiseActiveSetWindows(on: displayID, from: windows)
         }
         return totalTargets > 0
@@ -1127,7 +1134,7 @@ final class TilerCoordinator {
         let draggedWindow = windows.first { $0.windowID == draggedWindowID }
         let dropDisplayID = DisplayService.displayID(containing: point) ?? draggedWindow?.displayID
         guard let dropDisplayID else {
-            return performFullReflow(reason: "drop-fallback:no-display")
+            return performFullReflow(reason: "drop-fallback:no-display", followUp: nil)
         }
         let dropSpaceID = currentSpaceID(for: dropDisplayID)
 
@@ -1147,7 +1154,7 @@ final class TilerCoordinator {
             )
         }
 
-        return performFullReflow(reason: "drop")
+        return performFullReflow(reason: "drop", followUp: nil)
     }
 
     /// ウィンドウセットをライブウィンドウと同期（prune + 新規登録 + タブバー更新）
@@ -1366,6 +1373,61 @@ final class TilerCoordinator {
         }
     }
 
+    private func setupAppActivationObserver() {
+        guard appActivationObserver == nil else {
+            return
+        }
+
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.syncActiveSetToFocusedWindow(reason: "app-activate")
+        }
+    }
+
+    private func syncActiveSetToFocusedWindow(reason: String) {
+        guard !dragTracker.isDragging, !dragTracker.isResizing, dragTracker.pendingWindowIDs.isEmpty else {
+            return
+        }
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
+            return
+        }
+        let pid = frontmostApp.processIdentifier
+        guard let focusedWindowID = axWindowResolver.focusedWindowID(pid: pid) else {
+            return
+        }
+        guard focusedWindowID != lastSyncedFocusedWindowID else {
+            return
+        }
+
+        let windows = fetchVisibleWindows()
+        guard let focusedWindow = windows.first(where: { $0.windowID == focusedWindowID }) else {
+            lastSyncedFocusedWindowID = focusedWindowID
+            return
+        }
+
+        let spaceID = currentSpaceID(for: focusedWindow.displayID)
+        guard let setID = windowSetManager.setID(containing: focusedWindowID, on: focusedWindow.displayID, spaceID: spaceID) else {
+            lastSyncedFocusedWindowID = focusedWindowID
+            return
+        }
+        guard windowSetManager.activeSet(for: focusedWindow.displayID, spaceID: spaceID)?.id != setID else {
+            lastSyncedFocusedWindowID = focusedWindowID
+            return
+        }
+
+        windowSetManager.activateSet(id: setID, for: focusedWindow.displayID, spaceID: spaceID)
+        lastSyncedFocusedWindowID = focusedWindowID
+        Diagnostics.log(
+            "Synced active set to focused window reason=\(reason) windowID=\(focusedWindowID) display=\(focusedWindow.displayID) set=\(setID)",
+            level: .debug
+        )
+        refreshTabBars(using: windows)
+        raiseActiveSetWindows(on: focusedWindow.displayID, from: windows)
+    }
+
     private func spaceSnapshotSignature(for windows: [WindowRef]) -> UInt64 {
         var pairs: [(CGWindowID, CGDirectDisplayID, Int)] = []
         pairs.reserveCapacity(windows.count)
@@ -1391,8 +1453,16 @@ final class TilerCoordinator {
         lifecycleMonitor.start { [weak self] reason in
             guard let self else { return }
             Diagnostics.log("Lifecycle change detected reason=\(reason)", level: .debug)
+            if self.shouldSyncActiveSetForLifecycleReason(reason) {
+                self.syncActiveSetToFocusedWindow(reason: reason)
+                return
+            }
             requestFullReflow(reason: "lifecycle:\(reason)")
         }
+    }
+
+    private func shouldSyncActiveSetForLifecycleReason(_ reason: String) -> Bool {
+        reason == "ax:\(kAXFocusedWindowChangedNotification)" || reason == "ax:\(kAXMainWindowChangedNotification)"
     }
 
     private func targetFramesNeedingApply(
@@ -1685,22 +1755,7 @@ final class TilerCoordinator {
         windowSetManager.activateSet(id: id, for: displayID, spaceID: spaceID)
         let allWindows = fetchVisibleWindows()
         refreshTabBars(using: allWindows)
-        requestFullReflow(reason: setSwitchReason(for: displayID))
-    }
-
-    private func setSwitchReason(for displayID: CGDirectDisplayID) -> String {
-        "\(setSwitchReasonPrefix)\(displayID)"
-    }
-
-    private func setSwitchDisplayID(for reason: String) -> CGDirectDisplayID? {
-        guard reason.hasPrefix(setSwitchReasonPrefix) else {
-            return nil
-        }
-        let rawValue = reason.dropFirst(setSwitchReasonPrefix.count)
-        guard let parsed = UInt32(rawValue) else {
-            return nil
-        }
-        return CGDirectDisplayID(parsed)
+        requestFullReflow(reason: "set-switch", followUp: .raiseActiveSet(displayID: displayID))
     }
 
     private func raiseActiveSetWindows(on displayID: CGDirectDisplayID, from allWindows: [WindowRef]) {

@@ -75,6 +75,23 @@ final class AXWindowResolver {
         return result
     }
 
+    func focusedWindowID(pid: pid_t) -> CGWindowID? {
+        guard pid > 0 else {
+            return nil
+        }
+
+        let appElement = AXUIElementCreateApplication(pid)
+        if let focusedWindow = copyElementAttribute(kAXFocusedWindowAttribute as CFString, from: appElement),
+           let windowID = copyWindowID(from: focusedWindow) {
+            return windowID
+        }
+        if let mainWindow = copyElementAttribute(kAXMainWindowAttribute as CFString, from: appElement),
+           let windowID = copyWindowID(from: mainWindow) {
+            return windowID
+        }
+        return nil
+    }
+
     private func copyWindowID(from element: AXUIElement) -> CGWindowID? {
         if let windowID = copyWindowIDUsingSymbol(from: element) {
             return windowID
@@ -110,6 +127,15 @@ final class AXWindowResolver {
             return nil
         }
         return value as? String
+    }
+
+    private func copyElementAttribute(_ attribute: CFString, from element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(value, to: AXUIElement.self)
     }
 
     private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {

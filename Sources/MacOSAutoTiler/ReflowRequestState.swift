@@ -1,8 +1,13 @@
 import CoreGraphics
 import Foundation
 
+enum FullReflowFollowUp {
+    case raiseActiveSet(displayID: CGDirectDisplayID)
+}
+
 struct QueuedFullReflow {
     let reason: String
+    let followUp: FullReflowFollowUp?
 }
 
 struct QueuedDropReflow {
@@ -22,6 +27,7 @@ actor ReflowRequestState {
         private var dropHeadIndex = 0
         private var fullReflowRequested = false
         private var latestFullReflowReason = "manual"
+        private var latestFullReflowFollowUp: FullReflowFollowUp?
 
         mutating func enqueue(_ request: QueuedReflowRequest) {
             switch request {
@@ -30,6 +36,7 @@ actor ReflowRequestState {
             case let .full(full):
                 fullReflowRequested = true
                 latestFullReflowReason = full.reason
+                latestFullReflowFollowUp = full.followUp
             }
         }
 
@@ -41,7 +48,9 @@ actor ReflowRequestState {
                 return nil
             }
             fullReflowRequested = false
-            return .full(QueuedFullReflow(reason: latestFullReflowReason))
+            let followUp = latestFullReflowFollowUp
+            latestFullReflowFollowUp = nil
+            return .full(QueuedFullReflow(reason: latestFullReflowReason, followUp: followUp))
         }
 
 

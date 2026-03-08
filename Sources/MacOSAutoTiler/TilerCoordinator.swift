@@ -712,7 +712,13 @@ final class TilerCoordinator {
             excluding: excludedWindowIDs,
             appending: appendedWindowID
         )
-        guard !orderedIDs.isEmpty else { return nil }
+        guard !orderedIDs.isEmpty else {
+            Diagnostics.log(
+                "Build set plan skipped display=\(displayID) space=\(spaceID) set=\(setID) appended=\(appendedWindowID.map(String.init) ?? "nil") excluded=\(excludedWindowIDs.map(String.init).sorted().joined(separator: ",")) reason=no-ordered-ids",
+                level: .debug
+            )
+            return nil
+        }
         return layoutPlanner(for: setID).buildPlan(
             setID: setID,
             orderedWindowIDs: orderedIDs,
@@ -852,6 +858,10 @@ final class TilerCoordinator {
 
         let previousDisplayID = activePlan?.displayID
         let currentDisplayID = DisplayService.displayID(containing: point)
+        Diagnostics.log(
+            "Drag update windowID=\(draggedWindowID) point=\(point) currentDisplay=\(currentDisplayID.map(String.init) ?? "nil") previousDisplay=\(previousDisplayID.map(String.init) ?? "nil") sourceDisplay=\(draggedWindow.displayID)",
+            level: .debug
+        )
 
         let previewPlan: DisplayLayoutPlan
         if let existing = activePlan, currentDisplayID == existing.displayID {
@@ -861,7 +871,12 @@ final class TilerCoordinator {
             let updateDisplayID = currentDisplayID ?? draggedWindow.displayID
             let spaceID = currentSpaceID(for: updateDisplayID)
             let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
-            guard let targetSetID = windowSetManager.activeSet(for: updateDisplayID, spaceID: spaceID)?.id,
+            let targetSetID = windowSetManager.activeSet(for: updateDisplayID, spaceID: spaceID)?.id
+            Diagnostics.log(
+                "Drag preview rebuild windowID=\(draggedWindowID) targetDisplay=\(updateDisplayID) space=\(spaceID) targetSet=\(targetSetID?.uuidString ?? "nil") visibleWindows=\(windows.filter { $0.displayID == updateDisplayID }.map { "\($0.windowID):space=\($0.spaceID)" }.joined(separator: ","))",
+                level: .debug
+            )
+            guard let targetSetID,
                   let newPlan = buildSetPlan(
                 setID: targetSetID,
                 on: updateDisplayID,
@@ -870,6 +885,10 @@ final class TilerCoordinator {
                 floatingContext: floatingContext,
                 appending: draggedWindowID
             ) else {
+                Diagnostics.log(
+                    "Drag preview rebuild failed windowID=\(draggedWindowID) targetDisplay=\(updateDisplayID) space=\(spaceID) targetSet=\(targetSetID?.uuidString ?? "nil")",
+                    level: .warn
+                )
                 resetInteractionState()
                 return
             }

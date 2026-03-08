@@ -292,6 +292,9 @@ final class TilerCoordinator {
     }
 
     private func handleOptionKeyPress(at point: CGPoint) {
+        guard dragTracker.isDragging || dragTracker.isResizing || !dragTracker.pendingWindowIDs.isEmpty else {
+            return
+        }
         toggleFloatingForActiveDrag(at: point)
     }
 

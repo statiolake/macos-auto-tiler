@@ -37,6 +37,7 @@ final class LayoutPlanner {
 
     /// orderedWindowIDs → DisplayLayoutPlan（index=スロット、座標マッチングなし）
     func buildPlan(
+        setID: WindowSetID,
         orderedWindowIDs: [CGWindowID],
         windowsByID: [CGWindowID: WindowRef],
         displayID: CGDirectDisplayID,
@@ -48,6 +49,7 @@ final class LayoutPlanner {
         let slots = makeSlots(for: orderedWindowIDs.count, in: bounds, scope: scope)
         guard !slots.isEmpty else { return nil }
         return DisplayLayoutPlan(
+            setID: setID,
             displayID: displayID,
             spaceID: spaceID,
             slots: slots,

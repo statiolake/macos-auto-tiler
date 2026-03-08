@@ -35,6 +35,41 @@ final class WindowSetManager {
         return activeSet.orderedWindowIDs
     }
 
+    func orderedWindowIDsForAllSets(on displayID: CGDirectDisplayID, spaceID: Int) -> [CGWindowID] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let store = storeByKey[key(displayID, spaceID)] else {
+            return []
+        }
+
+        var orderedWindowIDs: [CGWindowID] = []
+        var seen = Set<CGWindowID>()
+        for set in store.sets {
+            for windowID in set.orderedWindowIDs where seen.insert(windowID).inserted {
+                orderedWindowIDs.append(windowID)
+            }
+        }
+        return orderedWindowIDs
+    }
+
+    func setID(containing windowID: CGWindowID, on displayID: CGDirectDisplayID, spaceID: Int) -> WindowSetID? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let store = storeByKey[key(displayID, spaceID)] else {
+            return nil
+        }
+        return store.sets.first(where: { $0.orderedWindowIDs.contains(windowID) })?.id
+    }
+
+    func orderedWindowIDs(in setID: WindowSetID, on displayID: CGDirectDisplayID, spaceID: Int) -> [CGWindowID] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let store = storeByKey[key(displayID, spaceID)] else {
+            return []
+        }
+        return store.sets.first(where: { $0.id == setID })?.orderedWindowIDs ?? []
+    }
+
     func slotIndex(of windowID: CGWindowID, on displayID: CGDirectDisplayID, spaceID: Int) -> Int? {
         lock.lock()
         defer { lock.unlock() }
@@ -135,6 +170,27 @@ final class WindowSetManager {
             var store = storeByKey[k],
             let activeID = store.activeSetID,
             let idx = store.sets.firstIndex(where: { $0.id == activeID })
+        else {
+            lock.unlock()
+            return
+        }
+        store.sets[idx].moveToSlot(windowID, slot: slot)
+        storeByKey[k] = store
+        lock.unlock()
+    }
+
+    func moveWindowToSlot(
+        _ windowID: CGWindowID,
+        slot: Int,
+        in setID: WindowSetID,
+        on displayID: CGDirectDisplayID,
+        spaceID: Int
+    ) {
+        lock.lock()
+        let k = key(displayID, spaceID)
+        guard
+            var store = storeByKey[k],
+            let idx = store.sets.firstIndex(where: { $0.id == setID })
         else {
             lock.unlock()
             return

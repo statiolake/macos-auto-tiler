@@ -48,6 +48,7 @@ struct PendingDrag {
 }
 
 struct DisplayLayoutPlan {
+    let setID: WindowSetID
     let displayID: CGDirectDisplayID
     let spaceID: Int
     let slots: [Slot]

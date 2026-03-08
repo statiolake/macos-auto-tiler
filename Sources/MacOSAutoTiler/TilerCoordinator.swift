@@ -5,7 +5,6 @@ final class TilerCoordinator {
     private let axWindowResolver = AXWindowResolver.shared
     private let ruleStore = WindowRuleStore()
     private lazy var discovery = WindowDiscovery(ruleStore: ruleStore)
-    private let defaultLayoutPlanner = LayoutPlanner()
     private let overlay = OverlayWindowController()
     private let windowSetManager = WindowSetManager()
     private let windowFocusController = PrivateWindowFocusController()
@@ -577,7 +576,12 @@ final class TilerCoordinator {
 
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
         let spaceID = currentSpaceID(for: displayID)
+        guard let setID = windowSetManager.setID(containing: resizingWindowID, on: displayID, spaceID: spaceID) else {
+            resetInteractionState()
+            return
+        }
         let orderedIDs = tiledOrderedWindowIDs(
+            in: setID,
             on: displayID,
             spaceID: spaceID,
             windowsByID: windowsByID,
@@ -588,7 +592,7 @@ final class TilerCoordinator {
             return
         }
 
-        let resizePlanner = activeLayoutPlanner(for: displayID)
+        let resizePlanner = layoutPlanner(for: setID)
         resizePlanner.syncRatiosFromObservedWindows(
             orderedWindowIDs: orderedIDs,
             windowsByID: windowsByID,
@@ -599,6 +603,7 @@ final class TilerCoordinator {
         )
 
         guard let plan = resizePlanner.buildPlan(
+            setID: setID,
             orderedWindowIDs: orderedIDs,
             windowsByID: windowsByID,
             displayID: displayID,
@@ -630,14 +635,18 @@ final class TilerCoordinator {
         let displayID = resizedWindow.displayID
         let spaceID = currentSpaceID(for: displayID)
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+        guard let setID = windowSetManager.setID(containing: resizeState.windowID, on: displayID, spaceID: spaceID) else {
+            return
+        }
         let orderedIDs = tiledOrderedWindowIDs(
+            in: setID,
             on: displayID,
             spaceID: spaceID,
             windowsByID: windowsByID,
             floatingContext: floatingContext
         )
 
-        let resizePlanner = activeLayoutPlanner(for: displayID)
+        let resizePlanner = layoutPlanner(for: setID)
         resizePlanner.syncRatiosFromObservedWindows(
             orderedWindowIDs: orderedIDs,
             windowsByID: windowsByID,
@@ -655,6 +664,7 @@ final class TilerCoordinator {
     }
 
     private func tiledOrderedWindowIDs(
+        in setID: WindowSetID,
         on displayID: CGDirectDisplayID,
         spaceID: Int,
         windowsByID: [CGWindowID: WindowRef],
@@ -662,7 +672,7 @@ final class TilerCoordinator {
         excluding excludedWindowIDs: Set<CGWindowID> = [],
         appending appendedWindowID: CGWindowID? = nil
     ) -> [CGWindowID] {
-        var orderedIDs = windowSetManager.orderedWindowIDs(on: displayID, spaceID: spaceID)
+        var orderedIDs = windowSetManager.orderedWindowIDs(in: setID, on: displayID, spaceID: spaceID)
             .filter { id in
                 guard let window = windowsByID[id] else { return false }
                 guard !excludedWindowIDs.contains(id) else { return false }
@@ -677,7 +687,8 @@ final class TilerCoordinator {
         return orderedIDs
     }
 
-    private func buildDisplayPlan(
+    private func buildSetPlan(
+        setID: WindowSetID,
         on displayID: CGDirectDisplayID,
         spaceID: Int,
         windowsByID: [CGWindowID: WindowRef],
@@ -686,6 +697,7 @@ final class TilerCoordinator {
         appending appendedWindowID: CGWindowID? = nil
     ) -> DisplayLayoutPlan? {
         let orderedIDs = tiledOrderedWindowIDs(
+            in: setID,
             on: displayID,
             spaceID: spaceID,
             windowsByID: windowsByID,
@@ -694,12 +706,30 @@ final class TilerCoordinator {
             appending: appendedWindowID
         )
         guard !orderedIDs.isEmpty else { return nil }
-        return activeLayoutPlanner(for: displayID).buildPlan(
+        return layoutPlanner(for: setID).buildPlan(
+            setID: setID,
             orderedWindowIDs: orderedIDs,
             windowsByID: windowsByID,
             displayID: displayID,
             spaceID: spaceID
         )
+    }
+
+    private func buildDisplayPlans(
+        on displayID: CGDirectDisplayID,
+        spaceID: Int,
+        windowsByID: [CGWindowID: WindowRef],
+        floatingContext: FloatingEvaluationContext
+    ) -> [DisplayLayoutPlan] {
+        windowSetManager.sets(for: displayID, spaceID: spaceID).compactMap { set in
+            buildSetPlan(
+                setID: set.id,
+                on: displayID,
+                spaceID: spaceID,
+                windowsByID: windowsByID,
+                floatingContext: floatingContext
+            )
+        }
     }
 
     @discardableResult
@@ -728,7 +758,12 @@ final class TilerCoordinator {
 
         let floatingContext = liveFloatingContext()
         let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
+        guard let setID = windowSetManager.setID(containing: draggedWindowID, on: displayID, spaceID: spaceID) else {
+            Diagnostics.log("Drag windowID=\(draggedWindowID) not assigned to a window set; skipping overlay", level: .debug)
+            return
+        }
         let orderedIDs = tiledOrderedWindowIDs(
+            in: setID,
             on: displayID,
             spaceID: spaceID,
             windowsByID: windowsByID,
@@ -736,12 +771,13 @@ final class TilerCoordinator {
         )
 
         guard orderedIDs.contains(draggedWindowID) else {
-            Diagnostics.log("Drag windowID=\(draggedWindowID) not in active set; skipping overlay", level: .debug)
+            Diagnostics.log("Drag windowID=\(draggedWindowID) not in tiled set; skipping overlay", level: .debug)
             return
         }
 
         refreshTabBars(using: windows)
-        if let remainingPlan = buildDisplayPlan(
+        if let remainingPlan = buildSetPlan(
+            setID: setID,
             on: displayID,
             spaceID: spaceID,
             windowsByID: windowsByID,
@@ -754,11 +790,12 @@ final class TilerCoordinator {
             )
         }
 
-        let planner = activeLayoutPlanner(for: displayID)
+        let planner = layoutPlanner(for: setID)
         let slots = planner.buildSlots(count: orderedIDs.count, displayID: displayID, spaceID: spaceID)
         guard !slots.isEmpty else { return }
 
         let plan = DisplayLayoutPlan(
+            setID: setID,
             displayID: displayID,
             spaceID: spaceID,
             slots: slots,
@@ -817,7 +854,9 @@ final class TilerCoordinator {
             let updateDisplayID = currentDisplayID ?? draggedWindow.displayID
             let spaceID = currentSpaceID(for: updateDisplayID)
             let windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { f, _ in f })
-            guard let newPlan = buildDisplayPlan(
+            guard let targetSetID = windowSetManager.activeSet(for: updateDisplayID, spaceID: spaceID)?.id,
+                  let newPlan = buildSetPlan(
+                setID: targetSetID,
                 on: updateDisplayID,
                 spaceID: spaceID,
                 windowsByID: windowsByID,
@@ -830,7 +869,7 @@ final class TilerCoordinator {
             previewPlan = newPlan
         }
 
-        let activeDragPlanner = activeLayoutPlanner(for: previewPlan.displayID)
+        let activeDragPlanner = layoutPlanner(for: previewPlan.setID)
         let hoverIndex = activeDragPlanner.slotIndex(at: point, in: previewPlan)
         guard let dragState = dragTracker.updateDrag(point: point, hoverSlotIndex: hoverIndex) else {
             resetInteractionState()
@@ -1006,14 +1045,13 @@ final class TilerCoordinator {
         var plans: [DisplayLayoutPlan] = []
         for displayID in DisplayService.activeDisplayIDs() {
             let spaceID = currentSpaceID(for: displayID)
-            if let plan = buildDisplayPlan(
+            let displayPlans = buildDisplayPlans(
                 on: displayID,
                 spaceID: spaceID,
                 windowsByID: windowsByID,
                 floatingContext: floatingContext
-            ) {
-                plans.append(plan)
-            }
+            )
+            plans.append(contentsOf: displayPlans)
         }
 
         guard !plans.isEmpty else {
@@ -1052,7 +1090,7 @@ final class TilerCoordinator {
             totalTargets += targets.count
 
             Diagnostics.log(
-                "Reflow (\(reason)) display=\(plan.displayID) windows=\(plan.windowsByID.count) targets=\(targets.count)",
+                "Reflow (\(reason)) display=\(plan.displayID) set=\(plan.setID) windows=\(plan.windowsByID.count) targets=\(targets.count)",
                 level: .info
             )
 
@@ -1098,8 +1136,15 @@ final class TilerCoordinator {
             windowSetManager.removeWindowFromAllSets(draggedWindowID)
             windowSetManager.registerNewWindows([draggedWindowID], on: dropDisplayID, spaceID: dropSpaceID)
         }
-        if let slot = hoverSlotIndex {
-            windowSetManager.moveWindowToSlot(draggedWindowID, slot: slot, on: dropDisplayID, spaceID: dropSpaceID)
+        if let slot = hoverSlotIndex,
+           let setID = windowSetManager.setID(containing: draggedWindowID, on: dropDisplayID, spaceID: dropSpaceID) {
+            windowSetManager.moveWindowToSlot(
+                draggedWindowID,
+                slot: slot,
+                in: setID,
+                on: dropDisplayID,
+                spaceID: dropSpaceID
+            )
         }
 
         return performFullReflow(reason: "drop")
@@ -1584,11 +1629,7 @@ final class TilerCoordinator {
 
     // MARK: - Set / Tab Bar helpers
 
-    private func activeLayoutPlanner(for displayID: CGDirectDisplayID) -> LayoutPlanner {
-        let spaceID = currentSpaceID(for: displayID)
-        guard let setID = windowSetManager.activeSet(for: displayID, spaceID: spaceID)?.id else {
-            return defaultLayoutPlanner
-        }
+    private func layoutPlanner(for setID: WindowSetID) -> LayoutPlanner {
         if let planner = layoutPlannerBySetID[setID] { return planner }
         let planner = LayoutPlanner()
         layoutPlannerBySetID[setID] = planner

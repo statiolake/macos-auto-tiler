@@ -40,6 +40,11 @@ final class TabBarWindowController {
             if self.viewsByDisplayID[displayID] == nil {
                 self.createWindow(for: displayID)
             }
+            let window = self.windowsByDisplayID[displayID]
+            Diagnostics.log(
+                "TabBar render display=\(displayID) shouldShow=\(presentation.shouldShow) dragging=\(presentation.isDragging) sets=\(presentation.sets.count) visibleState=\(self.visibleByDisplayID[displayID] ?? false) windowVisible=\(window?.isVisible ?? false) alpha=\(window?.alphaValue ?? -1) windowNumber=\(window?.windowNumber ?? -1)",
+                level: .debug
+            )
             guard let view = self.viewsByDisplayID[displayID] else { return }
             view.windowSets = presentation.sets
             view.activeSetID = presentation.activeSetID
@@ -94,8 +99,13 @@ final class TabBarWindowController {
               let shown = shownFrame(for: displayID) else { return }
 
         let wasShown = visibleByDisplayID[displayID] ?? false
+        Diagnostics.log(
+            "TabBar visibility display=\(displayID) shouldShow=\(shouldShow) wasShown=\(wasShown) animating=\(animatingByDisplayID[displayID] ?? false) windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue) frame=\(window.frame.debugDescription)",
+            level: .debug
+        )
         guard shouldShow != wasShown else {
             if animatingByDisplayID[displayID] == true {
+                Diagnostics.log("TabBar visibility display=\(displayID) skipped while animating", level: .debug)
                 return
             }
             if !window.frame.equalTo(shown) {
@@ -104,9 +114,17 @@ final class TabBarWindowController {
             if shouldShow {
                 window.alphaValue = 1
                 window.orderFrontRegardless()
+                Diagnostics.log(
+                    "TabBar orderFront display=\(displayID) windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                    level: .debug
+                )
             } else {
                 window.alphaValue = 0
                 window.orderOut(nil)
+                Diagnostics.log(
+                    "TabBar orderOut display=\(displayID) windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                    level: .debug
+                )
             }
             return
         }
@@ -119,6 +137,15 @@ final class TabBarWindowController {
         if shouldShow {
             window.alphaValue = 0
             window.orderFrontRegardless()
+            Diagnostics.log(
+                "TabBar animation start display=\(displayID) phase=show windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                level: .debug
+            )
+        } else {
+            Diagnostics.log(
+                "TabBar animation start display=\(displayID) phase=hide windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                level: .debug
+            )
         }
 
         animatingByDisplayID[displayID] = true
@@ -136,9 +163,17 @@ final class TabBarWindowController {
             }
             if shouldShow {
                 window.alphaValue = 1
+                Diagnostics.log(
+                    "TabBar animation finish display=\(displayID) phase=show windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                    level: .debug
+                )
             } else {
                 window.alphaValue = 0
                 window.orderOut(nil)
+                Diagnostics.log(
+                    "TabBar animation finish display=\(displayID) phase=hide windowVisible=\(window.isVisible) alpha=\(window.alphaValue) occlusion=\(window.occlusionState.rawValue)",
+                    level: .debug
+                )
             }
         })
     }

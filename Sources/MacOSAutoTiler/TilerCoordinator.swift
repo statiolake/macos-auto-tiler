@@ -1746,6 +1746,14 @@ final class TilerCoordinator {
         for displayID in DisplayService.activeDisplayIDs() {
             let state = tabBarDisplayState(for: displayID, titlesByID: titlesByID)
             DisplayService.additionalTopInsetByDisplay[displayID] = state.reservedTopInset
+            let visibleWindowSummary = sourceWindows
+                .filter { $0.displayID == displayID }
+                .map { "\($0.windowID):space=\($0.spaceID)" }
+                .joined(separator: ",")
+            Diagnostics.log(
+                "TabBar state display=\(displayID) space=\(currentSpaceID(for: displayID)) sets=\(state.presentation.sets.count) activeSet=\(state.presentation.activeSetID?.uuidString ?? "nil") dragging=\(state.presentation.isDragging) shouldShow=\(state.presentation.shouldShow) reservedInset=\(state.reservedTopInset) visibleWindows=\(visibleWindowSummary)",
+                level: .debug
+            )
             tabBar.render(state.presentation, for: displayID)
         }
     }

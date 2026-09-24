@@ -12,3 +12,6 @@ xcuserdata/
 
 # macOS metadata
 .DS_Store
+
+# Editor-generated settings
+.vscode/

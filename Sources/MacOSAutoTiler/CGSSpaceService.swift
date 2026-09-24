@@ -2,8 +2,14 @@ import CoreGraphics
 import Darwin
 import Foundation
 
+struct SpaceShortcutDisabledError: LocalizedError {
+    var errorDescription: String? {
+        "The Mission Control shortcut \"Move left/right a space\" is disabled in System Settings > Keyboard > Keyboard Shortcuts"
+    }
+}
+
 /// Bridge to the private SkyLight space APIs: which space a window lives on, which space each display shows,
-/// and switching to the adjacent space through the user's Mission Control shortcut.
+/// and posting the user's Mission Control shortcut for switching to the adjacent space.
 final class CGSSpaceService {
     static let shared = CGSSpaceService()
 
@@ -69,23 +75,26 @@ final class CGSSpaceService {
         return result
     }
 
-    /// Posts the system "Move left/right a space" shortcut. Returns false when there is no space in that
-    /// direction or the user disabled the shortcut.
-    func switchToAdjacentSpace(displayID: CGDirectDisplayID, goLeft: Bool) -> Bool {
+    /// Whether the display has a space `offset` steps from the current one, in Mission Control order.
+    /// False while the display's spaces are unresolvable mid-transition.
+    func hasSpace(on displayID: CGDirectDisplayID, atOffset offset: Int) -> Bool {
         guard
             let display = managedDisplay(for: displayID),
             let current = spaceID(display["Current Space"]),
-            let spaces = (display["Spaces"] as? [Any])?.compactMap(spaceID),
-            let index = spaces.firstIndex(of: current),
-            spaces.indices.contains(goLeft ? index - 1 : index + 1)
+            let spaceIDs = (display["Spaces"] as? [Any])?.compactMap(spaceID),
+            let currentIndex = spaceIDs.firstIndex(of: current)
         else {
             return false
         }
+        return spaceIDs.indices.contains(currentIndex + offset)
+    }
 
+    /// Posts the user's "Move left/right a space" Mission Control shortcut. It acts on the display under the
+    /// pointer.
+    func postAdjacentSpaceShortcut(goLeft: Bool) throws {
         let hotKey = goLeft ? Self.moveLeftSpaceHotKey : Self.moveRightSpaceHotKey
         guard isSymbolicHotKeyEnabled(hotKey) else {
-            Diagnostics.log("Space switch skipped: the Mission Control shortcut is disabled", level: .warn)
-            return false
+            throw SpaceShortcutDisabledError()
         }
         var keyCode: UInt16 = 0
         var flags: UInt32 = 0
@@ -103,7 +112,6 @@ final class CGSSpaceService {
         keyDown.flags = CGEventFlags(rawValue: UInt64(flags))
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
-        return true
     }
 
     private func managedDisplay(for displayID: CGDirectDisplayID) -> [String: Any]? {
@@ -116,6 +124,7 @@ final class CGSSpaceService {
         return displays.first { $0["Display Identifier"] as? String == identifier }
     }
 
+    /// Accepts both a space dictionary and the "Current Space" entry, which has the same shape.
     private func spaceID(_ value: Any?) -> Int? {
         ((value as? [String: Any])?["ManagedSpaceID"] as? NSNumber)?.intValue
     }

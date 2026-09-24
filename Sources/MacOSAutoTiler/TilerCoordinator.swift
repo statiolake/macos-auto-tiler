@@ -29,6 +29,10 @@ final class TilerCoordinator {
     private var gesture = Gesture.idle
     /// Taken at mouse down. A gesture works on this view of the windows until mouse up.
     private var gestureSnapshot: WindowSnapshot?
+    /// Unlike the windows, the shown spaces can change mid-gesture: pushing a held window against the screen
+    /// edge, or pressing the space shortcut while holding it, switches spaces and carries the window along.
+    private var gestureVisibleSpaces: [CGDirectDisplayID: SpaceKey] = [:]
+    private var pointer = CGPoint.zero
     private var pendingReflow: PendingReflow?
     private var isReflowScheduled = false
     private var lastSpaceSwitch = Date.distantPast
@@ -47,7 +51,7 @@ final class TilerCoordinator {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.requestReflow("space-change", waitForStableSpaces: true)
+            self?.handleSpaceChange()
         }
         requestReflow("startup")
     }
@@ -167,6 +171,16 @@ final class TilerCoordinator {
         actuator.apply(jobs, reason: reason)
     }
 
+    private func handleSpaceChange() {
+        if !gesture.isIdle {
+            gestureVisibleSpaces = discovery.visibleSpaces()
+            if case .dragging = gesture {
+                updateDragPreview(at: pointer)
+            }
+        }
+        requestReflow("space-change", waitForStableSpaces: true)
+    }
+
     // MARK: - Input
 
     private func handleTapEvent(_ event: TapEvent) -> Bool {
@@ -196,14 +210,26 @@ final class TilerCoordinator {
         }
     }
 
-    /// Scrolling the wheel over the desktop switches to the adjacent space.
+    /// Scrolling the wheel over the desktop switches to the adjacent space. At the first or last space the
+    /// scroll reaches the desktop as usual.
     private func handleScroll(at point: CGPoint, deltaY: Int64) -> Bool {
-        guard !discovery.hasVisibleWindow(at: point), let displayID = DisplayService.displayID(containing: point) else {
+        let goLeft = deltaY > 0
+        guard
+            !discovery.hasVisibleWindow(at: point),
+            let displayID = DisplayService.displayID(containing: point),
+            CGSSpaceService.shared.hasSpace(on: displayID, atOffset: goLeft ? -1 : 1)
+        else {
             return false
         }
         // One wheel notch produces several events; swallow the rest instead of switching again.
         guard Date().timeIntervalSince(lastSpaceSwitch) >= Self.spaceSwitchCooldown else { return true }
-        guard CGSSpaceService.shared.switchToAdjacentSpace(displayID: displayID, goLeft: deltaY > 0) else { return false }
+        do {
+            try CGSSpaceService.shared.postAdjacentSpaceShortcut(goLeft: goLeft)
+        } catch {
+            Diagnostics.log("Space switch by scroll failed: \(error.localizedDescription)", level: .warn)
+            NSSound.beep()
+            return false
+        }
         lastSpaceSwitch = Date()
         return true
     }
@@ -224,10 +250,13 @@ final class TilerCoordinator {
             $0.frame.insetBy(dx: -Self.windowHitSlop, dy: -Self.windowHitSlop).contains(point)
         }
         gestureSnapshot = snapshot
+        gestureVisibleSpaces = snapshot.visibleSpaces
+        pointer = point
         gesture = candidates.isEmpty ? .ignored : .pending(Gesture.Pending(candidates: candidates, point: point))
     }
 
     private func continueGesture(at point: CGPoint) {
+        pointer = point
         switch gesture {
         case var .pending(pending):
             pending.travelled += hypot(point.x - pending.lastPoint.x, point.y - pending.lastPoint.y)
@@ -335,7 +364,7 @@ final class TilerCoordinator {
             case let .dragging(windowID) = gesture,
             let window = snapshotForGesture.window(windowID),
             !state.isFloating(window),
-            let target = dropTarget(at: point, visibleSpaces: snapshotForGesture.visibleSpaces)
+            let target = dropTarget(at: point)
         else {
             overlay.hide()
             return
@@ -345,8 +374,9 @@ final class TilerCoordinator {
 
     private func drop(_ windowID: CGWindowID, at point: CGPoint) {
         guard let window = snapshotForGesture.window(windowID), !state.isFloating(window) else { return }
-        // The user may have switched spaces while holding the window, so ask for the current ones again.
-        guard let target = dropTarget(at: point, visibleSpaces: discovery.visibleSpaces()) else {
+        // The space-change notification may still be on its way when the button is released right after a switch.
+        gestureVisibleSpaces = discovery.visibleSpaces()
+        guard let target = dropTarget(at: point) else {
             Diagnostics.log("Drop of window \(windowID) at \(point) has no resolvable space; it rejoins on the next reflow", level: .warn)
             requestReflow("drop")
             return
@@ -357,10 +387,10 @@ final class TilerCoordinator {
     }
 
     /// The slots the space under `point` would have with one more window, and the one nearest to `point`.
-    private func dropTarget(at point: CGPoint, visibleSpaces: [CGDirectDisplayID: SpaceKey]) -> DropTarget? {
+    private func dropTarget(at point: CGPoint) -> DropTarget? {
         guard
             let displayID = DisplayService.displayID(containing: point),
-            let space = visibleSpaces[displayID],
+            let space = gestureVisibleSpaces[displayID],
             let area = DisplayService.visibleBounds(for: displayID)
         else {
             return nil

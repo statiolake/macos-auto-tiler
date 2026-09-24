@@ -1,89 +1,41 @@
 import ApplicationServices
 import CoreGraphics
-import Foundation
 
 struct WindowSemantics {
     let descriptor: WindowTypeDescriptor
-    let isSpecialFloating: Bool
+    /// A movable window with the standard role and subrole; dialogs, sheets, panels and the like are not.
+    let isStandardWindow: Bool
 }
 
+/// Caches the AX role/subrole of windows. AX queries are slow, and a window's kind never changes.
 final class WindowSemanticsClassifier {
     private let resolver: AXWindowResolver
-    private let cacheLock = NSLock()
     private var cache: [CGWindowID: WindowSemantics] = [:]
 
-    init(resolver: AXWindowResolver = AXWindowResolver()) {
+    init(resolver: AXWindowResolver) {
         self.resolver = resolver
     }
 
-    func semantics(for window: WindowRef) -> WindowSemantics {
-        cacheLock.lock()
-        if let cached = cache[window.windowID] {
-            cacheLock.unlock()
+    /// Nil while the window is not resolvable through AX yet (e.g. right after creation). Not cached, so the
+    /// next snapshot asks again.
+    func semantics(windowID: CGWindowID, pid: pid_t) -> WindowSemantics? {
+        if let cached = cache[windowID] {
             return cached
         }
-        cacheLock.unlock()
-
-        let semantics = classify(window: window)
-        cacheLock.lock()
-        if let cached = cache[window.windowID] {
-            cacheLock.unlock()
-            return cached
+        guard let resolved = resolver.window(pid: pid, windowID: windowID) else {
+            return nil
         }
-        cache[window.windowID] = semantics
-        cacheLock.unlock()
+        let semantics = WindowSemantics(
+            descriptor: WindowTypeDescriptor(role: resolved.role, subrole: resolved.subrole),
+            isStandardWindow: resolved.role == kAXWindowRole
+                && resolved.subrole == kAXStandardWindowSubrole
+                && resolved.canSetPosition
+        )
+        cache[windowID] = semantics
         return semantics
     }
 
     func prune(to liveWindowIDs: Set<CGWindowID>) {
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
         cache = cache.filter { liveWindowIDs.contains($0.key) }
     }
-
-    private func classify(window: WindowRef) -> WindowSemantics {
-        guard let resolvedAX = resolver.window(pid: window.pid, windowID: window.windowID) else {
-            Diagnostics.log(
-                "Window semantics unresolved windowID=\(window.windowID) pid=\(window.pid) app=\(window.appName) title=\"\(window.title)\"",
-                level: .debug
-            )
-            return WindowSemantics(
-                descriptor: WindowTypeDescriptor(role: "AXWindow", subrole: "Unknown"),
-                isSpecialFloating: true
-            )
-        }
-        let role = resolvedAX.role
-        let subrole = resolvedAX.subrole
-        let isStandardWindow = subrole == (kAXStandardWindowSubrole as String)
-        let isMovable = resolvedAX.canSetPosition
-        let isManageable = (role == (kAXWindowRole as String)) && isStandardWindow && isMovable
-
-        let isSpecialFloating = !isManageable || floatingRoles.contains(role) || floatingSubroles.contains(subrole)
-        if !isManageable {
-            Diagnostics.log(
-                "Window semantics marked non-manageable windowID=\(window.windowID) app=\(window.appName) title=\"\(window.title)\" role=\(role) subrole=\(subrole) movable=\(isMovable)",
-                level: .debug
-            )
-        }
-        return WindowSemantics(
-            descriptor: WindowTypeDescriptor(role: role, subrole: subrole),
-            isSpecialFloating: isSpecialFloating
-        )
-    }
-
-    private let floatingRoles: Set<String> = [
-        "AXSheet",
-        "AXDrawer",
-        "AXPopover",
-        "AXDialog",
-        "AXSystemDialog",
-    ]
-
-    private let floatingSubroles: Set<String> = [
-        "AXDialog",
-        "AXSystemDialog",
-        "AXFloatingWindow",
-        "AXSystemFloatingWindow",
-        "AXUtilityWindow",
-    ]
 }

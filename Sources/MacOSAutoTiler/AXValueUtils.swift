@@ -4,50 +4,43 @@ import CoreGraphics
 enum AXValueUtils {
     static func copyFrame(of element: AXUIElement) -> CGRect? {
         guard
-            let position = copyCGPoint(attribute: kAXPositionAttribute as CFString, from: element),
-            let size = copyCGSize(attribute: kAXSizeAttribute as CFString, from: element)
+            let position: CGPoint = copyValue(kAXPositionAttribute, type: .cgPoint, from: element),
+            let size: CGSize = copyValue(kAXSizeAttribute, type: .cgSize, from: element)
         else {
             return nil
         }
         return CGRect(origin: position, size: size)
     }
 
-    static func copyCGPoint(attribute: CFString, from element: AXUIElement) -> CGPoint? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgPoint) else {
-            return nil
-        }
-        var point = CGPoint.zero
-        guard AXValueGetValue(axValue, .cgPoint, &point) else {
-            return nil
-        }
-        return point
+    static func setPosition(_ point: CGPoint, on element: AXUIElement) -> AXError {
+        setValue(point, type: .cgPoint, attribute: kAXPositionAttribute, on: element)
     }
 
-    static func copyCGSize(attribute: CFString, from element: AXUIElement) -> CGSize? {
-        guard let axValue = copyAXValue(attribute: attribute, from: element, type: .cgSize) else {
-            return nil
-        }
-        var size = CGSize.zero
-        guard AXValueGetValue(axValue, .cgSize, &size) else {
-            return nil
-        }
-        return size
+    static func setSize(_ size: CGSize, on element: AXUIElement) -> AXError {
+        setValue(size, type: .cgSize, attribute: kAXSizeAttribute, on: element)
     }
 
-    static func copyAXValue(attribute: CFString, from element: AXUIElement, type: AXValueType) -> AXValue? {
+    private static func copyValue<T: BitwiseCopyable>(_ attribute: String, type: AXValueType, from element: AXUIElement) -> T? {
         var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
         guard
-            result == .success,
-            let rawValue = value,
-            CFGetTypeID(rawValue) == AXValueGetTypeID()
+            AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+            let value,
+            CFGetTypeID(value) == AXValueGetTypeID()
         else {
             return nil
         }
-        let axValue = unsafeBitCast(rawValue, to: AXValue.self)
-        guard AXValueGetType(axValue) == type else {
-            return nil
+        let axValue = unsafeBitCast(value, to: AXValue.self)
+        return withUnsafeTemporaryAllocation(of: T.self, capacity: 1) { buffer in
+            guard AXValueGetValue(axValue, type, buffer.baseAddress!) else { return nil }
+            return buffer.baseAddress!.pointee
         }
-        return axValue
+    }
+
+    private static func setValue<T: BitwiseCopyable>(_ value: T, type: AXValueType, attribute: String, on element: AXUIElement) -> AXError {
+        var mutable = value
+        guard let axValue = AXValueCreate(type, &mutable) else {
+            preconditionFailure("AXValueCreate failed for \(type)")
+        }
+        return AXUIElementSetAttributeValue(element, attribute as CFString, axValue)
     }
 }

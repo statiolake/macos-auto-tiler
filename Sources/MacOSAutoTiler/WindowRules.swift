@@ -48,7 +48,6 @@ final class WindowRuleStore {
     }
 
     private let defaults: UserDefaults
-    private let lock = NSLock()
     private var floatingApps: Set<String>
     private var floatingTypeKeys: Set<String>
     private var excludedBundleIDs: Set<String>
@@ -83,54 +82,25 @@ final class WindowRuleStore {
         self.excludedBundleIDs = Set(defaults.stringArray(forKey: Keys.excludedBundleIDs) ?? [])
     }
 
+    // Queries go through `snapshot()` so the panel and discovery can never disagree on a rule.
     func isAppForcedFloating(_ appName: String) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return Self.defaultFloatingApps.contains(appName) || floatingApps.contains(appName)
-    }
-
-    func isBuiltInAppRule(_ appName: String) -> Bool {
-        Self.defaultFloatingApps.contains(appName)
-    }
-
-    func allForcedFloatingApps() -> Set<String> {
-        lock.lock()
-        defer { lock.unlock() }
-        return floatingApps.union(Self.defaultFloatingApps)
-    }
-
-    func builtInFloatingApps() -> [String] {
-        Array(Self.defaultFloatingApps).sorted()
-    }
-
-    func userDefinedFloatingApps() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return Array(floatingApps).sorted()
+        snapshot().isAppForcedFloating(appName)
     }
 
     func isTypeForcedFloating(_ descriptor: WindowTypeDescriptor) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return floatingTypeKeys.contains(descriptor.typeKey)
+        snapshot().isTypeForcedFloating(descriptor)
     }
 
     func isBundleExcluded(_ bundleID: String?) -> Bool {
-        guard let bundleID else { return false }
-        lock.lock()
-        defer { lock.unlock() }
-        return Self.defaultExcludedBundleIDs.contains(bundleID) || excludedBundleIDs.contains(bundleID)
+        snapshot().isBundleExcluded(bundleID)
     }
 
     func isBuiltInExcludedBundle(_ bundleID: String?) -> Bool {
-        guard let bundleID else { return false }
-        return Self.defaultExcludedBundleIDs.contains(bundleID)
+        bundleID.map(Self.defaultExcludedBundleIDs.contains) ?? false
     }
 
-    func allExcludedBundleIDs() -> Set<String> {
-        lock.lock()
-        defer { lock.unlock() }
-        return excludedBundleIDs.union(Self.defaultExcludedBundleIDs)
+    func userDefinedFloatingApps() -> [String] {
+        floatingApps.sorted()
     }
 
     func builtInExcludedBundleIDs() -> [String] {
@@ -138,15 +108,11 @@ final class WindowRuleStore {
     }
 
     func userDefinedExcludedBundleIDs() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
         return Array(excludedBundleIDs).sorted()
     }
 
     func userDefinedFloatingTypeDescriptors() -> [WindowTypeDescriptor] {
-        lock.lock()
         let keys = Array(floatingTypeKeys)
-        lock.unlock()
 
         return keys.compactMap { parseTypeKey($0) }
             .sorted {
@@ -156,47 +122,39 @@ final class WindowRuleStore {
     }
 
     func setAppForcedFloating(_ appName: String, enabled: Bool) {
-        lock.lock()
         if enabled {
             floatingApps.insert(appName)
         } else {
             floatingApps.remove(appName)
         }
         defaults.set(Array(floatingApps).sorted(), forKey: Keys.floatingApps)
-        lock.unlock()
     }
 
     func setTypeForcedFloating(_ descriptor: WindowTypeDescriptor, enabled: Bool) {
-        lock.lock()
         if enabled {
             floatingTypeKeys.insert(descriptor.typeKey)
         } else {
             floatingTypeKeys.remove(descriptor.typeKey)
         }
         defaults.set(Array(floatingTypeKeys).sorted(), forKey: Keys.floatingTypeKeys)
-        lock.unlock()
     }
 
     func setBundleExcluded(_ bundleID: String, enabled: Bool) {
         guard !isBuiltInExcludedBundle(bundleID) else {
             return
         }
-        lock.lock()
         if enabled {
             excludedBundleIDs.insert(bundleID)
         } else {
             excludedBundleIDs.remove(bundleID)
         }
         defaults.set(Array(excludedBundleIDs).sorted(), forKey: Keys.excludedBundleIDs)
-        lock.unlock()
     }
 
     func snapshot() -> WindowRuleSnapshot {
-        lock.lock()
         let apps = floatingApps.union(Self.defaultFloatingApps)
         let typeKeys = floatingTypeKeys
         let bundles = excludedBundleIDs.union(Self.defaultExcludedBundleIDs)
-        lock.unlock()
 
         return WindowRuleSnapshot(
             floatingApps: apps,

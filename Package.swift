@@ -11,6 +11,11 @@ let package = Package(
         .executableTarget(
             name: "MacOSAutoTiler",
             path: "Sources/MacOSAutoTiler"
-        )
+        ),
+        .testTarget(
+            name: "MacOSAutoTilerTests",
+            dependencies: ["MacOSAutoTiler"],
+            path: "Tests/MacOSAutoTilerTests"
+        ),
     ]
 )

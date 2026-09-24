@@ -14,7 +14,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
-        coordinator.start()
+        do {
+            try coordinator.start()
+        } catch {
+            Diagnostics.log("Startup failed: \(error.localizedDescription)", level: .error)
+            let alert = NSAlert(error: error)
+            alert.messageText = "macOS Auto Tiler could not start"
+            alert.informativeText = error.localizedDescription
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            NSApp.terminate(nil)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -74,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleStatusItemClick(_ sender: Any?) {
         guard let event = NSApp.currentEvent else {
             Diagnostics.log("Status item click with no current event; triggering reflow", level: .debug)
-            coordinator.requestFullReflow(reason: "status-left-click")
+            coordinator.requestReflow("status-left-click")
             return
         }
 
@@ -87,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
         case .leftMouseUp:
-            coordinator.requestFullReflow(reason: "status-left-click")
+            coordinator.requestReflow("status-left-click")
         default:
             break
         }
@@ -96,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc
     private func reflowNow() {
         Diagnostics.log("Manual reflow requested from menu", level: .info)
-        coordinator.requestFullReflow(reason: "menu")
+        coordinator.requestReflow("menu")
     }
 
     @objc

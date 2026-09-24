@@ -1,16 +1,25 @@
 import AppKit
 import CoreGraphics
 
+/// Click-through overlay that shows the slots of the layout being edited.
 final class OverlayWindowController {
+    private struct Content: Equatable {
+        let displayID: CGDirectDisplayID
+        let slotRects: [CGRect]
+        let hoverIndex: Int?
+    }
+
     private var overlayWindow: NSWindow?
     private var overlayView: OverlayView?
     private var activeDisplayID: CGDirectDisplayID?
+    /// Drag events arrive at the pointer's report rate; redrawing a full-screen view for each one is costly.
+    private var shownContent: Content?
 
-    func show(
-        displayID: CGDirectDisplayID,
-        slotRects: [CGRect],
-        hoverIndex: Int?
-    ) {
+    func show(displayID: CGDirectDisplayID, slotRects: [CGRect], hoverIndex: Int?) {
+        let content = Content(displayID: displayID, slotRects: slotRects, hoverIndex: hoverIndex)
+        guard content != shownContent else { return }
+        shownContent = content
+
         ensureWindow(displayID: displayID)
         guard let overlayView else { return }
         overlayView.slotRects = slotRects
@@ -20,6 +29,7 @@ final class OverlayWindowController {
     }
 
     func hide() {
+        shownContent = nil
         overlayWindow?.orderOut(nil)
     }
 

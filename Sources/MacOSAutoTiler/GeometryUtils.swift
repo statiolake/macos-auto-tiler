@@ -1,14 +1,17 @@
 import CoreGraphics
 
-enum GeometryUtils {
-    static func isApproximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat) -> Bool {
-        abs(lhs.origin.x - rhs.origin.x) <= tolerance &&
-            abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
-            abs(lhs.size.width - rhs.size.width) <= tolerance &&
-            abs(lhs.size.height - rhs.size.height) <= tolerance
+extension CGRect {
+    func isApproximatelyEqual(to other: CGRect, tolerance: CGFloat) -> Bool {
+        abs(minX - other.minX) <= tolerance
+            && abs(minY - other.minY) <= tolerance
+            && abs(width - other.width) <= tolerance
+            && abs(height - other.height) <= tolerance
     }
 
-    static func centerDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
-        hypot(lhs.midX - rhs.midX, lhs.midY - rhs.midY)
+    /// Zero when `point` is inside the rectangle.
+    func distance(to point: CGPoint) -> CGFloat {
+        let dx = Swift.max(minX - point.x, 0, point.x - maxX)
+        let dy = Swift.max(minY - point.y, 0, point.y - maxY)
+        return (dx * dx + dy * dy).squareRoot()
     }
 }

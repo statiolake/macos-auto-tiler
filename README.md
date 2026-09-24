@@ -2,27 +2,25 @@
 
 Drag-to-slot snap + auto reflow tiler for macOS (MVP2).
 
-## What is implemented
+## Features
 
-- `MVP0`:
-  - Menu bar app skeleton (`AppKit`)
-  - Accessibility permission prompt helper
-  - Window discovery via `CGWindowListCopyWindowInfo`
-- `MVP1`:
-  - Global drag detection via `CGEvent.tapCreate` (`down/dragged/up`)
-  - Transparent top overlay with slot highlights and ghost preview
-  - Overlay passes mouse through (`ignoresMouseEvents = true`)
-- `MVP2`:
-  - Drop-time slot insert/reflow (`Trello`-style card insert)
-  - Target frame calculation from slots
-  - Batch move/resize via AX (`kAXPositionAttribute`, `kAXSizeAttribute`)
-  - Startup auto reflow (runs once shortly after launch)
+- Every native Mission Control space (per display) has its own master/stack layout.
+  Space switching is left to macOS, including trackpad swipes.
+- Drag a window: the remaining windows close the gap, and an overlay shows the slot the window will drop into.
+  Dropping on another display moves it into that display's layout.
+- Resize a tiled window: the master ratio or stack row heights follow the edge you dragged.
+- While holding a window, press Option (alone) or right-click to toggle it between tiled and floating.
+- Windows are re-tiled when they are created, closed, minimized or restored, when apps launch or quit,
+  and after a space switch.
+- Scrolling the mouse wheel over the empty desktop switches to the adjacent space.
+- `Floating Rules...` in the menu: always float an app, a window type (AX role/subrole) or exclude a bundle ID.
 
 ## Run
 
 ```bash
 swift build
 swift run macos-auto-tiler
+swift test
 ```
 
 The app appears as a menu bar item (`Tiler`).
@@ -74,26 +72,26 @@ If drag capture fails, open System Settings and allow both permissions for the a
 
 ## Architecture
 
-- `Sources/MacOSAutoTiler/WindowDiscovery.swift`
-  - External window list + geometry (`windowID`, `pid`, `bounds`, title/app)
-  - Space resolution using CGS private APIs (`CGSCopySpacesForWindows`)
-- `Sources/MacOSAutoTiler/CGSSpaceService.swift`
-  - Private CGS bridge for space/window mapping and current display space lookup
-- `Sources/MacOSAutoTiler/EventTapController.swift`
-  - Global mouse event tap (`leftMouseDown/Dragged/Up`)
-- `Sources/MacOSAutoTiler/LayoutPlanner.swift`
-  - Slot generation, hit testing, reflow order, target frame mapping
-- `Sources/MacOSAutoTiler/OverlayWindowController.swift`
-  - Top-most transparent overlay for hover/ghost rendering
-- `Sources/MacOSAutoTiler/AXWindowActuator.swift`
-  - AX window resolution + position/size application
-- `Sources/MacOSAutoTiler/TilerCoordinator.swift`
-  - Orchestration of drag lifecycle and drop-time batch apply
+Pure logic (unit tested in `Tests/`):
+
+- `SpaceLayout.swift` — slot order and ratios of one space; slot geometry and resize-to-ratio conversion
+- `TilingState.swift` — layouts of all spaces plus user-chosen floating windows; reconciliation with a snapshot
+- `Gesture.swift` — mouse-down-to-mouse-up state machine: pending → drag / resize / ignored
+
+Side effects:
+
+- `TilerCoordinator.swift` — wires events to state changes and layouts (main thread only)
+- `WindowDiscovery.swift` — on-screen windows, their space, and whether they are tilable
+- `CGSSpaceService.swift` — private SkyLight bridge for spaces and the Mission Control switch shortcut
+- `AXWindowActuator.swift` — applies frames through AX on a serial background queue
+- `WindowLifecycleMonitor.swift` — AX and workspace notifications that trigger a reflow
+- `EventTapController.swift` — global mouse/modifier/scroll event tap
+- `OverlayWindowController.swift` — click-through slot preview
 
 ## Current constraints
 
 - Drag-time movement is visual only (overlay), by design.
-- AX matching is heuristic (`CG` frame nearest `AX` frame).
+- Moving a window between two *visible* spaces with Mission Control (instead of dragging it) is not followed; drag it instead.
 - Windows with strong size constraints may fail during apply.
 - CGS private API usage can break across macOS updates and is not App Store-friendly.
 

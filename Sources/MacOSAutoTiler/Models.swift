@@ -1,65 +1,55 @@
 import CoreGraphics
 
-struct WindowRef {
+/// A native Mission Control space as seen on one display. Every key owns an independent tiling layout.
+struct SpaceKey: Hashable, CustomStringConvertible {
+    let displayID: CGDirectDisplayID
+    let spaceID: Int
+
+    var description: String {
+        "display=\(displayID)/space=\(spaceID)"
+    }
+}
+
+struct ObservedWindow {
     let windowID: CGWindowID
     let pid: pid_t
-    let displayID: CGDirectDisplayID
     let frame: CGRect
     let title: String
     let appName: String
     let bundleID: String?
-    let spaceID: Int
+    let space: SpaceKey
+    /// False for windows that must never be tiled: non-regular apps, dialogs, and rule-forced floating windows.
     let isTilable: Bool
+}
 
-    func with(frame: CGRect, displayID: CGDirectDisplayID? = nil, isTilable: Bool? = nil) -> WindowRef {
-        WindowRef(
-            windowID: windowID,
-            pid: pid,
-            displayID: displayID ?? self.displayID,
-            frame: frame,
-            title: title,
-            appName: appName,
-            bundleID: bundleID,
-            spaceID: spaceID,
-            isTilable: isTilable ?? self.isTilable
-        )
+/// On-screen windows at one instant, together with the space currently shown on every active display.
+struct WindowSnapshot {
+    /// Front-to-back order as reported by the window server.
+    let windows: [ObservedWindow]
+    let visibleSpaces: [CGDirectDisplayID: SpaceKey]
+    /// False while the window server is mid-transition and some window or display has no resolvable space.
+    let isComplete: Bool
+
+    private let windowsByID: [CGWindowID: ObservedWindow]
+
+    init(windows: [ObservedWindow], visibleSpaces: [CGDirectDisplayID: SpaceKey], isComplete: Bool) {
+        self.windows = windows
+        self.visibleSpaces = visibleSpaces
+        self.isComplete = isComplete
+        windowsByID = Dictionary(windows.map { ($0.windowID, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
-    func with(isTilable: Bool) -> WindowRef {
-        with(frame: frame, isTilable: isTilable)
-    }
-}
-
-struct Slot {
-    let rect: CGRect
-}
-
-struct DragState {
-    let draggedWindowID: CGWindowID
-    let startPoint: CGPoint
-    var currentPoint: CGPoint
-    let originalFrame: CGRect
-    var hoverSlotIndex: Int?
-}
-
-struct PendingDrag {
-    let windowID: CGWindowID
-    let originalFrame: CGRect
-}
-
-struct DisplayLayoutPlan {
-    let setID: WindowSetID
-    let displayID: CGDirectDisplayID
-    let spaceID: Int
-    let slots: [Slot]
-    let orderedWindowIDs: [CGWindowID]   // slots[i].rect が orderedWindowIDs[i] に対応
-    let windowsByID: [CGWindowID: WindowRef]
-
-    var targetFrames: [CGWindowID: CGRect] {
-        Dictionary(uniqueKeysWithValues: zip(orderedWindowIDs, slots).map { ($0, $1.rect) })
+    func window(_ windowID: CGWindowID) -> ObservedWindow? {
+        windowsByID[windowID]
     }
 
-    func slotIndex(of windowID: CGWindowID) -> Int? {
-        orderedWindowIDs.firstIndex(of: windowID)
+    /// Identity of every window's placement; two snapshots with equal placements describe the same arrangement.
+    var placements: Set<Placement> {
+        Set(windows.map { Placement(windowID: $0.windowID, space: $0.space) })
+    }
+
+    struct Placement: Hashable {
+        let windowID: CGWindowID
+        let space: SpaceKey
     }
 }

@@ -1,11 +1,9 @@
 import ApplicationServices
 import CoreGraphics
 import Darwin
-import Foundation
 
+/// Maps window-server window IDs to AX elements.
 final class AXWindowResolver {
-    static let shared = AXWindowResolver()
-
     struct ResolvedWindow {
         let element: AXUIElement
         let windowID: CGWindowID
@@ -16,156 +14,62 @@ final class AXWindowResolver {
         let canSetSize: Bool
     }
 
-    private typealias AXUIElementGetWindowFunction = @convention(c) (
-        AXUIElement,
-        UnsafeMutablePointer<CGWindowID>
-    ) -> AXError
+    private typealias GetWindowFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
 
-    private let axWindowNumberAttribute: CFString = "AXWindowNumber" as CFString
-    private static let getWindowFunction: AXUIElementGetWindowFunction? = AXWindowResolver.loadGetWindowFunction()
+    /// Private but long-standing; every window manager for macOS relies on it.
+    private static let getWindow: GetWindowFunction = {
+        guard
+            let handle = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_LAZY),
+            let symbol = dlsym(handle, "_AXUIElementGetWindow")
+        else {
+            fatalError("_AXUIElementGetWindow is unavailable on this macOS version")
+        }
+        return unsafeBitCast(symbol, to: GetWindowFunction.self)
+    }()
 
     func window(pid: pid_t, windowID: CGWindowID) -> ResolvedWindow? {
         windowsByID(pid: pid)[windowID]
     }
 
     func windowsByID(pid: pid_t) -> [CGWindowID: ResolvedWindow] {
-        guard pid > 0 else {
-            return [:]
-        }
-
         let appElement = AXUIElementCreateApplication(pid)
         var windowsValue: CFTypeRef?
-        let windowsResult = AXUIElementCopyAttributeValue(
-            appElement,
-            kAXWindowsAttribute as CFString,
-            &windowsValue
-        )
-
         guard
-            windowsResult == .success,
-            let axWindows = windowsValue as? [AXUIElement],
-            !axWindows.isEmpty
+            AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+            let axWindows = windowsValue as? [AXUIElement]
         else {
             return [:]
         }
 
         var result: [CGWindowID: ResolvedWindow] = [:]
-        result.reserveCapacity(axWindows.count)
-
         for element in axWindows {
-            guard let windowID = copyWindowID(from: element) else {
+            var windowID = CGWindowID(0)
+            guard Self.getWindow(element, &windowID) == .success, windowID != 0, result[windowID] == nil else {
                 continue
             }
-            guard result[windowID] == nil else {
-                continue
-            }
-
-            let resolved = ResolvedWindow(
+            result[windowID] = ResolvedWindow(
                 element: element,
                 windowID: windowID,
                 frame: AXValueUtils.copyFrame(of: element),
-                role: copyStringAttribute(kAXRoleAttribute as CFString, from: element) ?? "Unknown",
-                subrole: copyStringAttribute(kAXSubroleAttribute as CFString, from: element) ?? "Unknown",
-                canSetPosition: isAttributeSettable(kAXPositionAttribute as CFString, on: element),
-                canSetSize: isAttributeSettable(kAXSizeAttribute as CFString, on: element)
+                role: copyString(kAXRoleAttribute, from: element) ?? "Unknown",
+                subrole: copyString(kAXSubroleAttribute, from: element) ?? "Unknown",
+                canSetPosition: isSettable(kAXPositionAttribute, on: element),
+                canSetSize: isSettable(kAXSizeAttribute, on: element)
             )
-            result[windowID] = resolved
         }
-
         return result
     }
 
-    func focusedWindowID(pid: pid_t) -> CGWindowID? {
-        guard pid > 0 else {
-            return nil
-        }
-
-        let appElement = AXUIElementCreateApplication(pid)
-        if let focusedWindow = copyElementAttribute(kAXFocusedWindowAttribute as CFString, from: appElement),
-           let windowID = copyWindowID(from: focusedWindow) {
-            return windowID
-        }
-        if let mainWindow = copyElementAttribute(kAXMainWindowAttribute as CFString, from: appElement),
-           let windowID = copyWindowID(from: mainWindow) {
-            return windowID
-        }
-        return nil
-    }
-
-    private func copyWindowID(from element: AXUIElement) -> CGWindowID? {
-        if let windowID = copyWindowIDUsingSymbol(from: element) {
-            return windowID
-        }
-        return copyWindowIDUsingAttribute(from: element)
-    }
-
-    private func copyWindowIDUsingSymbol(from element: AXUIElement) -> CGWindowID? {
-        guard let getWindowFunction = Self.getWindowFunction else {
-            return nil
-        }
-        var windowID = CGWindowID(0)
-        let result = getWindowFunction(element, &windowID)
-        guard result == .success, windowID != 0 else {
-            return nil
-        }
-        return windowID
-    }
-
-    private func copyWindowIDUsingAttribute(from element: AXUIElement) -> CGWindowID? {
+    private func copyString(_ attribute: String, from element: AXUIElement) -> String? {
         var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, axWindowNumberAttribute, &value)
-        guard result == .success, let number = value as? NSNumber else {
-            return nil
-        }
-        return CGWindowID(number.uint32Value)
-    }
-
-    private func copyStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value, CFGetTypeID(value) == CFStringGetTypeID() else {
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
             return nil
         }
         return value as? String
     }
 
-    private func copyElementAttribute(_ attribute: CFString, from element: AXUIElement) -> AXUIElement? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        return unsafeBitCast(value, to: AXUIElement.self)
-    }
-
-    private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
+    private func isSettable(_ attribute: String, on element: AXUIElement) -> Bool {
         var settable = DarwinBoolean(false)
-        let result = AXUIElementIsAttributeSettable(element, attribute, &settable)
-        return result == .success && settable.boolValue
-    }
-
-    private static func loadGetWindowFunction() -> AXUIElementGetWindowFunction? {
-        guard let handle = dlopen(
-            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
-            RTLD_LAZY
-        ) else {
-            Diagnostics.log(
-                "AXWindowResolver could not open ApplicationServices handle; falling back to AXWindowNumber attribute",
-                level: .warn
-            )
-            return nil
-        }
-
-        guard
-            let symbol = dlsym(handle, "AXUIElementGetWindow") ?? dlsym(handle, "_AXUIElementGetWindow")
-        else {
-            Diagnostics.log(
-                "AXWindowResolver could not load AXUIElementGetWindow; falling back to AXWindowNumber attribute",
-                level: .warn
-            )
-            return nil
-        }
-
-        return unsafeBitCast(symbol, to: AXUIElementGetWindowFunction.self)
+        return AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success && settable.boolValue
     }
 }

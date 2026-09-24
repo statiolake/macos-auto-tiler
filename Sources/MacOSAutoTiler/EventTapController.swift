@@ -1,188 +1,114 @@
 import CoreGraphics
 import Foundation
 
-enum MouseEventType {
-    case down
-    case dragged
-    case up
-    case secondaryDown
-    case optionPressed
-    case optionTabPressed(reverse: Bool)
-    case scrollWheel(deltaY: Int64)
+enum TapEvent {
+    case mouseDown(CGPoint)
+    case mouseDragged(CGPoint)
+    case mouseUp(CGPoint)
+    case rightMouseDown(CGPoint)
+    /// Option pressed on its own, without any other modifier.
+    case optionPressed(CGPoint)
+    /// Discrete (mouse wheel) vertical scroll. Trackpad scrolling is never reported.
+    case scrollWheel(CGPoint, deltaY: Int64)
 }
 
+struct EventTapError: LocalizedError {
+    var errorDescription: String? {
+        "Could not create the global event tap. Check Accessibility and Input Monitoring permissions."
+    }
+}
+
+/// Global event tap on the main run loop. The handler returns true to swallow the event.
 final class EventTapController {
-    private static let tabKeyCode: CGKeyCode = 48
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var handler: ((MouseEventType, CGPoint) -> Bool)?
+    private var handler: ((TapEvent) -> Bool)?
     private var lastFlags: CGEventFlags = []
 
-    func start(handler: @escaping (MouseEventType, CGPoint) -> Bool) -> Bool {
-        stop()
-        self.handler = handler
-        Diagnostics.log("Starting global mouse event tap", level: .info)
+    func start(handler: @escaping (TapEvent) -> Bool) throws {
+        precondition(eventTap == nil, "event tap started twice")
+        let eventTypes: [CGEventType] = [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .flagsChanged, .scrollWheel]
+        let mask = eventTypes.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
 
-        let mask =
-            (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
-            (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
-            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
-            (CGEventMask(1) << CGEventType.rightMouseDown.rawValue) |
-            (CGEventMask(1) << CGEventType.keyDown.rawValue) |
-            (CGEventMask(1) << CGEventType.flagsChanged.rawValue) |
-            (CGEventMask(1) << CGEventType.scrollWheel.rawValue)
-
-        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         guard
             let tap = CGEvent.tapCreate(
                 tap: .cgSessionEventTap,
                 place: .headInsertEventTap,
                 options: .defaultTap,
                 eventsOfInterest: mask,
-                callback: EventTapController.callback,
-                userInfo: refcon
-            )
+                callback: Self.callback,
+                userInfo: Unmanaged.passUnretained(self).toOpaque()
+            ),
+            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         else {
-            Diagnostics.log("Failed to create CGEvent tap", level: .error)
-            return false
+            throw EventTapError()
         }
 
-        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
-            Diagnostics.log("Failed to create run loop source for event tap", level: .error)
-            return false
-        }
-
+        self.handler = handler
         eventTap = tap
         runLoopSource = source
-        lastFlags = []
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        Diagnostics.log("Global mouse event tap enabled", level: .info)
-        return true
     }
 
     func stop() {
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         }
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
         }
         runLoopSource = nil
         eventTap = nil
         handler = nil
-        lastFlags = []
-        Diagnostics.log("Global mouse event tap stopped", level: .debug)
     }
 
     private func handle(_ type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            Diagnostics.log("Event tap was disabled by system, re-enabling", level: .warn)
-            if let tap = eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
+            Diagnostics.log("Event tap was disabled by the system (\(type.rawValue)); re-enabling", level: .warn)
+            if let eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
             }
             return Unmanaged.passUnretained(event)
         }
 
-        guard let handler else {
+        guard let handler, let tapEvent = tapEvent(type, event: event) else {
             return Unmanaged.passUnretained(event)
         }
+        return handler(tapEvent) ? nil : Unmanaged.passUnretained(event)
+    }
 
+    private func tapEvent(_ type: CGEventType, event: CGEvent) -> TapEvent? {
         let point = event.location
-        var consumed = false
-
         switch type {
         case .leftMouseDown:
-            consumed = handler(.down, point)
+            return .mouseDown(point)
         case .leftMouseDragged:
-            consumed = handler(.dragged, point)
+            return .mouseDragged(point)
         case .leftMouseUp:
-            consumed = handler(.up, point)
+            return .mouseUp(point)
         case .rightMouseDown:
-            consumed = handler(.secondaryDown, point)
-        case .keyDown:
-            if let shortcutEvent = shortcutEvent(for: event) {
-                consumed = handler(shortcutEvent, point)
-            }
+            return .rightMouseDown(point)
         case .flagsChanged:
-            let flags = event.flags
-            let becameOptionOnly = isOptionOnlyPressTransition(from: lastFlags, to: flags)
-            lastFlags = flags
-            if becameOptionOnly {
-                consumed = handler(.optionPressed, point)
-            }
-        case .scrollWheel:
-            let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
-            if isContinuous {
-                return Unmanaged.passUnretained(event)
-            }
-            let lineDeltaY = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
-            let pointDeltaY = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
-            let deltaY = lineDeltaY != 0 ? lineDeltaY : pointDeltaY
-            if deltaY != 0 {
-                consumed = handler(.scrollWheel(deltaY: deltaY), point)
-            }
-        default:
+            let wasOptionDown = lastFlags.contains(.maskAlternate)
             lastFlags = event.flags
-            break
-        }
-
-        return consumed ? nil : Unmanaged.passUnretained(event)
-    }
-
-    private func shortcutEvent(for event: CGEvent) -> MouseEventType? {
-        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        guard keyCode == Self.tabKeyCode else {
+            let otherModifiers: CGEventFlags = [.maskShift, .maskControl, .maskCommand, .maskAlphaShift, .maskSecondaryFn, .maskHelp]
+            let isOptionOnly = event.flags.contains(.maskAlternate) && event.flags.intersection(otherModifiers).isEmpty
+            return !wasOptionDown && isOptionOnly ? .optionPressed(point) : nil
+        case .scrollWheel:
+            guard event.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 else { return nil }
+            let lineDelta = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            let deltaY = lineDelta != 0 ? lineDelta : event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
+            return deltaY != 0 ? .scrollWheel(point, deltaY: deltaY) : nil
+        default:
             return nil
         }
-
-        let flags = event.flags
-        guard flags.contains(.maskAlternate) else {
-            return nil
-        }
-
-        let disallowed: CGEventFlags = [
-            .maskControl,
-            .maskCommand,
-            .maskAlphaShift,
-            .maskSecondaryFn,
-            .maskHelp,
-        ]
-        guard flags.intersection(disallowed).isEmpty else {
-            return nil
-        }
-
-        return .optionTabPressed(reverse: flags.contains(.maskShift))
-    }
-
-    private func isOptionOnlyPressTransition(from previous: CGEventFlags, to current: CGEventFlags) -> Bool {
-        let wasOptionDown = previous.contains(.maskAlternate)
-        let isOptionDown = current.contains(.maskAlternate)
-        return !wasOptionDown && isOptionDown && hasOnlyOptionModifier(current)
-    }
-
-    private func hasOnlyOptionModifier(_ flags: CGEventFlags) -> Bool {
-        guard flags.contains(.maskAlternate) else {
-            return false
-        }
-
-        let disallowed: CGEventFlags = [
-            .maskShift,
-            .maskControl,
-            .maskCommand,
-            .maskAlphaShift,
-            .maskSecondaryFn,
-            .maskNumericPad,
-            .maskHelp,
-        ]
-        return flags.intersection(disallowed).isEmpty
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, refcon in
         guard let refcon else {
-            return Unmanaged.passUnretained(event)
+            preconditionFailure("event tap callback without refcon")
         }
-        let controller = Unmanaged<EventTapController>.fromOpaque(refcon).takeUnretainedValue()
-        return controller.handle(type, event: event)
+        return Unmanaged<EventTapController>.fromOpaque(refcon).takeUnretainedValue().handle(type, event: event)
     }
 }

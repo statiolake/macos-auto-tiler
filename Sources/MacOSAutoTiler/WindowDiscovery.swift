@@ -2,293 +2,152 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+/// Reads windows from the window server and decides which of them are tiling candidates.
 final class WindowDiscovery {
-    private struct OwnerProcessInfo {
-        let isEligible: Bool
-        let appName: String
-        let bundleID: String?
-        let isTilable: Bool
-    }
+    private static let minimumWindowExtent: CGFloat = 80
 
     private let ruleStore: WindowRuleStore
-    private let cgsSpaceService: CGSSpaceService
-    private let logStateLock = NSLock()
-    private var lastDiscoverySignature: UInt64?
+    private let typeRegistry: WindowTypeRegistry
+    private let semanticsClassifier: WindowSemanticsClassifier
+    private let spaces = CGSSpaceService.shared
 
-    init(
-        ruleStore: WindowRuleStore = WindowRuleStore(),
-        cgsSpaceService: CGSSpaceService = .shared
-    ) {
+    init(ruleStore: WindowRuleStore, typeRegistry: WindowTypeRegistry, resolver: AXWindowResolver) {
         self.ruleStore = ruleStore
-        self.cgsSpaceService = cgsSpaceService
+        self.typeRegistry = typeRegistry
+        semanticsClassifier = WindowSemanticsClassifier(resolver: resolver)
     }
 
-    func fetchVisibleWindows() -> [WindowRef] {
-        fetchVisibleWindowsInternal().windows
-    }
+    func snapshot() -> WindowSnapshot {
+        let infos = onScreenWindowInfos()
+        let visibleSpaces = visibleSpaces()
+        let rules = ruleStore.snapshot()
+        var isComplete = visibleSpaces.count == DisplayService.activeDisplayIDs().count
 
-    func fetchVisibleWindowsReflowSafe() -> [WindowRef]? {
-        let result = fetchVisibleWindowsInternal()
-        guard !result.hasIncompleteSpaceData else {
-            return nil
+        let candidates = infos.filter { info in
+            info.layer == 0
+                && info.alpha > 0.01
+                && info.pid != getpid()
+                && info.frame.width >= Self.minimumWindowExtent
+                && info.frame.height >= Self.minimumWindowExtent
         }
-        return result.windows
-    }
+        let spaceByWindowID = spaces.spacesByWindowID(windowIDs: candidates.map(\.windowID))
 
-    private func fetchVisibleWindowsInternal() -> (windows: [WindowRef], hasIncompleteSpaceData: Bool) {
-        guard
-            let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
-        else {
-            return (windows: [], hasIncompleteSpaceData: false)
-        }
+        var ownerByPID: [pid_t: NSRunningApplication?] = [:]
+        var windows: [ObservedWindow] = []
+        for info in candidates {
+            let owner = ownerByPID[info.pid] ?? NSRunningApplication(processIdentifier: info.pid)
+            ownerByPID[info.pid] = owner
+            let bundleID = owner?.bundleIdentifier
+            guard owner?.isFinishedLaunching ?? true, !rules.isBundleExcluded(bundleID) else { continue }
 
-        let selfPID = getpid()
-        var displayByWindowID: [CGWindowID: CGDirectDisplayID] = [:]
-        displayByWindowID.reserveCapacity(raw.count)
-        let allWindowIDs = raw.compactMap { info -> CGWindowID? in
-            guard let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
-                return nil
-            }
-            return CGWindowID(windowNumber)
-        }
-        let spaceByWindowID = cgsSpaceService.spacesByWindowID(windowIDs: allWindowIDs)
-
-        var displayIDs = Set<CGDirectDisplayID>()
-        for info in raw {
-            guard
-                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
-                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-                let frame = CGRect(dictionaryRepresentation: boundsDict)
-            else {
+            guard let spaceID = spaceByWindowID[info.windowID] else {
+                isComplete = false
                 continue
             }
-            let windowID = CGWindowID(windowNumber)
-            if let displayID = DisplayService.displayID(for: frame) {
-                displayIDs.insert(displayID)
-                displayByWindowID[windowID] = displayID
-            }
-        }
-        let currentSpaceByDisplayID = cgsSpaceService.currentSpaceByDisplayID(displayIDs: displayIDs)
-        let hasMissingCurrentDisplaySpace = !displayIDs.isEmpty && currentSpaceByDisplayID.count < displayIDs.count
-        let visibleSpaceIDs = Set(currentSpaceByDisplayID.values)
-
-        var windows: [WindowRef] = []
-        windows.reserveCapacity(raw.count)
-        var ownerInfoByPID: [pid_t: OwnerProcessInfo] = [:]
-        var droppedMissingDisplay = 0
-        var droppedMissingSpace = 0
-        var droppedOffVisibleSpaces = 0
-
-        for info in raw {
-            guard
-                let layer = info[kCGWindowLayer as String] as? Int,
-                layer == 0,
-                let alpha = info[kCGWindowAlpha as String] as? Double,
-                alpha > 0.01,
-                let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-                pid != selfPID,
-                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
-                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-                let frame = CGRect(dictionaryRepresentation: boundsDict),
-                frame.width >= 80,
-                frame.height >= 80
-            else {
+            // Mid-transition, windows of the space being left are still reported as on screen.
+            guard let space = visibleSpace(withID: spaceID, containing: info.frame, in: visibleSpaces) else {
                 continue
             }
 
-            let ownerInfo: OwnerProcessInfo
-            if let cached = ownerInfoByPID[pid] {
-                ownerInfo = cached
-            } else {
-                let computed = ownerProcessInfo(pid: pid, fallbackOwnerName: info[kCGWindowOwnerName as String] as? String)
-                ownerInfoByPID[pid] = computed
-                ownerInfo = computed
+            let appName = owner?.localizedName ?? info.ownerName ?? "Unknown"
+            let semantics = semanticsClassifier.semantics(windowID: info.windowID, pid: info.pid)
+            if let semantics {
+                typeRegistry.record(appName: appName, bundleID: bundleID, descriptor: semantics.descriptor)
             }
-            guard ownerInfo.isEligible else {
-                continue
-            }
-
-            let title = (info[kCGWindowName as String] as? String) ?? ""
-            let windowID = CGWindowID(windowNumber)
-            guard let displayID = displayByWindowID[windowID] else {
-                droppedMissingDisplay += 1
-                continue
-            }
-            guard let resolvedSpaceID = spaceByWindowID[windowID] else {
-                droppedMissingSpace += 1
-                continue
-            }
-            if !visibleSpaceIDs.isEmpty, !visibleSpaceIDs.contains(resolvedSpaceID) {
-                droppedOffVisibleSpaces += 1
-                continue
-            }
+            let isTilable = owner?.activationPolicy == .regular
+                && semantics?.isStandardWindow == true
+                && !rules.isAppForcedFloating(appName)
+                && !(semantics.map { rules.isTypeForcedFloating($0.descriptor) } ?? false)
 
             windows.append(
-                WindowRef(
-                    windowID: windowID,
-                    pid: pid,
-                    displayID: displayID,
-                    frame: frame,
-                    title: title,
-                    appName: ownerInfo.appName,
-                    bundleID: ownerInfo.bundleID,
-                    spaceID: resolvedSpaceID,
-                    isTilable: ownerInfo.isTilable
+                ObservedWindow(
+                    windowID: info.windowID,
+                    pid: info.pid,
+                    frame: info.frame,
+                    title: info.title,
+                    appName: appName,
+                    bundleID: bundleID,
+                    space: space,
+                    isTilable: isTilable
                 )
             )
         }
 
-        if droppedMissingDisplay > 0 || droppedMissingSpace > 0 || droppedOffVisibleSpaces > 0 || hasMissingCurrentDisplaySpace {
-            Diagnostics.log(
-                "CGS space filter dropped windows missingDisplay=\(droppedMissingDisplay) missingSpace=\(droppedMissingSpace) offVisibleSpaces=\(droppedOffVisibleSpaces) missingCurrentDisplaySpace=\(hasMissingCurrentDisplaySpace)",
-                level: .debug
-            )
-        }
+        semanticsClassifier.prune(to: Set(infos.map(\.windowID)))
+        return WindowSnapshot(windows: windows, visibleSpaces: visibleSpaces, isComplete: isComplete)
+    }
 
-        logDiscoveryIfChanged(windows)
-        return (
-            windows: windows,
-            hasIncompleteSpaceData: hasMissingCurrentDisplaySpace || droppedMissingSpace > 0
+    private func visibleSpace(
+        withID spaceID: Int,
+        containing frame: CGRect,
+        in visibleSpaces: [CGDirectDisplayID: SpaceKey]
+    ) -> SpaceKey? {
+        let showing = visibleSpaces.values.filter { $0.spaceID == spaceID }
+        guard showing.count > 1 else { return showing.first }
+        // With "Displays have separate Spaces" turned off, one space spans every display; the frame decides.
+        return DisplayService.displayID(for: frame).flatMap { visibleSpaces[$0] }
+    }
+
+    /// The space each active display currently shows. Displays whose space is unresolvable mid-transition are absent.
+    func visibleSpaces() -> [CGDirectDisplayID: SpaceKey] {
+        let currentSpaceByDisplay = spaces.currentSpaceByDisplayID(displayIDs: DisplayService.activeDisplayIDs())
+        return Dictionary(uniqueKeysWithValues: currentSpaceByDisplay.map {
+            ($0.key, SpaceKey(displayID: $0.key, spaceID: $0.value))
+        })
+    }
+
+    /// IDs of windows on every space, including hidden and minimized ones.
+    func allWindowIDs() -> Set<CGWindowID> {
+        Set(windowInfos(options: [.excludeDesktopElements]).map(\.windowID))
+    }
+
+    func frames(of windowIDs: Set<CGWindowID>) -> [CGWindowID: CGRect] {
+        Dictionary(
+            onScreenWindowInfos().filter { windowIDs.contains($0.windowID) }.map { ($0.windowID, $0.frame) },
+            uniquingKeysWith: { first, _ in first }
         )
-    }
-
-    func fetchWindow(windowID: CGWindowID) -> WindowRef? {
-        fetchVisibleWindows().first { $0.windowID == windowID }
-    }
-
-    /// 全 space のウィンドウ ID を返す（floating state の prune に使用）
-    func fetchAllWindowIDs() -> Set<CGWindowID> {
-        guard
-            let raw = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
-        else {
-            return []
-        }
-        var result = Set<CGWindowID>()
-        result.reserveCapacity(raw.count)
-        for info in raw {
-            guard let windowNumber = info[kCGWindowNumber as String] as? UInt32 else {
-                continue
-            }
-            result.insert(CGWindowID(windowNumber))
-        }
-        return result
-    }
-
-    func fetchWindowFrames(for windowIDs: Set<CGWindowID>) -> [CGWindowID: CGRect] {
-        guard
-            !windowIDs.isEmpty,
-            let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
-        else {
-            return [:]
-        }
-        var result: [CGWindowID: CGRect] = [:]
-        for info in raw {
-            guard
-                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
-                windowIDs.contains(CGWindowID(windowNumber)),
-                let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-                let frame = CGRect(dictionaryRepresentation: boundsDict)
-            else {
-                continue
-            }
-            result[CGWindowID(windowNumber)] = frame
-            if result.count == windowIDs.count {
-                break
-            }
-        }
-        return result
     }
 
     func hasVisibleWindow(at point: CGPoint) -> Bool {
-        guard
-            let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
-        else {
-            return false
-        }
+        onScreenWindowInfos().contains { $0.layer == 0 && $0.alpha > 0.01 && $0.frame.contains(point) }
+    }
 
-        for info in raw {
+    private struct WindowInfo {
+        let windowID: CGWindowID
+        let pid: pid_t
+        let frame: CGRect
+        let layer: Int
+        let alpha: Double
+        let title: String
+        let ownerName: String?
+    }
+
+    private func onScreenWindowInfos() -> [WindowInfo] {
+        windowInfos(options: [.optionOnScreenOnly, .excludeDesktopElements])
+    }
+
+    private func windowInfos(options: CGWindowListOption) -> [WindowInfo] {
+        guard let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            preconditionFailure("CGWindowListCopyWindowInfo returned nil")
+        }
+        return raw.compactMap { info in
             guard
-                let layer = info[kCGWindowLayer as String] as? Int,
-                layer == 0,
-                let alpha = info[kCGWindowAlpha as String] as? Double,
-                alpha > 0.01,
+                let windowNumber = info[kCGWindowNumber as String] as? UInt32,
+                let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                 let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                 let frame = CGRect(dictionaryRepresentation: boundsDict)
             else {
-                continue
+                return nil
             }
-            if frame.contains(point) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func logDiscoveryIfChanged(_ windows: [WindowRef]) {
-        let signature = discoverySignature(for: windows)
-
-        logStateLock.lock()
-        let shouldLog = signature != lastDiscoverySignature
-        if shouldLog {
-            lastDiscoverySignature = signature
-        }
-        logStateLock.unlock()
-
-        guard shouldLog else {
-            return
-        }
-
-        Diagnostics.log("Discovered \(windows.count) visible candidate windows", level: .debug)
-    }
-
-    private func discoverySignature(for windows: [WindowRef]) -> UInt64 {
-        var hash = UInt64(windows.count)
-        for id in windows.map(\.windowID).sorted() {
-            FNV1a64.combine(&hash, UInt64(id))
-        }
-        return hash
-    }
-
-    private func ownerProcessInfo(pid: pid_t, fallbackOwnerName: String?) -> OwnerProcessInfo {
-        guard let app = NSRunningApplication(processIdentifier: pid) else {
-            // Keep unknown processes eligible to avoid false negatives for legitimate apps.
-            return OwnerProcessInfo(
-                isEligible: true,
-                appName: fallbackOwnerName ?? "Unknown",
-                bundleID: nil,
-                isTilable: false
+            return WindowInfo(
+                windowID: CGWindowID(windowNumber),
+                pid: pid,
+                frame: frame,
+                layer: info[kCGWindowLayer as String] as? Int ?? 0,
+                alpha: info[kCGWindowAlpha as String] as? Double ?? 1,
+                title: info[kCGWindowName as String] as? String ?? "",
+                ownerName: info[kCGWindowOwnerName as String] as? String
             )
         }
-
-        let appName = app.localizedName ?? fallbackOwnerName ?? "Unknown"
-        let bundleID = app.bundleIdentifier
-
-        if ruleStore.isBundleExcluded(bundleID) {
-            return OwnerProcessInfo(
-                isEligible: false,
-                appName: appName,
-                bundleID: bundleID,
-                isTilable: app.activationPolicy == .regular
-            )
-        }
-
-        guard app.isFinishedLaunching else {
-            return OwnerProcessInfo(
-                isEligible: false,
-                appName: appName,
-                bundleID: bundleID,
-                isTilable: app.activationPolicy == .regular
-            )
-        }
-
-        return OwnerProcessInfo(
-            isEligible: true,
-            appName: appName,
-            bundleID: bundleID,
-            isTilable: app.activationPolicy == .regular
-        )
     }
 }
